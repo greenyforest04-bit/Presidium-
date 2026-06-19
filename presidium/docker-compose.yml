@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+  bootstrap1:
+    build: .
+    container_name: presidium-bootstrap1
+    ports:
+      - "9478:9478/udp"
+      - "9478:9478/tcp"
+    environment:
+      - PRESIDIUM_NET_LISTEN_PORT=9478
+      - PRESIDIUM_NET_BOOTSTRAP_NODES=bootstrap2:9479,bootstrap3:9480
+      - PRESIDIUM_NET_MDNS_ENABLED=false
+      - PRESIDIUM_LOG_LEVEL=INFO
+    volumes:
+      - bootstrap1_data:/data/presidium
+    networks:
+      - presidium
+
+  bootstrap2:
+    build: .
+    container_name: presidium-bootstrap2
+    ports:
+      - "9479:9479/udp"
+      - "9479:9479/tcp"
+    environment:
+      - PRESIDIUM_NET_LISTEN_PORT=9479
+      - PRESIDIUM_NET_BOOTSTRAP_NODES=bootstrap1:9478,bootstrap3:9480
+      - PRESIDIUM_NET_MDNS_ENABLED=false
+      - PRESIDIUM_LOG_LEVEL=INFO
+    volumes:
+      - bootstrap2_data:/data/presidium
+    networks:
+      - presidium
+
+  bootstrap3:
+    build: .
+    container_name: presidium-bootstrap3
+    ports:
+      - "9480:9480/udp"
+      - "9480:9480/tcp"
+    environment:
+      - PRESIDIUM_NET_LISTEN_PORT=9480
+      - PRESIDIUM_NET_BOOTSTRAP_NODES=bootstrap1:9478,bootstrap2:9479
+      - PRESIDIUM_NET_MDNS_ENABLED=false
+      - PRESIDIUM_LOG_LEVEL=INFO
+    volumes:
+      - bootstrap3_data:/data/presidium
+    networks:
+      - presidium
+
+volumes:
+  bootstrap1_data:
+  bootstrap2_data:
+  bootstrap3_data:
+
+networks:
+  presidium:
+    driver: bridge

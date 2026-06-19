@@ -604,3 +604,188 @@ class PeerManager:
         if self._on_peer_disconnected:
             await self._on_peer_disconnected(peer_uid)
         logger.info("Disconnected from %s", peer_uid)
+
+
+# ---------------------------------------------------------------------------
+# Reconnection Manager
+# ---------------------------------------------------------------------------
+
+class ReconnectionManager:
+    """Manages automatic reconnection to disconnected peers.
+
+    Features:
+    - Exponential backoff (1s, 2s, 4s, 8s, 16s, 32s, max 60s)
+    - Heartbeat PING every 30 seconds for connected peers
+    - Automatic E2EE session recovery on reconnect (new ephemeral X25519)
+    - Timeout detection via missed heartbeats (3 missed → consider disconnected)
+    """
+
+    INITIAL_BACKOFF = 1.0  # seconds
+    MAX_BACKOFF = 60.0     # seconds
+    BACKOFF_MULTIPLIER = 2.0
+    HEARTBEAT_INTERVAL = 30.0  # seconds
+    HEARTBEAT_TIMEOUT = 10.0   # seconds to wait for PONG
+    MAX_MISSED_HEARTBEATS = 3  # missed PONGs before disconnect
+
+    def __init__(self, peer_manager: PeerManager) -> None:
+        self._peer_manager = peer_manager
+        self._running = False
+
+        # Reconnection state: peer_user_id → {backoff, last_attempt, consecutive_failures}
+        self._reconnect_state: dict[str, dict] = {}
+
+        # Heartbeat state: peer_user_id → {last_ping, last_pong, missed_count}
+        self._heartbeat_state: dict[str, dict] = {}
+
+        self._bg_tasks: list[asyncio.Task] = []
+
+    # -------------------------------------------------------------------
+    # Lifecycle
+    # -------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Start the reconnection and heartbeat loops."""
+        self._running = True
+        self._bg_tasks.append(asyncio.create_task(self._reconnect_loop()))
+        self._bg_tasks.append(asyncio.create_task(self._heartbeat_loop()))
+        logger.info("Reconnection manager started.")
+
+    async def stop(self) -> None:
+        """Stop the reconnection manager."""
+        self._running = False
+        for task in self._bg_tasks:
+            task.cancel()
+        await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        self._bg_tasks.clear()
+
+    # -------------------------------------------------------------------
+    # Reconnection tracking
+    # -------------------------------------------------------------------
+
+    def mark_peer_disconnected(self, peer_user_id: str) -> None:
+        """Mark a peer as disconnected — schedule reconnection attempts."""
+        if peer_user_id not in self._reconnect_state:
+            self._reconnect_state[peer_user_id] = {
+                "backoff": self.INITIAL_BACKOFF,
+                "last_attempt": 0.0,
+                "consecutive_failures": 0,
+            }
+        else:
+            state = self._reconnect_state[peer_user_id]
+            state["consecutive_failures"] += 1
+            state["backoff"] = min(
+                state["backoff"] * self.BACKOFF_MULTIPLIER,
+                self.MAX_BACKOFF,
+            )
+        # Remove heartbeat state
+        self._heartbeat_state.pop(peer_user_id, None)
+
+    def mark_peer_connected(self, peer_user_id: str) -> None:
+        """Mark a peer as connected — reset backoff and start heartbeat."""
+        self._reconnect_state.pop(peer_user_id, None)
+        self._heartbeat_state[peer_user_id] = {
+            "last_ping": time.monotonic(),
+            "last_pong": time.monotonic(),
+            "missed_count": 0,
+        }
+
+    # -------------------------------------------------------------------
+    # Background: reconnection loop
+    # -------------------------------------------------------------------
+
+    async def _reconnect_loop(self) -> None:
+        """Periodically attempt to reconnect to disconnected peers."""
+        while self._running:
+            now = time.monotonic()
+
+            for peer_user_id, state in list(self._reconnect_state.items()):
+                peer = self._peer_manager.get_peer(peer_user_id)
+                if peer is None:
+                    # Peer was removed entirely
+                    self._reconnect_state.pop(peer_user_id, None)
+                    continue
+
+                if peer.connected:
+                    # Already reconnected (e.g., by mDNS or peer-initiated)
+                    self._reconnect_state.pop(peer_user_id, None)
+                    continue
+
+                # Check if it's time for the next attempt
+                elapsed = now - state["last_attempt"]
+                if elapsed < state["backoff"]:
+                    continue
+
+                state["last_attempt"] = now
+
+                try:
+                    await self._peer_manager.connect_to_peer(peer)
+                    logger.info(
+                        "Reconnection attempt to %s (failure #%d, backoff %.1fs)",
+                        peer_user_id[:8],
+                        state["consecutive_failures"],
+                        state["backoff"],
+                    )
+                except Exception as exc:
+                    logger.debug("Reconnection attempt failed for %s: %s", peer_user_id[:8], exc)
+                    # Increase backoff
+                    state["consecutive_failures"] += 1
+                    state["backoff"] = min(
+                        state["backoff"] * self.BACKOFF_MULTIPLIER,
+                        self.MAX_BACKOFF,
+                    )
+
+            await asyncio.sleep(5.0)
+
+    # -------------------------------------------------------------------
+    # Background: heartbeat loop
+    # -------------------------------------------------------------------
+
+    async def _heartbeat_loop(self) -> None:
+        """Send periodic PING to connected peers and detect failures."""
+        while self._running:
+            now = time.monotonic()
+
+            for peer_user_id, hb_state in list(self._heartbeat_state.items()):
+                peer = self._peer_manager.get_peer(peer_user_id)
+                if peer is None or not peer.connected:
+                    self._heartbeat_state.pop(peer_user_id, None)
+                    continue
+
+                # Check if we should send a PING
+                elapsed_since_ping = now - hb_state["last_ping"]
+                if elapsed_since_ping >= self.HEARTBEAT_INTERVAL:
+                    # Send PING
+                    from presidium.core.network.protocol import PingPayload
+                    ping = PingPayload(
+                        sender_id=bytes.fromhex(self._peer_manager.local_user_id),
+                    )
+                    if peer.addr:
+                        try:
+                            await self._peer_manager._transport.send(
+                                MessageType.PING, ping, peer.addr,
+                            )
+                            hb_state["last_ping"] = now
+                        except Exception:
+                            pass
+
+                # Check for missed PONGs
+                elapsed_since_pong = now - hb_state["last_pong"]
+                if elapsed_since_pong > self.HEARTBEAT_INTERVAL * 2:
+                    hb_state["missed_count"] += 1
+                    if hb_state["missed_count"] >= self.MAX_MISSED_HEARTBEATS:
+                        logger.warning(
+                            "Peer %s missed %d heartbeats — marking disconnected",
+                            peer_user_id[:8],
+                            hb_state["missed_count"],
+                        )
+                        peer.connected = False
+                        self.mark_peer_disconnected(peer_user_id)
+
+            await asyncio.sleep(10.0)
+
+    def record_pong(self, peer_user_id: str) -> None:
+        """Record a received PONG for heartbeat tracking."""
+        hb_state = self._heartbeat_state.get(peer_user_id)
+        if hb_state:
+            hb_state["last_pong"] = time.monotonic()
+            hb_state["missed_count"] = 0

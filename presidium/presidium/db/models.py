@@ -1,14 +1,13 @@
 """Database schema definitions for Presidium.
 
-Uses raw aiosqlite with explicit SQL schema for maximum control and
-minimal dependencies. All tables are defined here with their creation SQL.
-
+Uses raw aiosqlite with explicit SQL schema.
+All tables are defined here with their creation SQL.
 Schema version is tracked in a metadata table for future migrations.
 """
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # SQL: Schema creation
@@ -57,6 +56,43 @@ CREATE INDEX IF NOT EXISTS idx_messages_timestamp
 ON messages(timestamp);
 """
 
+# FTS5 full-text search index
+CREATE_MESSAGES_FTS = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    message_id,
+    content,
+    content='messages',
+    content_rowid='rowid'
+);
+"""
+
+# Triggers to keep FTS in sync
+CREATE_MESSAGES_FTS_INSERT_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages
+BEGIN
+    INSERT INTO messages_fts(rowid, message_id, content)
+    VALUES (new.rowid, new.message_id, new.content);
+END;
+"""
+
+CREATE_MESSAGES_FTS_DELETE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages
+BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, message_id, content)
+    VALUES ('delete', old.rowid, old.message_id, old.content);
+END;
+"""
+
+CREATE_MESSAGES_FTS_UPDATE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages
+BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, message_id, content)
+    VALUES ('delete', old.rowid, old.message_id, old.content);
+    INSERT INTO messages_fts(rowid, message_id, content)
+    VALUES (new.rowid, new.message_id, new.content);
+END;
+"""
+
 CREATE_FILE_TRANSFERS = """
 CREATE TABLE IF NOT EXISTS file_transfers (
     session_id TEXT PRIMARY KEY,
@@ -90,6 +126,52 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 """
 
+# Reactions table
+CREATE_REACTIONS = """
+CREATE TABLE IF NOT EXISTS reactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    emoji TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(message_id, user_id, emoji),
+    FOREIGN KEY (message_id) REFERENCES messages(message_id)
+);
+"""
+
+CREATE_INDEX_REACTIONS_MESSAGE = """
+CREATE INDEX IF NOT EXISTS idx_reactions_message
+ON reactions(message_id);
+"""
+
+# Outbox table (messages pending delivery)
+CREATE_OUTBOX = """
+CREATE TABLE IF NOT EXISTS outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    peer_user_id TEXT NOT NULL,
+    message_id BLOB NOT NULL,
+    encrypted_payload BLOB NOT NULL,
+    created_at REAL NOT NULL,
+    last_retry_at REAL DEFAULT 0.0,
+    retry_count INTEGER DEFAULT 0,
+    delivered INTEGER DEFAULT 0
+);
+"""
+
+CREATE_INDEX_OUTBOX_PEER = """
+CREATE INDEX IF NOT EXISTS idx_outbox_peer
+ON outbox(peer_user_id, delivered);
+"""
+
+# Ratchet state persistence
+CREATE_RATCHET_STATES = """
+CREATE TABLE IF NOT EXISTS ratchet_states (
+    peer_user_id TEXT PRIMARY KEY,
+    state_data BLOB NOT NULL,
+    updated_at REAL NOT NULL
+);
+"""
+
 # All creation statements in order
 ALL_CREATE_STATEMENTS = [
     CREATE_METADATA,
@@ -97,7 +179,16 @@ ALL_CREATE_STATEMENTS = [
     CREATE_MESSAGES,
     CREATE_INDEX_MESSAGES_SESSION,
     CREATE_INDEX_MESSAGES_TIMESTAMP,
+    CREATE_MESSAGES_FTS,
+    CREATE_MESSAGES_FTS_INSERT_TRIGGER,
+    CREATE_MESSAGES_FTS_DELETE_TRIGGER,
+    CREATE_MESSAGES_FTS_UPDATE_TRIGGER,
     CREATE_FILE_TRANSFERS,
     CREATE_DHT_ROUTING,
     CREATE_SETTINGS,
+    CREATE_REACTIONS,
+    CREATE_INDEX_REACTIONS_MESSAGE,
+    CREATE_OUTBOX,
+    CREATE_INDEX_OUTBOX_PEER,
+    CREATE_RATCHET_STATES,
 ]

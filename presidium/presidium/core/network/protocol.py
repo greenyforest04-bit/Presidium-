@@ -57,6 +57,9 @@ class MessageType(enum.Uint8):
     CHAT_MESSAGE = 20
     CHAT_ACK = 21
     CHAT_READ = 22
+    TYPING_START = 23
+    TYPING_STOP = 24
+    REACTION = 25
 
     # DHT
     DHT_PING = 30
@@ -320,6 +323,26 @@ class ErrorPayload(msgspec.Struct):
     message: str
 
 
+class TypingStartPayload(msgspec.Struct):
+    """Typing indicator: user started typing."""
+    sender_user_id: bytes
+    session_id: bytes
+
+
+class TypingStopPayload(msgspec.Struct):
+    """Typing indicator: user stopped typing."""
+    sender_user_id: bytes
+    session_id: bytes
+
+
+class ReactionPayload(msgspec.Struct):
+    """Emoji reaction to a message."""
+    sender_user_id: bytes
+    message_id: bytes  # 16 bytes — the message being reacted to
+    emoji: str  # single emoji character
+    remove: bool = False  # True to remove a previously added reaction
+
+
 # ---------------------------------------------------------------------------
 # Payload type registry: msg_type → Struct class
 # ---------------------------------------------------------------------------
@@ -334,6 +357,9 @@ PAYLOAD_REGISTRY: dict[int, type[msgspec.Struct]] = {
     MessageType.CHAT_MESSAGE: ChatMessagePayload,
     MessageType.CHAT_ACK: ChatAckPayload,
     MessageType.CHAT_READ: ChatReadPayload,
+    MessageType.TYPING_START: TypingStartPayload,
+    MessageType.TYPING_STOP: TypingStopPayload,
+    MessageType.REACTION: ReactionPayload,
     MessageType.DHT_PING: DHTPingPayload,
     MessageType.DHT_PING_ACK: DHTPingAckPayload,
     MessageType.DHT_FIND_NODE: DHTFindNodePayload,
