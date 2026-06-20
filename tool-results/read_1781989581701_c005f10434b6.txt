@@ -1,0 +1,722 @@
+     1→"""Virtualized list widget for Presidium.
+     2→
+     3→Provides an efficient virtual scrolling container for rendering large
+     4→lists of items (e.g., chat messages, contact lists) without creating
+     5→a QWidget for every row. Only the items visible in the viewport — plus
+     6→a small buffer — are instantiated and laid out; the rest exist only as
+     7→data in the model. When the user scrolls, widgets are recycled to
+     8→represent different data rows, keeping memory usage O(visible) instead
+     9→of O(total).
+    10→
+    11→Architecture:
+    12→    VirtualListModel
+    13→        ├── Holds the full data list (list[Any])
+    14→        ├── Tracks per-item estimated heights (variable-height support)
+    15→        ├── Computes the visible range given a scroll offset
+    16→        └── Emits signals when data changes
+    17→
+    18→    VirtualListWidget(QWidget)
+    19→        ├── QScrollArea-based viewport
+    20→        ├── Only renders VISIBLE_BUFFER items above/below the fold
+    21→        ├── Recycles QWidget instances via a free-list
+    22→        ├── Supports variable-height items (message bubbles)
+    23→        └── Smooth scroll-to and scroll-to-bottom with QPropertyAnimation
+    24→
+    25→    VirtualListDelegate (ABC)
+    26→        ├── create_widget(index, data) → QWidget
+    27→        ├── update_widget(widget, index, data) → None
+    28→        └── estimate_height(data) → int
+    29→
+    30→Key design decisions:
+    31→    - Variable heights are handled by an estimated-height cache that
+    32→      is updated as widgets are actually rendered, so the scroll bar
+    33→      gradually converges on the true content height.
+    34→    - VISIBLE_BUFFER = 5 items above and below the viewport guard
+    35→      against visual gaps during fast scrolling.
+    36→    - Widget recycling avoids repeated construction/destruction;
+    37→      delegates only *update* an existing widget's content.
+    38→"""
+    39→
+    40→from __future__ import annotations
+    41→
+    42→import abc
+    43→import logging
+    44→from dataclasses import dataclass, field
+    45→from typing import Any, Optional
+    46→
+    47→from PySide6.QtCore import (
+    48→    Qt,
+    49→    Signal,
+    50→    Slot,
+    51→    QPoint,
+    52→    QRect,
+    53→    QPropertyAnimation,
+    54→    QEasingCurve,
+    55→    QTimer,
+    56→)
+    57→from PySide6.QtGui import QFontMetrics
+    58→from PySide6.QtWidgets import (
+    59→    QWidget,
+    60→    QVBoxLayout,
+    61→    QHBoxLayout,
+    62→    QScrollArea,
+    63→    QScrollBar,
+    64→    QSizePolicy,
+    65→    QLabel,
+    66→)
+    67→
+    68→logger = logging.getLogger(__name__)
+    69→
+    70→
+    71→# ---------------------------------------------------------------------------
+    72→# Constants
+    73→# ---------------------------------------------------------------------------
+    74→
+    75→VISIBLE_BUFFER: int = 5
+    76→"""Number of extra items to render above and below the visible viewport."""
+    77→
+    78→DEFAULT_ITEM_HEIGHT: int = 64
+    79→"""Fallback height when no estimate is available."""
+    80→
+    81→SCROLL_ANIMATION_DURATION_MS: int = 200
+    82→"""Duration for smooth scroll-to animations."""
+    83→
+    84→SCROLL_BAR_STEP: int = 40
+    85→"""Single scroll-step in pixels (mouse wheel / keyboard)."""
+    86→
+    87→
+    88→# ---------------------------------------------------------------------------
+    89→# Custom exceptions
+    90→# ---------------------------------------------------------------------------
+    91→
+    92→class VirtualListError(Exception):
+    93→    """Base exception for virtual list operations."""
+    94→
+    95→
+    96→class InvalidIndexError(VirtualListError):
+    97→    """Row index is out of bounds."""
+    98→
+    99→
+   100→class NoDelegateError(VirtualListError):
+   101→    """Attempted to render without a delegate installed."""
+   102→
+   103→
+   104→# ---------------------------------------------------------------------------
+   105→# Virtual List Delegate (Abstract Base Class)
+   106→# ---------------------------------------------------------------------------
+   107→
+   108→class VirtualListDelegate(abc.ABC):
+   109→    """Abstract delegate that knows how to render list items.
+   110→
+   111→    Subclass this to provide custom rendering logic for your data type.
+   112→    The virtual list calls *create_widget* the first time it needs a
+   113→    visual for a recycled slot and *update_widget* every time the slot
+   114→    is reused for a different data row.
+   115→
+   116→    The *estimate_height* method is called before the widget is shown so
+   117→    that the model can approximate total content height.  Once the real
+   118→    widget is rendered the model records the actual height.
+   119→    """
+   120→
+   121→    @abc.abstractmethod
+   122→    def create_widget(self, index: int, data: Any, parent: QWidget) -> QWidget:
+   123→        """Create a new widget for the given row.
+   124→
+   125→        Args:
+   126→            index: Row index in the data model.
+   127→            data: The data object for this row.
+   128→            parent: Parent widget (the list viewport).
+   129→
+   130→        Returns:
+   131→            A fully initialised QWidget for the row.
+   132→        """
+   133→
+   134→    @abc.abstractmethod
+   135→    def update_widget(self, widget: QWidget, index: int, data: Any) -> None:
+   136→        """Update an existing widget to represent a different row.
+   137→
+   138→        This is called when a recycled widget is reused for a new index.
+   139→
+   140→        Args:
+   141→            widget: The previously created widget.
+   142→            index: New row index.
+   143→            data: New data object.
+   144→        """
+   145→
+   146→    @abc.abstractmethod
+   147→    def estimate_height(self, data: Any) -> int:
+   148→        """Return an estimated pixel height for *data*.
+   149→
+   150→        Used by the model to compute scroll extent before the real
+   151→        widget has been rendered.  Returning ``DEFAULT_ITEM_HEIGHT``
+   152→        is always safe.
+   153→        """
+   154→
+   155→
+   156→# ---------------------------------------------------------------------------
+   157→# Virtual List Model
+   158→# ---------------------------------------------------------------------------
+   159→
+   160→class VirtualListModel:
+   161→    """Data model backing a :class:`VirtualListWidget`.
+   162→
+   163→    Stores the full data list and a height-cache so that the scroll
+   164→    area can compute content geometry without instantiating every row.
+   165→
+   166→    Signals are emitted via the owning ``VirtualListWidget`` because
+   167→    plain Python objects cannot define Qt signals.
+   168→    """
+   169→
+   170→    def __init__(self) -> None:
+   171→        self._data: list[Any] = []
+   172→        self._heights: list[int] = []
+   173→        self._cumulative_offsets: list[int] = []
+   174→
+   175→    # ------------------------------------------------------------------
+   176→    # Data management
+   177→    # ------------------------------------------------------------------
+   178→
+   179→    def set_data(self, data: list[Any]) -> None:
+   180→        """Replace the entire data list and recompute geometry.
+   181→
+   182→        Args:
+   183→            data: New list of row data objects.
+   184→        """
+   185→        self._data = list(data)
+   186→        self._heights = [DEFAULT_ITEM_HEIGHT] * len(self._data)
+   187→        self._recompute_offsets()
+   188→        logger.debug("Model data set: %d items.", len(self._data))
+   189→
+   190→    def append_data(self, item: Any, estimated_height: int = DEFAULT_ITEM_HEIGHT) -> None:
+   191→        """Append a single item to the end of the data list.
+   192→
+   193→        Args:
+   194→            item: Data object for the new row.
+   195→            estimated_height: Estimated pixel height.
+   196→        """
+   197→        self._data.append(item)
+   198→        self._heights.append(estimated_height)
+   199→        self._recompute_offsets()
+   200→
+   201→    def insert_data(self, index: int, item: Any, estimated_height: int = DEFAULT_ITEM_HEIGHT) -> None:
+   202→        """Insert an item at *index*.
+   203→
+   204→        Args:
+   205→            index: Position to insert at.
+   206→            item: Data object.
+   207→            estimated_height: Estimated pixel height.
+   208→
+   209→        Raises:
+   210→            InvalidIndexError: If *index* is out of range.
+   211→        """
+   212→        if index < 0 or index > len(self._data):
+   213→            raise InvalidIndexError(f"Cannot insert at index {index}; list size is {len(self._data)}.")
+   214→        self._data.insert(index, item)
+   215→        self._heights.insert(index, estimated_height)
+   216→        self._recompute_offsets()
+   217→
+   218→    def remove_data(self, index: int) -> Any:
+   219→        """Remove and return the item at *index*.
+   220→
+   221→        Args:
+   222→            index: Position to remove.
+   223→
+   224→        Returns:
+   225→            The removed data object.
+   226→
+   227→        Raises:
+   228→            InvalidIndexError: If *index* is out of range.
+   229→        """
+   230→        if index < 0 or index >= len(self._data):
+   231→            raise InvalidIndexError(f"Cannot remove index {index}; list size is {len(self._data)}.")
+   232→        item = self._data.pop(index)
+   233→        self._heights.pop(index)
+   234→        self._recompute_offsets()
+   235→        return item
+   236→
+   237→    def update_data(self, index: int, item: Any) -> None:
+   238→        """Replace the data object at *index*.
+   239→
+   240→        Args:
+   241→            index: Position to update.
+   242→            item: New data object.
+   243→
+   244→        Raises:
+   245→            InvalidIndexError: If *index* is out of range.
+   246→        """
+   247→        if index < 0 or index >= len(self._data):
+   248→            raise InvalidIndexError(f"Cannot update index {index}; list size is {len(self._data)}.")
+   249→        self._data[index] = item
+   250→
+   251→    def get_data(self, index: int) -> Any:
+   252→        """Return the data object at *index*.
+   253→
+   254→        Raises:
+   255→            InvalidIndexError: If *index* is out of range.
+   256→        """
+   257→        if index < 0 or index >= len(self._data):
+   258→            raise InvalidIndexError(f"Index {index} out of range (size={len(self._data)}).")
+   259→        return self._data[index]
+   260→
+   261→    def clear(self) -> None:
+   262→        """Remove all data."""
+   263→        self._data.clear()
+   264→        self._heights.clear()
+   265→        self._cumulative_offsets.clear()
+   266→
+   267→    # ------------------------------------------------------------------
+   268→    # Height management
+   269→    # ------------------------------------------------------------------
+   270→
+   271→    def set_actual_height(self, index: int, height: int) -> None:
+   272→        """Record the true rendered height for a row.
+   273→
+   274→        Called by the widget after layout so that subsequent scroll
+   275→        calculations are more accurate.
+   276→
+   277→        Args:
+   278→            index: Row index.
+   279→            height: Actual pixel height.
+   280→        """
+   281→        if 0 <= index < len(self._heights):
+   282→            old = self._heights[index]
+   283→            if old != height:
+   284→                self._heights[index] = height
+   285→                self._recompute_offsets()
+   286→
+   287→    def get_height(self, index: int) -> int:
+   288→        """Return the (estimated or actual) height for *index*."""
+   289→        if 0 <= index < len(self._heights):
+   290→            return self._heights[index]
+   291→        return DEFAULT_ITEM_HEIGHT
+   292→
+   293→    # ------------------------------------------------------------------
+   294→    # Geometry
+   295→    # ------------------------------------------------------------------
+   296→
+   297→    @property
+   298→    def item_count(self) -> int:
+   299→        """Number of items in the model."""
+   300→        return len(self._data)
+   301→
+   302→    @property
+   303→    def total_height(self) -> int:
+   304→        """Total content height in pixels."""
+   305→        if not self._cumulative_offsets:
+   306→            return 0
+   307→        return self._cumulative_offsets[-1]
+   308→
+   309→    def y_for_index(self, index: int) -> int:
+   310→        """Return the y-offset (top edge) of row *index*."""
+   311→        if index <= 0:
+   312→            return 0
+   313→        if index < len(self._cumulative_offsets):
+   314→            return self._cumulative_offsets[index - 1]
+   315→        return self.total_height
+   316→
+   317→    def index_for_y(self, y: int) -> int:
+   318→        """Return the row index that contains pixel offset *y*.
+   319→
+   320→        Uses binary search on the cumulative-offset table.
+   321→        """
+   322→        if not self._cumulative_offsets or y < 0:
+   323→            return 0
+   324→        lo, hi = 0, len(self._cumulative_offsets) - 1
+   325→        while lo < hi:
+   326→            mid = (lo + hi) // 2
+   327→            if self._cumulative_offsets[mid] <= y:
+   328→                lo = mid + 1
+   329→            else:
+   330→                hi = mid
+   331→        return lo
+   332→
+   333→    def visible_range(self, viewport_y: int, viewport_height: int) -> tuple[int, int]:
+   334→        """Compute the range of row indices that intersect the viewport.
+   335→
+   336→        Includes :data:`VISIBLE_BUFFER` items above and below.
+   337→
+   338→        Args:
+   339→            viewport_y: Top of the viewport in content coordinates.
+   340→            viewport_height: Height of the viewport in pixels.
+   341→
+   342→        Returns:
+   343→            Tuple of (start_index, end_index) inclusive.
+   344→        """
+   345→        if not self._data:
+   346→            return (0, 0)
+   347→
+   348→        first_visible = self.index_for_y(viewport_y)
+   349→        last_visible = self.index_for_y(viewport_y + viewport_height)
+   350→
+   351→        start = max(0, first_visible - VISIBLE_BUFFER)
+   352→        end = min(self.item_count - 1, last_visible + VISIBLE_BUFFER)
+   353→        return (start, end)
+   354→
+   355→    # ------------------------------------------------------------------
+   356→    # Internal
+   357→    # ------------------------------------------------------------------
+   358→
+   359→    def _recompute_offsets(self) -> None:
+   360→        """Rebuild the cumulative offset table from the height list."""
+   361→        offsets: list[int] = []
+   362→        acc = 0
+   363→        for h in self._heights:
+   364→            acc += h
+   365→            offsets.append(acc)
+   366→        self._cumulative_offsets = offsets
+   367→
+   368→
+   369→# ---------------------------------------------------------------------------
+   370→# Virtual List Widget
+   371→# ---------------------------------------------------------------------------
+   372→
+   373→class VirtualListWidget(QWidget):
+   374→    """High-performance virtualized list widget.
+   375→
+   376→    Only renders the items visible in the viewport (plus a small buffer)
+   377→    and recycles QWidget instances as the user scrolls, keeping memory
+   378→    usage proportional to the visible count rather than the total count.
+   379→
+   380→    Supports variable-height rows — message bubbles with different content
+   381→    lengths will have their heights tracked after first render so the
+   382→    scrollbar gradually converges on the true extent.
+   383→
+   384→    Signals:
+   385→        scrolled(int): Emitted with the current scroll position (y offset).
+   386→        reached_bottom(): Emitted when the list is scrolled to the very end.
+   387→        item_clicked(int): Emitted with the row index when a row is clicked.
+   388→
+   389→    Usage::
+   390→
+   391→        delegate = MyDelegate()
+   392→        vl = VirtualListWidget()
+   393→        vl.set_delegate(delegate)
+   394→        vl.set_data(my_list_of_items)
+   395→    """
+   396→
+   397→    scrolled = Signal(int)
+   398→    reached_bottom = Signal()
+   399→    item_clicked = Signal(int)
+   400→
+   401→    def __init__(self, parent: QWidget | None = None) -> None:
+   402→        super().__init__(parent)
+   403→        self._model = VirtualListModel()
+   404→        self._delegate: Optional[VirtualListDelegate] = None
+   405→
+   406→        # Widget pool: maps (index → widget) for currently rendered rows
+   407→        self._visible_widgets: dict[int, QWidget] = {}
+   408→        # Free list of recycled widgets waiting for reuse
+   409→        self._free_widgets: list[QWidget] = []
+   410→
+   411→        self._viewport_y: int = 0
+   412→        self._viewport_height: int = 0
+   413→        self._last_range: tuple[int, int] = (0, 0)
+   414→
+   415→        self._setup_ui()
+   416→        logger.debug("VirtualListWidget created.")
+   417→
+   418→    # ------------------------------------------------------------------
+   419→    # UI setup
+   420→    # ------------------------------------------------------------------
+   421→
+   422→    def _setup_ui(self) -> None:
+   423→        """Build the internal scroll-area based layout."""
+   424→        self._scroll_area = QScrollArea(self)
+   425→        self._scroll_area.setWidgetResizable(False)
+   426→        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+   427→        self._scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+   428→        self._scroll_area.setStyleSheet(
+   429→            "QScrollArea { border: none; background: transparent; }"
+   430→        )
+   431→
+   432→        # The "content" widget that fills the virtual height
+   433→        self._content_widget = QWidget()
+   434→        self._content_widget.setStyleSheet("background: transparent;")
+   435→
+   436→        self._content_layout = QVBoxLayout(self._content_widget)
+   437→        self._content_layout.setContentsMargins(0, 0, 0, 0)
+   438→        self._content_layout.setSpacing(0)
+   439→        self._content_layout.addStretch(0)  # grows to fill total height
+   440→
+   441→        self._scroll_area.setWidget(self._content_widget)
+   442→
+   443→        # Main layout
+   444→        outer = QVBoxLayout(self)
+   445→        outer.setContentsMargins(0, 0, 0, 0)
+   446→        outer.setSpacing(0)
+   447→        outer.addWidget(self._scroll_area)
+   448→
+   449→        # Scroll bar signals
+   450→        vbar = self._scroll_area.verticalScrollBar()
+   451→        vbar.setSingleStep(SCROLL_BAR_STEP)
+   452→        vbar.valueChanged.connect(self._on_scroll_value_changed)
+   453→
+   454→        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+   455→
+   456→    # ------------------------------------------------------------------
+   457→    # Public API
+   458→    # ------------------------------------------------------------------
+   459→
+   460→    def set_delegate(self, delegate: VirtualListDelegate) -> None:
+   461→        """Set the delegate used to create and update row widgets.
+   462→
+   463→        Must be called before :meth:`set_data`.
+   464→
+   465→        Args:
+   466→            delegate: The delegate instance.
+   467→        """
+   468→        self._delegate = delegate
+   469→        # Discard all rendered widgets — the new delegate creates new ones
+   470→        self._recycle_all()
+   471→        logger.debug("Delegate set: %s", type(delegate).__name__)
+   472→
+   473→    def set_data(self, data: list[Any]) -> None:
+   474→        """Set the list data and refresh the viewport.
+   475→
+   476→        Args:
+   477→            data: List of row data objects.
+   478→        """
+   479→        self._recycle_all()
+   480→        self._model.set_data(data)
+   481→        self._update_content_height()
+   482→        self._render_visible()
+   483→        logger.info("Data set: %d items.", len(data))
+   484→
+   485→    @property
+   486→    def item_count(self) -> int:
+   487→        """Number of items in the list."""
+   488→        return self._model.item_count
+   489→
+   490→    def scroll_to(self, index: int, animate: bool = True) -> None:
+   491→        """Scroll so that row *index* is visible in the viewport.
+   492→
+   493→        Args:
+   494→            index: Target row index.
+   495→            animate: If True, use a smooth scrolling animation.
+   496→
+   497→        Raises:
+   498→            InvalidIndexError: If *index* is out of range.
+   499→        """
+   500→        if index < 0 or index >= self._model.item_count:
+   501→            raise InvalidIndexError(f"Cannot scroll to index {index}; size is {self._model.item_count}.")
+   502→
+   503→        target_y = self._model.y_for_index(index)
+   504→        vbar = self._scroll_area.verticalScrollBar()
+   505→
+   506→        if animate:
+   507→            self._animate_scroll(vbar.value(), target_y)
+   508→        else:
+   509→            vbar.setValue(target_y)
+   510→
+   511→    def scroll_to_bottom(self, animate: bool = True) -> None:
+   512→        """Scroll to the bottom of the list.
+   513→
+   514→        Args:
+   515→            animate: If True, use smooth scrolling.
+   516→        """
+   517→        if self._model.item_count == 0:
+   518→            return
+   519→        target_y = max(0, self._model.total_height - self._viewport_height)
+   520→        vbar = self._scroll_area.verticalScrollBar()
+   521→        if animate:
+   522→            self._animate_scroll(vbar.value(), target_y)
+   523→        else:
+   524→            vbar.setValue(target_y)
+   525→
+   526→    def scroll_to_top(self, animate: bool = True) -> None:
+   527→        """Scroll to the top of the list.
+   528→
+   529→        Args:
+   530→            animate: If True, use smooth scrolling.
+   531→        """
+   532→        vbar = self._scroll_area.verticalScrollBar()
+   533→        if animate:
+   534→            self._animate_scroll(vbar.value(), 0)
+   535→        else:
+   536→            vbar.setValue(0)
+   537→
+   538→    def refresh(self) -> None:
+   539→        """Force a full re-render of visible items."""
+   540→        self._update_content_height()
+   541→        self._render_visible()
+   542→
+   543→    def update_item(self, index: int) -> None:
+   544→        """Re-render a single item if it is currently visible.
+   545→
+   546→        Args:
+   547→            index: Row index to update.
+   548→        """
+   549→        if index in self._visible_widgets and self._delegate is not None:
+   550→            data = self._model.get_data(index)
+   551→            widget = self._visible_widgets[index]
+   552→            self._delegate.update_widget(widget, index, data)
+   553→
+   554→    # ------------------------------------------------------------------
+   555→    # Event overrides
+   556→    # ------------------------------------------------------------------
+   557→
+   558→    def resizeEvent(self, event) -> None:
+   559→        """Handle viewport resize by re-rendering."""
+   560→        super().resizeEvent(event)
+   561→        self._viewport_height = self._scroll_area.viewport().height()
+   562→        self._update_content_height()
+   563→        self._render_visible()
+   564→
+   565→    # ------------------------------------------------------------------
+   566→    # Scroll handling
+   567→    # ------------------------------------------------------------------
+   568→
+   569→    @Slot(int)
+   570→    def _on_scroll_value_changed(self, value: int) -> None:
+   571→        """React to scroll position changes."""
+   572→        self._viewport_y = value
+   573→        self.scrolled.emit(value)
+   574→        self._render_visible()
+   575→
+   576→        # Detect bottom
+   577→        vbar = self._scroll_area.verticalScrollBar()
+   578→        if vbar.maximum() <= value + 2:
+   579→            self.reached_bottom.emit()
+   580→
+   581→    def _animate_scroll(self, start_y: int, end_y: int) -> None:
+   582→        """Smooth-scroll from *start_y* to *end_y*.
+   583→
+   584→        Args:
+   585→            start_y: Starting scroll position.
+   586→            end_y: Target scroll position.
+   587→        """
+   588→        vbar = self._scroll_area.verticalScrollBar()
+   589→        self._scroll_anim = QPropertyAnimation(vbar, b"value")
+   590→        self._scroll_anim.setDuration(SCROLL_ANIMATION_DURATION_MS)
+   591→        self._scroll_anim.setStartValue(start_y)
+   592→        self._scroll_anim.setEndValue(end_y)
+   593→        self._scroll_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+   594→        self._scroll_anim.start()
+   595→
+   596→    # ------------------------------------------------------------------
+   597→    # Rendering / recycling
+   598→    # ------------------------------------------------------------------
+   599→
+   600→    def _update_content_height(self) -> None:
+   601→        """Set the content widget height to match the model's total height."""
+   602→        total = self._model.total_height
+   603→        min_height = max(total, self._scroll_area.viewport().height())
+   604→        self._content_widget.setFixedHeight(min_height)
+   605→
+   606→    def _render_visible(self) -> None:
+   607→        """Create / recycle widgets for the visible range."""
+   608→        if self._delegate is None:
+   609→            raise NoDelegateError("No delegate set. Call set_delegate() first.")
+   610→
+   611→        vp_height = self._scroll_area.viewport().height()
+   612→        if vp_height <= 0:
+   613→            vp_height = self.height()
+   614→        self._viewport_height = vp_height
+   615→
+   616→        start, end = self._model.visible_range(self._viewport_y, vp_height)
+   617→        new_range = (start, end)
+   618→
+   619→        # Nothing changed — skip
+   620→        if new_range == self._last_range and self._visible_widgets:
+   621→            return
+   622→        self._last_range = new_range
+   623→
+   624→        # Determine which indices are no longer visible
+   625→        to_recycle = [idx for idx in self._visible_widgets if idx < start or idx > end]
+   626→
+   627→        # Recycle invisible widgets
+   628→        for idx in to_recycle:
+   629→            widget = self._visible_widgets.pop(idx)
+   630→            widget.hide()
+   631→            self._free_widgets.append(widget)
+   632→
+   633→        # Render visible items
+   634→        for idx in range(start, end + 1):
+   635→            if idx >= self._model.item_count:
+   636→                break
+   637→            data = self._model.get_data(idx)
+   638→            y_pos = self._model.y_for_index(idx)
+   639→            est_height = self._model.get_height(idx)
+   640→
+   641→            if idx in self._visible_widgets:
+   642→                # Update existing widget
+   643→                widget = self._visible_widgets[idx]
+   644→                self._delegate.update_widget(widget, idx, data)
+   645→            else:
+   646→                # Get a widget (recycled or new)
+   647→                widget = self._acquire_widget(idx, data)
+   648→
+   649→            # Position the widget
+   650→            widget.move(0, y_pos)
+   651→            widget.setFixedWidth(self._scroll_area.viewport().width())
+   652→            widget.show()
+   653→
+   654→            # Record actual height after layout
+   655→            QTimer.singleShot(0, lambda i=idx, w=widget: self._record_actual_height(i, w))
+   656→
+   657→    def _acquire_widget(self, index: int, data: Any) -> QWidget:
+   658→        """Obtain a widget — from the free-list or freshly created.
+   659→
+   660→        Args:
+   661→            index: Row index.
+   662→            data: Row data.
+   663→
+   664→        Returns:
+   665→            A widget ready for display.
+   666→        """
+   667→        assert self._delegate is not None  # guaranteed by _render_visible
+   668→
+   669→        if self._free_widgets:
+   670→            widget = self._free_widgets.pop()
+   671→            self._delegate.update_widget(widget, index, data)
+   672→        else:
+   673→            widget = self._delegate.create_widget(index, data, self._content_widget)
+   674→
+   675→        widget.setParent(self._content_widget)
+   676→        self._visible_widgets[index] = widget
+   677→        return widget
+   678→
+   679→    def _record_actual_height(self, index: int, widget: QWidget) -> None:
+   680→        """Record the real rendered height of a widget back to the model.
+   681→
+   682→        This is called asynchronously so that Qt has a chance to lay out
+   683→        the widget before we measure it.
+   684→
+   685→        Args:
+   686→            index: Row index.
+   687→            widget: The rendered widget.
+   688→        """
+   689→        actual = widget.sizeHint().height() if widget.sizeHint().height() > 0 else widget.height()
+   690→        if actual > 0:
+   691→            old = self._model.get_height(index)
+   692→            if old != actual:
+   693→                self._model.set_actual_height(index, actual)
+   694→                # Content height may have changed
+   695→                self._update_content_height()
+   696→
+   697→    def _recycle_all(self) -> None:
+   698→        """Hide and pool all currently visible widgets."""
+   699→        for idx, widget in list(self._visible_widgets.items()):
+   700→            widget.hide()
+   701→            widget.setParent(None)
+   702→            widget.deleteLater()
+   703→        self._visible_widgets.clear()
+   704→        for widget in self._free_widgets:
+   705→            widget.setParent(None)
+   706→            widget.deleteLater()
+   707→        self._free_widgets.clear()
+   708→        self._last_range = (0, 0)
+   709→
+   710→    # ------------------------------------------------------------------
+   711→    # Utility
+   712→    # ------------------------------------------------------------------
+   713→
+   714→    def widget_for_index(self, index: int) -> Optional[QWidget]:
+   715→        """Return the QWidget for *index* if it is currently rendered, else None."""
+   716→        return self._visible_widgets.get(index)
+   717→
+   718→    @property
+   719→    def model(self) -> VirtualListModel:
+   720→        """Access the underlying data model."""
+   721→        return self._model
+   722→

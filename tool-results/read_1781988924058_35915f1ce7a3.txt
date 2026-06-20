@@ -1,0 +1,823 @@
+     1→"""Notification manager for Presidium — grouped, inline-reply, history.
+     2→
+     3→Provides a comprehensive notification system that integrates with the
+     4→Push Client and Tray Manager to deliver rich desktop notifications:
+     5→
+     6→    - Grouped notifications: multiple messages from the same contact
+     7→      are collapsed into a single notification with a count badge
+     8→    - Inline reply: respond to messages directly from the notification
+     9→      without opening the main window (platform-dependent)
+    10→    - Notification history: persistent log of all received notifications
+    11→      with search, filter, and bulk actions
+    12→    - Priority levels: urgent / normal / low — controls sound, vibration,
+    13→      and visual prominence
+    14→    - Do-not-disturb: per-contact and global DND schedules
+    15→    - Action buttons: mark read, mute conversation, quick reactions
+    16→
+    17→Architecture:
+    18→    NotificationManager (singleton)
+    19→        ├── NotificationGroup (per-contact grouping)
+    20→        │   ├── Notification (single notification item)
+    21→        │   └── inline_reply_handler
+    22→        ├── NotificationHistory (persistent SQLite storage)
+    23→        ├── DNDScheduler (do-not-disturb schedules)
+    24→        └── SoundPlayer (notification sounds)
+    25→
+    26→The manager integrates with:
+    27→    - PushClient: receives DecryptedNotification from background poll
+    28→    - TrayManager: shows desktop notifications via QSystemTrayIcon
+    29→    - ChatManager: delivers inline replies via the messaging layer
+    30→"""
+    31→
+    32→from __future__ import annotations
+    33→
+    34→import asyncio
+    35→import enum
+    36→import logging
+    37→import time
+    38→from dataclasses import dataclass, field
+    39→from typing import Callable, Awaitable, Optional
+    40→
+    41→from PySide6.QtCore import Qt, QObject, Signal, QTimer, QDateTime
+    42→from PySide6.QtGui import QAction
+    43→from PySide6.QtWidgets import (
+    44→    QSystemTrayIcon,
+    45→    QWidget,
+    46→    QVBoxLayout,
+    47→    QHBoxLayout,
+    48→    QLabel,
+    49→    QPushButton,
+    50→    QListWidget,
+    51→    QListWidgetItem,
+    52→    QLineEdit,
+    53→    QComboBox,
+    54→    QCheckBox,
+    55→    QDialog,
+    56→    QTextEdit,
+    57→    QMenu,
+    58→)
+    59→
+    60→logger = logging.getLogger(__name__)
+    61→
+    62→
+    63→# ---------------------------------------------------------------------------
+    64→# Constants
+    65→# ---------------------------------------------------------------------------
+    66→
+    67→MAX_NOTIFICATION_HISTORY = 1000
+    68→GROUP_COLLAPSE_TIMEOUT = 5.0    # seconds to wait before collapsing
+    69→MAX_INLINE_REPLY_LENGTH = 500
+    70→NOTIFICATION_SOUND_DEFAULT = "message"
+    71→
+    72→
+    73→# ---------------------------------------------------------------------------
+    74→# Custom exceptions
+    75→# ---------------------------------------------------------------------------
+    76→
+    77→class NotificationError(Exception):
+    78→    """Base exception for notification operations."""
+    79→
+    80→
+    81→class HistoryError(NotificationError):
+    82→    """Failed to access notification history."""
+    83→
+    84→
+    85→class DNDError(NotificationError):
+    86→    """Do-not-disturb configuration error."""
+    87→
+    88→
+    89→# ---------------------------------------------------------------------------
+    90→# Enums
+    91→# ---------------------------------------------------------------------------
+    92→
+    93→class NotificationPriority(enum.IntEnum):
+    94→    """Priority level for notifications."""
+    95→    LOW = 0
+    96→    NORMAL = 1
+    97→    URGENT = 2
+    98→
+    99→
+   100→class NotificationType(enum.Enum):
+   101→    """Type of notification content."""
+   102→    CHAT_MESSAGE = "chat_message"
+   103→    GROUP_MESSAGE = "group_message"
+   104→    FILE_RECEIVED = "file_received"
+   105→    VOICE_CALL = "voice_call"
+   106→    GROUP_CALL = "group_call"
+   107→    CONTACT_REQUEST = "contact_request"
+   108→    SYSTEM = "system"
+   109→    MENTION = "mention"
+   110→
+   111→
+   112→# ---------------------------------------------------------------------------
+   113→# Data models
+   114→# ---------------------------------------------------------------------------
+   115→
+   116→@dataclass
+   117→class Notification:
+   118→    """A single notification item.
+   119→
+   120→    Attributes:
+   121→        notification_id: Unique identifier (hex string).
+   122→        peer_user_id: User ID of the sender.
+   123→        peer_name: Display name of the sender.
+   124→        notification_type: Type of notification.
+   125→        priority: Priority level.
+   126→        title: Notification title.
+   127→        body: Notification body text.
+   128→        timestamp: Unix timestamp when the notification was created.
+   129→        is_read: Whether the notification has been read.
+   130→        chat_id: Associated chat session ID.
+   131→        message_id: Associated message ID (for inline reply).
+   132→        group_id: Group ID for grouping related notifications.
+   133→        action_data: Additional data for notification actions.
+   134→    """
+   135→    notification_id: str = ""
+   136→    peer_user_id: str = ""
+   137→    peer_name: str = ""
+   138→    notification_type: NotificationType = NotificationType.CHAT_MESSAGE
+   139→    priority: NotificationPriority = NotificationPriority.NORMAL
+   140→    title: str = ""
+   141→    body: str = ""
+   142→    timestamp: float = 0.0
+   143→    is_read: bool = False
+   144→    chat_id: str = ""
+   145→    message_id: str = ""
+   146→    group_id: str = ""
+   147→    action_data: dict = field(default_factory=dict)
+   148→
+   149→
+   150→@dataclass
+   151→class NotificationGroup:
+   152→    """A group of related notifications from the same contact.
+   153→
+   154→    Attributes:
+   155→        group_id: Unique identifier for the group.
+   156→        peer_user_id: User ID of the contact.
+   157→        peer_name: Display name of the contact.
+   158→        notifications: List of notifications in the group.
+   159→        last_updated: Unix timestamp of the most recent notification.
+   160→        collapsed: Whether the group is currently collapsed.
+   161→    """
+   162→    group_id: str = ""
+   163→    peer_user_id: str = ""
+   164→    peer_name: str = ""
+   165→    notifications: list[Notification] = field(default_factory=list)
+   166→    last_updated: float = 0.0
+   167→    collapsed: bool = True
+   168→
+   169→    @property
+   170→    def unread_count(self) -> int:
+   171→        """Number of unread notifications in the group."""
+   172→        return sum(1 for n in self.notifications if not n.is_read)
+   173→
+   174→    @property
+   175→    def latest(self) -> Optional[Notification]:
+   176→        """The most recent notification in the group."""
+   177→        if not self.notifications:
+   178→            return None
+   179→        return max(self.notifications, key=lambda n: n.timestamp)
+   180→
+   181→    @property
+   182→    def summary_text(self) -> str:
+   183→        """Summary text for the collapsed group."""
+   184→        count = len(self.notifications)
+   185→        if count == 1:
+   186→            return self.notifications[0].body[:100]
+   187→        return f"{count} messages — {self.latest.body[:60] if self.latest else ''}"
+   188→
+   189→
+   190→@dataclass
+   191→class DNDSchedule:
+   192→    """Do-not-disturb schedule configuration.
+   193→
+   194→    Attributes:
+   195→        enabled: Whether DND is currently active.
+   196→        start_hour: Start hour (0-23) for scheduled DND.
+   197→        start_minute: Start minute (0-59).
+   198→        end_hour: End hour (0-23).
+   199→        end_minute: End minute (0-59).
+   200→        allow_urgent: Whether to allow urgent notifications during DND.
+   201→        allow_mentions: Whether to allow @mention notifications during DND.
+   202→        muted_contacts: Set of peer_user_ids that are muted.
+   203→    """
+   204→    enabled: bool = False
+   205→    start_hour: int = 22
+   206→    start_minute: int = 0
+   207→    end_hour: int = 8
+   208→    end_minute: int = 0
+   209→    allow_urgent: bool = True
+   210→    allow_mentions: bool = True
+   211→    muted_contacts: set[str] = field(default_factory=set)
+   212→
+   213→    def is_dnd_active(self) -> bool:
+   214→        """Check if DND should be active right now based on the schedule.
+   215→
+   216→        Returns:
+   217→            True if DND is enabled and current time is within the DND window.
+   218→        """
+   219→        if not self.enabled:
+   220→            return False
+   221→
+   222→        from datetime import datetime
+   223→        now = datetime.now()
+   224→        current_minutes = now.hour * 60 + now.minute
+   225→        start_minutes = self.start_hour * 60 + self.start_minute
+   226→        end_minutes = self.end_hour * 60 + self.end_minute
+   227→
+   228→        if start_minutes <= end_minutes:
+   229→            # Same day range (e.g., 9:00 - 17:00)
+   230→            return start_minutes <= current_minutes < end_minutes
+   231→        else:
+   232→            # Overnight range (e.g., 22:00 - 8:00)
+   233→            return current_minutes >= start_minutes or current_minutes < end_minutes
+   234→
+   235→    def should_suppress(self, notification: Notification) -> bool:
+   236→        """Check if a notification should be suppressed by DND.
+   237→
+   238→        Urgent notifications pass through if allow_urgent is True.
+   239→        Mention notifications pass through if allow_mentions is True.
+   240→        Muted contacts are always suppressed.
+   241→
+   242→        Returns:
+   243→            True if the notification should be suppressed.
+   244→        """
+   245→        if notification.peer_user_id in self.muted_contacts:
+   246→            return True
+   247→
+   248→        if not self.is_dnd_active():
+   249→            return False
+   250→
+   251→        if self.allow_urgent and notification.priority == NotificationPriority.URGENT:
+   252→            return False
+   253→
+   254→        if self.allow_mentions and notification.notification_type == NotificationType.MENTION:
+   255→            return False
+   256→
+   257→        return True
+   258→
+   259→
+   260→# ---------------------------------------------------------------------------
+   261→# Notification Manager
+   262→# ---------------------------------------------------------------------------
+   263→
+   264→class NotificationManager(QObject):
+   265→    """Centralized notification management for Presidium.
+   266→
+   267→    Manages notification grouping, DND scheduling, history, and delivery
+   268→    via the system tray. Integrates with PushClient for background
+   269→    notifications and ChatManager for inline replies.
+   270→
+   271→    Signals:
+   272→        notification_received(Notification): New notification created.
+   273→        notification_read(str): Notification marked as read (notification_id).
+   274→        group_updated(str): Notification group changed (group_id).
+   275→        inline_reply_sent(str, str): Reply sent (peer_user_id, message).
+   276→    """
+   277→
+   278→    notification_received = Signal(object)   # Notification
+   279→    notification_read = Signal(str)          # notification_id
+   280→    group_updated = Signal(str)              # group_id
+   281→    inline_reply_sent = Signal(str, str)     # peer_user_id, message_text
+   282→
+   283→    def __init__(
+   284→        self,
+   285→        tray_manager: Optional[object] = None,
+   286→        parent: Optional[QObject] = None,
+   287→    ) -> None:
+   288→        super().__init__(parent)
+   289→        self._tray_manager = tray_manager
+   290→        self._groups: dict[str, NotificationGroup] = {}
+   291→        self._history: list[Notification] = []
+   292→        self._dnd = DNDSchedule()
+   293→        self._sound_enabled = True
+   294→
+   295→        # Callbacks
+   296→        self._on_inline_reply: Optional[Callable[[str, str], Awaitable[None]]] = None
+   297→
+   298→        # Collapse timer
+   299→        self._collapse_timer = QTimer(self)
+   300→        self._collapse_timer.setInterval(int(GROUP_COLLAPSE_TIMEOUT * 1000))
+   301→        self._collapse_timer.timeout.connect(self._collapse_groups)
+   302→        self._collapse_timer.start()
+   303→
+   304→    # -------------------------------------------------------------------
+   305→    # Configuration
+   306→    # -------------------------------------------------------------------
+   307→
+   308→    def set_dnd_schedule(self, schedule: DNDSchedule) -> None:
+   309→        """Update the do-not-disturb schedule."""
+   310→        self._dnd = schedule
+   311→        logger.info(
+   312→            "DND schedule updated: enabled=%s, %02d:%02d-%02d:%02d",
+   313→            schedule.enabled, schedule.start_hour, schedule.start_minute,
+   314→            schedule.end_hour, schedule.end_minute,
+   315→        )
+   316→
+   317→    def set_sound_enabled(self, enabled: bool) -> None:
+   318→        """Enable or disable notification sounds."""
+   319→        self._sound_enabled = enabled
+   320→
+   321→    def mute_contact(self, peer_user_id: str) -> None:
+   322→        """Add a contact to the DND mute list."""
+   323→        self._dnd.muted_contacts.add(peer_user_id)
+   324→
+   325→    def unmute_contact(self, peer_user_id: str) -> None:
+   326→        """Remove a contact from the DND mute list."""
+   327→        self._dnd.muted_contacts.discard(peer_user_id)
+   328→
+   329→    def set_on_inline_reply(
+   330→        self, callback: Callable[[str, str], Awaitable[None]]
+   331→    ) -> None:
+   332→        """Register callback for inline replies from notifications.
+   333→
+   334→        Args:
+   335→            callback: Async function(peer_user_id, message_text).
+   336→        """
+   337→        self._on_inline_reply = callback
+   338→
+   339→    # -------------------------------------------------------------------
+   340→    # Notification creation
+   341→    # -------------------------------------------------------------------
+   342→
+   343→    def create_notification(
+   344→        self,
+   345→        peer_user_id: str,
+   346→        peer_name: str,
+   347→        title: str,
+   348→        body: str,
+   349→        notification_type: NotificationType = NotificationType.CHAT_MESSAGE,
+   350→        priority: NotificationPriority = NotificationPriority.NORMAL,
+   351→        chat_id: str = "",
+   352→        message_id: str = "",
+   353→        action_data: Optional[dict] = None,
+   354→    ) -> Notification:
+   355→        """Create and deliver a new notification.
+   356→
+   357→        The notification is added to the appropriate group, checked
+   358→        against DND rules, and delivered via the system tray if allowed.
+   359→
+   360→        Args:
+   361→            peer_user_id: Sender's user ID.
+   362→            peer_name: Sender's display name.
+   363→            title: Notification title.
+   364→            body: Notification body text.
+   365→            notification_type: Type of notification.
+   366→            priority: Priority level.
+   367→            chat_id: Associated chat session ID.
+   368→            message_id: Associated message ID.
+   369→            action_data: Additional action data.
+   370→
+   371→        Returns:
+   372→            The created Notification object.
+   373→        """
+   374→        import os
+   375→        notification_id = os.urandom(8).hex()
+   376→
+   377→        notification = Notification(
+   378→            notification_id=notification_id,
+   379→            peer_user_id=peer_user_id,
+   380→            peer_name=peer_name,
+   381→            notification_type=notification_type,
+   382→            priority=priority,
+   383→            title=title,
+   384→            body=body,
+   385→            timestamp=time.time(),
+   386→            is_read=False,
+   387→            chat_id=chat_id,
+   388→            message_id=message_id,
+   389→            group_id=peer_user_id,
+   390→            action_data=action_data or {},
+   391→        )
+   392→
+   393→        # Add to group
+   394→        self._add_to_group(notification)
+   395→
+   396→        # Add to history
+   397→        self._add_to_history(notification)
+   398→
+   399→        # Check DND
+   400→        if not self._dnd.should_suppress(notification):
+   401→            self._deliver_notification(notification)
+   402→
+   403→        # Emit signal
+   404→        self.notification_received.emit(notification)
+   405→
+   406→        logger.debug(
+   407→            "Created notification %s from %s (%s, priority=%s)",
+   408→            notification_id,
+   409→            peer_user_id[:8],
+   410→            notification_type.value,
+   411→            priority.name,
+   412→        )
+   413→
+   414→        return notification
+   415→
+   416→    # -------------------------------------------------------------------
+   417→    # Grouping
+   418→    # -------------------------------------------------------------------
+   419→
+   420→    def _add_to_group(self, notification: Notification) -> None:
+   421→        """Add a notification to its group (creates group if needed)."""
+   422→        group_id = notification.group_id
+   423→        if group_id not in self._groups:
+   424→            self._groups[group_id] = NotificationGroup(
+   425→                group_id=group_id,
+   426→                peer_user_id=notification.peer_user_id,
+   427→                peer_name=notification.peer_name,
+   428→            )
+   429→        group = self._groups[group_id]
+   430→        group.notifications.append(notification)
+   431→        group.last_updated = notification.timestamp
+   432→        self.group_updated.emit(group_id)
+   433→
+   434→    def _collapse_groups(self) -> None:
+   435→        """Collapse groups that haven't been updated recently."""
+   436→        now = time.time()
+   437→        for group in self._groups.values():
+   438→            if not group.collapsed and (now - group.last_updated) > GROUP_COLLAPSE_TIMEOUT:
+   439→                group.collapsed = True
+   440→                self.group_updated.emit(group.group_id)
+   441→
+   442→    def get_group(self, group_id: str) -> Optional[NotificationGroup]:
+   443→        """Get a notification group by ID."""
+   444→        return self._groups.get(group_id)
+   445→
+   446→    def get_all_groups(self) -> list[NotificationGroup]:
+   447→        """Get all notification groups, sorted by most recent."""
+   448→        return sorted(
+   449→            self._groups.values(),
+   450→            key=lambda g: g.last_updated,
+   451→            reverse=True,
+   452→        )
+   453→
+   454→    # -------------------------------------------------------------------
+   455→    # History
+   456→    # -------------------------------------------------------------------
+   457→
+   458→    def _add_to_history(self, notification: Notification) -> None:
+   459→        """Add a notification to the history log."""
+   460→        self._history.append(notification)
+   461→        # Trim history to max size
+   462→        if len(self._history) > MAX_NOTIFICATION_HISTORY:
+   463→            self._history = self._history[-MAX_NOTIFICATION_HISTORY:]
+   464→
+   465→    def get_history(
+   466→        self,
+   467→        limit: int = 100,
+   468→        offset: int = 0,
+   469→        unread_only: bool = False,
+   470→        peer_user_id: str = "",
+   471→    ) -> list[Notification]:
+   472→        """Query notification history with optional filters.
+   473→
+   474→        Args:
+   475→            limit: Maximum number of notifications to return.
+   476→            offset: Offset for pagination.
+   477→            unread_only: Only return unread notifications.
+   478→            peer_user_id: Filter by sender.
+   479→
+   480→        Returns:
+   481→            List of matching Notification objects.
+   482→        """
+   483→        results = self._history
+   484→
+   485→        if unread_only:
+   486→            results = [n for n in results if not n.is_read]
+   487→        if peer_user_id:
+   488→            results = [n for n in results if n.peer_user_id == peer_user_id]
+   489→
+   490→        # Sort by timestamp, most recent first
+   491→        results = sorted(results, key=lambda n: n.timestamp, reverse=True)
+   492→        return results[offset:offset + limit]
+   493→
+   494→    def mark_read(self, notification_id: str) -> None:
+   495→        """Mark a notification as read."""
+   496→        for notification in self._history:
+   497→            if notification.notification_id == notification_id:
+   498→                notification.is_read = True
+   499→                self.notification_read.emit(notification_id)
+   500→                break
+   501→
+   502→    def mark_all_read(self, peer_user_id: str = "") -> None:
+   503→        """Mark all notifications as read, optionally filtered by peer.
+   504→
+   505→        Args:
+   506→            peer_user_id: If provided, only mark notifications from this peer.
+   507→        """
+   508→        for notification in self._history:
+   509→            if not peer_user_id or notification.peer_user_id == peer_user_id:
+   510→                notification.is_read = True
+   511→                self.notification_read.emit(notification.notification_id)
+   512→
+   513→    def clear_history(self, older_than: float = 0.0) -> int:
+   514→        """Clear notification history.
+   515→
+   516→        Args:
+   517→            older_than: Only clear notifications older than this timestamp.
+   518→                If 0, clear all history.
+   519→
+   520→        Returns:
+   521→            Number of notifications removed.
+   522→        """
+   523→        if older_than == 0.0:
+   524→            count = len(self._history)
+   525→            self._history.clear()
+   526→            return count
+   527→
+   528→        original = len(self._history)
+   529→        self._history = [n for n in self._history if n.timestamp >= older_than]
+   530→        return original - len(self._history)
+   531→
+   532→    # -------------------------------------------------------------------
+   533→    # Delivery
+   534→    # -------------------------------------------------------------------
+   535→
+   536→    def _deliver_notification(self, notification: Notification) -> None:
+   537→        """Deliver a notification via the system tray.
+   538→
+   539→        Args:
+   540→            notification: The notification to deliver.
+   541→        """
+   542→        if self._tray_manager is None:
+   543→            return
+   544→
+   545→        # Check if there's a group with multiple items
+   546→        group = self._groups.get(notification.group_id)
+   547→        if group and len(group.notifications) > 1 and group.collapsed:
+   548→            title = f"{notification.peer_name} ({len(group.notifications)})"
+   549→            body = group.summary_text
+   550→        else:
+   551→            title = notification.title or notification.peer_name
+   552→            body = notification.body
+   553→
+   554→        # Add priority indicator
+   555→        if notification.priority == NotificationPriority.URGENT:
+   556→            title = f"🔴 {title}"
+   557→        elif notification.priority == NotificationPriority.LOW:
+   558→            title = f"⚪ {title}"
+   559→
+   560→        try:
+   561→            self._tray_manager.show_notification(
+   562→                title=title,
+   563→                message=body[:200],
+   564→                peer_user_id=notification.peer_user_id,
+   565→            )
+   566→        except Exception as exc:
+   567→            logger.debug("Notification delivery failed: %s", exc)
+   568→
+   569→        # Play sound
+   570→        if self._sound_enabled and notification.priority >= NotificationPriority.NORMAL:
+   571→            self._play_notification_sound()
+   572→
+   573→    def _play_notification_sound(self) -> None:
+   574→        """Play a notification sound.
+   575→
+   576→        Uses QSound or the system notification sound. This is a
+   577→        best-effort operation — if sound is unavailable, it's silently
+   578→        skipped.
+   579→        """
+   580→        try:
+   581→            # Try QSoundEffect for cross-platform sound
+   582→            from PySide6.QtMultimedia import QSoundEffect
+   583→            from PySide6.QtCore import QUrl
+   584→
+   585→            # Use system notification sound if available
+   586→            sound = QSoundEffect(self)
+   587→            sound.setSource(QUrl.fromLocalFile("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"))
+   588→            sound.setVolume(0.5)
+   589→            sound.play()
+   590→        except Exception:
+   591→            logger.debug("Notification sound not available.")
+   592→
+   593→    # -------------------------------------------------------------------
+   594→    # Inline reply
+   595→    # -------------------------------------------------------------------
+   596→
+   597→    async def handle_inline_reply(
+   598→        self, notification_id: str, reply_text: str
+   599→    ) -> bool:
+   600→        """Handle an inline reply from a notification.
+   601→
+   602→        Args:
+   603→            notification_id: ID of the notification being replied to.
+   604→            reply_text: The reply message text.
+   605→
+   606→        Returns:
+   607→            True if the reply was sent successfully.
+   608→
+   609→        Raises:
+   610→            NotificationError: If the notification is not found or reply fails.
+   611→        """
+   612→        if len(reply_text) > MAX_INLINE_REPLY_LENGTH:
+   613→            raise NotificationError(
+   614→                f"Reply too long: {len(reply_text)} chars, max {MAX_INLINE_REPLY_LENGTH}."
+   615→            )
+   616→
+   617→        # Find the notification
+   618→        notification = None
+   619→        for n in self._history:
+   620→            if n.notification_id == notification_id:
+   621→                notification = n
+   622→                break
+   623→
+   624→        if notification is None:
+   625→            raise NotificationError(f"Notification {notification_id} not found.")
+   626→
+   627→        # Send the reply
+   628→        if self._on_inline_reply:
+   629→            try:
+   630→                await self._on_inline_reply(
+   631→                    notification.peer_user_id, reply_text
+   632→                )
+   633→                self.inline_reply_sent.emit(
+   634→                    notification.peer_user_id, reply_text
+   635→                )
+   636→                logger.info(
+   637→                    "Inline reply sent to %s: %s",
+   638→                    notification.peer_user_id[:8],
+   639→                    reply_text[:50],
+   640→                )
+   641→                return True
+   642→            except Exception as exc:
+   643→                raise NotificationError(
+   644→                    f"Inline reply failed: {exc}"
+   645→                ) from exc
+   646→
+   647→        logger.warning("No inline reply handler registered.")
+   648→        return False
+   649→
+   650→    # -------------------------------------------------------------------
+   651→    # Stats
+   652→    # -------------------------------------------------------------------
+   653→
+   654→    @property
+   655→    def total_unread(self) -> int:
+   656→        """Total number of unread notifications across all groups."""
+   657→        return sum(1 for n in self._history if not n.is_read)
+   658→
+   659→    @property
+   660→    def group_count(self) -> int:
+   661→        """Number of active notification groups."""
+   662→        return len(self._groups)
+   663→
+   664→    @property
+   665→    def history_count(self) -> int:
+   666→        """Number of notifications in history."""
+   667→        return len(self._history)
+   668→
+   669→
+   670→# ---------------------------------------------------------------------------
+   671→# Notification History Panel (Qt Widget)
+   672→# ---------------------------------------------------------------------------
+   673→
+   674→class NotificationHistoryPanel(QWidget):
+   675→    """Qt widget for browsing notification history.
+   676→
+   677→    Features:
+   678→        - Scrollable list of past notifications
+   679→        - Filter by: unread, contact, type
+   680→        - Bulk actions: mark all read, clear history
+   681→        - Search by notification text
+   682→    """
+   683→
+   684→    def __init__(
+   685→        self,
+   686→        manager: NotificationManager,
+   687→        parent: Optional[QWidget] = None,
+   688→    ) -> None:
+   689→        super().__init__(parent)
+   690→        self._manager = manager
+   691→        self._setup_ui()
+   692→
+   693→    def _setup_ui(self) -> None:
+   694→        """Build the notification history panel UI."""
+   695→        layout = QVBoxLayout(self)
+   696→        layout.setContentsMargins(8, 8, 8, 8)
+   697→        layout.setSpacing(8)
+   698→
+   699→        # Header
+   700→        header = QHBoxLayout()
+   701→
+   702→        self._title_label = QLabel("Notifications")
+   703→        self._title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #E0E0EC;")
+   704→        header.addWidget(self._title_label)
+   705→
+   706→        header.addStretch()
+   707→
+   708→        # Filter combo
+   709→        self._filter_combo = QComboBox()
+   710→        self._filter_combo.addItems(["All", "Unread", "Messages", "Calls", "Files"])
+   711→        self._filter_combo.setAccessibleName("Notification filter")
+   712→        self._filter_combo.currentIndexChanged.connect(self._refresh_list)
+   713→        header.addWidget(self._filter_combo)
+   714→
+   715→        layout.addLayout(header)
+   716→
+   717→        # Search bar
+   718→        self._search_input = QLineEdit()
+   719→        self._search_input.setPlaceholderText("Search notifications...")
+   720→        self._search_input.setAccessibleName("Search notifications")
+   721→        self._search_input.textChanged.connect(self._refresh_list)
+   722→        layout.addWidget(self._search_input)
+   723→
+   724→        # Notification list
+   725→        self._list_widget = QListWidget()
+   726→        self._list_widget.setAccessibleName("Notification list")
+   727→        self._list_widget.setStyleSheet("""
+   728→            QListWidget {
+   729→                background-color: #1A1A24;
+   730→                border: 1px solid #3A3A50;
+   731→                border-radius: 8px;
+   732→                padding: 4px;
+   733→            }
+   734→            QListWidget::item {
+   735→                padding: 8px;
+   736→                border-bottom: 1px solid #2A2A3A;
+   737→                color: #E0E0EC;
+   738→            }
+   739→            QListWidget::item:selected {
+   740→                background-color: #242436;
+   741→            }
+   742→        """)
+   743→        layout.addWidget(self._list_widget)
+   744→
+   745→        # Action bar
+   746→        actions = QHBoxLayout()
+   747→
+   748→        self._mark_all_read_btn = QPushButton("Mark All Read")
+   749→        self._mark_all_read_btn.setAccessibleName("Mark all notifications read")
+   750→        self._mark_all_read_btn.clicked.connect(self._mark_all_read)
+   751→        actions.addWidget(self._mark_all_read_btn)
+   752→
+   753→        self._clear_btn = QPushButton("Clear History")
+   754→        self._clear_btn.setAccessibleName("Clear notification history")
+   755→        self._clear_btn.clicked.connect(self._clear_history)
+   756→        actions.addWidget(self._clear_btn)
+   757→
+   758→        actions.addStretch()
+   759→
+   760→        self._count_label = QLabel("0 notifications")
+   761→        self._count_label.setStyleSheet("color: #8888A0;")
+   762→        actions.addWidget(self._count_label)
+   763→
+   764→        layout.addLayout(actions)
+   765→
+   766→        # Refresh timer
+   767→        self._refresh_timer = QTimer(self)
+   768→        self._refresh_timer.setInterval(5000)
+   769→        self._refresh_timer.timeout.connect(self._refresh_list)
+   770→        self._refresh_timer.start()
+   771→
+   772→    def _refresh_list(self) -> None:
+   773→        """Refresh the notification list from the manager."""
+   774→        self._list_widget.clear()
+   775→
+   776→        filter_text = self._search_input.text().lower()
+   777→        filter_index = self._filter_combo.currentIndex()
+   778→
+   779→        notifications = self._manager.get_history(limit=200)
+   780→
+   781→        for notification in notifications:
+   782→            # Apply filters
+   783→            if filter_index == 1 and notification.is_read:
+   784→                continue
+   785→            if filter_index == 2 and notification.notification_type not in (
+   786→                NotificationType.CHAT_MESSAGE, NotificationType.GROUP_MESSAGE
+   787→            ):
+   788→                continue
+   789→            if filter_index == 3 and notification.notification_type not in (
+   790→                NotificationType.VOICE_CALL, NotificationType.GROUP_CALL
+   791→            ):
+   792→                continue
+   793→            if filter_index == 4 and notification.notification_type != NotificationType.FILE_RECEIVED:
+   794→                continue
+   795→            if filter_text and filter_text not in notification.body.lower() and filter_text not in notification.title.lower():
+   796→                continue
+   797→
+   798→            # Build display text
+   799→            read_marker = "" if notification.is_read else "● "
+   800→            time_str = QDateTime.fromSecsSinceEpoch(int(notification.timestamp)).toString("HH:mm")
+   801→            text = f"{read_marker}{notification.peer_name} — {notification.body[:80]}"
+   802→            item = QListWidgetItem(f"[{time_str}] {text}")
+   803→            item.setData(Qt.ItemDataRole.UserRole, notification.notification_id)
+   804→
+   805→            if not notification.is_read:
+   806→                font = item.font()
+   807→                font.setBold(True)
+   808→                item.setFont(font)
+   809→
+   810→            self._list_widget.addItem(item)
+   811→
+   812→        self._count_label.setText(f"{len(self._manager._history)} notifications")
+   813→
+   814→    def _mark_all_read(self) -> None:
+   815→        """Mark all notifications as read."""
+   816→        self._manager.mark_all_read()
+   817→        self._refresh_list()
+   818→
+   819→    def _clear_history(self) -> None:
+   820→        """Clear all notification history."""
+   821→        self._manager.clear_history()
+   822→        self._refresh_list()
+   823→

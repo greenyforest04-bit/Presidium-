@@ -1,0 +1,768 @@
+     1→"""Contact Discovery v2 for Presidium — privacy-preserving contact matching.
+     2→
+     3→Implements a contact discovery protocol based on RSA blind signatures so that
+     4→the server never sees plaintext contact identifiers (phone numbers, emails,
+     5→usernames).  Only blinded hashes leave the client; the server signs them
+     6→without learning what they represent, and the client unblinds the signature
+     7→locally.  Matching is performed by comparing unblinded signatures against a
+     8→pre-registered set on the server — the server knows *that* two users share
+     9→a contact but not *which* contact.
+    10→
+    11→Architecture:
+    12→    BlindSignatureProtocol
+    13→        ├── RSA key generation (2048-bit default)
+    14→        ├── blind(message_hash, public_key) → blinded_token
+    15→        ├── sign(blinded_token, private_key) → blinded_signature
+    16→        └── unblind(blinded_signature, blinding_factor, public_key) → signature
+    17→
+    18→    DiscoveryServer
+    19→        ├── Holds registered contact tokens (unblinded signatures)
+    20→        ├── Signs blinded tokens without seeing plaintext
+    21→        ├── Matches client tokens against registered set
+    22→        └── Rate limits: 100 discovery requests / hour / user
+    23→
+    24→    DiscoveryClient
+    25→        ├── Hashes contact identifiers (SHA-256 + truncation)
+    26→        ├── Blinds each hash for submission
+    27→        ├── Receives and unblinds server signatures
+    28→        └── Compares unblinded signatures with server's match set
+    29→
+    30→    DiscoveryToken
+    31→        ├── blinded_token:  the value sent to the server
+    32→        ├── signature:      the server's signature on the blinded token
+    33→        └── unblinded_sig:  the unblinded signature (verifiable locally)
+    34→
+    35→    ContactDiscoveryV2
+    36→        ├── Integrates client + server in one class for local testing
+    37→        ├── discover_contacts() async — full protocol round-trip
+    38→        └── register_contacts() async — pre-register own contact tokens
+    39→
+    40→Privacy properties:
+    41→    - Server never sees plaintext phone numbers / emails
+    42→    - Server cannot link a blinded token to a specific contact
+    43→    - Blinding factor is client-side secret, never transmitted
+    44→    - Rate limiting prevents brute-force enumeration
+    45→    - Tokens are single-use per discovery session (fresh blinding each time)
+    46→
+    47→Wire protocol (conceptual):
+    48→    Client → Server:  POST /discover
+    49→        { user_id, [blinded_token_1, ..., blinded_token_n] }
+    50→
+    51→    Server → Client:  200 OK
+    52→        { signatures: [sig_1, ..., sig_n], matches: [index_1, ...] }
+    53→"""
+    54→
+    55→from __future__ import annotations
+    56→
+    57→import asyncio
+    58→import hashlib
+    59→import logging
+    60→import os
+    61→import time
+    62→from abc import ABC, abstractmethod
+    63→from dataclasses import dataclass, field
+    64→from typing import Any, Optional
+    65→
+    66→logger = logging.getLogger(__name__)
+    67→
+    68→
+    69→# ---------------------------------------------------------------------------
+    70→# Constants
+    71→# ---------------------------------------------------------------------------
+    72→
+    73→RSA_KEY_BITS: int = 2048
+    74→"""Default RSA key size for blind signatures."""
+    75→
+    76→CONTACT_HASH_BYTES: int = 32
+    77→"""SHA-256 output length used for contact hashing."""
+    78→
+    79→RATE_LIMIT_PER_HOUR: int = 100
+    80→"""Maximum discovery requests per user per hour."""
+    81→
+    82→RATE_LIMIT_WINDOW: int = 3600
+    83→"""Rate limit window in seconds (1 hour)."""
+    84→
+    85→MAX_CONTACTS_PER_REQUEST: int = 512
+    86→"""Maximum number of contact hashes in a single discovery request."""
+    87→
+    88→TOKEN_EXPIRY_SECONDS: int = 86400 * 30
+    89→"""How long a registered contact token remains valid (30 days)."""
+    90→
+    91→
+    92→# ---------------------------------------------------------------------------
+    93→# Custom exceptions
+    94→# ---------------------------------------------------------------------------
+    95→
+    96→class DiscoveryV2Error(Exception):
+    97→    """Base exception for Discovery v2 operations."""
+    98→
+    99→
+   100→class BlindSignatureError(DiscoveryV2Error):
+   101→    """Cryptographic error in the blind signature protocol."""
+   102→
+   103→
+   104→class RateLimitExceededError(DiscoveryV2Error):
+   105→    """User has exceeded the discovery request rate limit."""
+   106→
+   107→
+   108→class InvalidTokenError(DiscoveryV2Error):
+   109→    """A submitted discovery token is malformed or expired."""
+   110→
+   111→
+   112→class TooManyContactsError(DiscoveryV2Error):
+   113→    """Too many contact hashes submitted in a single request."""
+   114→
+   115→
+   116→class ServerKeyError(DiscoveryV2Error):
+   117→    """Server RSA key is not available or invalid."""
+   118→
+   119→
+   120→# ---------------------------------------------------------------------------
+   121→# Discovery token dataclass
+   122→# ---------------------------------------------------------------------------
+   123→
+   124→@dataclass
+   125→class DiscoveryToken:
+   126→    """A single token in the contact discovery protocol.
+   127→
+   128→    Attributes:
+   129→        contact_hash:  SHA-256 hash of the contact identifier (phone, email).
+   130→        blinded_token: The RSA-blinded hash sent to the server.
+   131→        blinding_factor: Secret random value used for blinding (never sent).
+   132→        signature: Server's RSA signature on the blinded token.
+   133→        unblinded_sig: Signature after removing the blinding factor.
+   134→    """
+   135→    contact_hash: bytes = b""
+   136→    blinded_token: bytes = b""
+   137→    blinding_factor: int = 0
+   138→    signature: bytes = b""
+   139→    unblinded_sig: bytes = b""
+   140→
+   141→    @property
+   142→    def is_complete(self) -> bool:
+   143→        """Whether the token has been through the full blind-sign-unblind cycle."""
+   144→        return bool(self.unblinded_sig)
+   145→
+   146→
+   147→# ---------------------------------------------------------------------------
+   148→# Blind Signature Protocol
+   149→# ---------------------------------------------------------------------------
+   150→
+   151→class BlindSignatureProtocol:
+   152→    """RSA blind signature operations for contact discovery.
+   153→
+   154→    Uses textbook RSA with SHA-256 as the hash function.  The protocol
+   155→    works as follows:
+   156→
+   157→    1. **Blind**:  The client computes ``blinded = hash * r^e mod n``
+   158→       where *r* is a random blinding factor and *(e, n)* is the server's
+   159→       public key.
+   160→
+   161→    2. **Sign**:   The server computes ``sig = blinded^d mod n`` where
+   162→       *d* is its private exponent.
+   163→
+   164→    3. **Unblind**: The client computes ``unblinded = sig * r^{-1} mod n``,
+   165→       which equals ``hash^d mod n`` — a valid RSA signature on the
+   166→       original hash.
+   167→
+   168→    All operations use Python's built-in ``pow()`` with three arguments
+   169→    for efficient modular exponentiation.
+   170→    """
+   171→
+   172→    @staticmethod
+   173→    def generate_keypair(bits: int = RSA_KEY_BITS) -> tuple[int, int, int, int, int]:
+   174→        """Generate an RSA key pair and return (n, e, d, p, q).
+   175→
+   176→        Args:
+   177→            bits: Key size in bits.
+   178→
+   179→        Returns:
+   180→            Tuple of (modulus n, public exponent e, private exponent d,
+   181→            prime p, prime q).
+   182→        """
+   183→        from sympy import nextprime, randprime
+   184→
+   185→        half = bits // 2
+   186→        while True:
+   187→            p = randprime(2 ** (half - 1), 2 ** half)
+   188→            q = randprime(2 ** (half - 1), 2 ** half)
+   189→            if p == q:
+   190→                continue
+   191→            n = p * q
+   192→            phi = (p - 1) * (q - 1)
+   193→            e = 65537
+   194→            from math import gcd
+   195→            if gcd(e, phi) != 1:
+   196→                continue
+   197→            d = pow(e, -1, phi)
+   198→            return (n, e, d, p, q)
+   199→
+   200→    @staticmethod
+   201→    def _hash_to_int(data: bytes) -> int:
+   202→        """Convert raw bytes to an integer suitable for RSA operations.
+   203→
+   204→        Args:
+   205→            data: Hash bytes (typically SHA-256 output).
+   206→
+   207→        Returns:
+   208→            Integer representation.
+   209→        """
+   210→        return int.from_bytes(data, byteorder="big")
+   211→
+   212→    @staticmethod
+   213→    def blind(contact_hash: bytes, e: int, n: int) -> tuple[bytes, int]:
+   214→        """Blind a contact hash with a random factor.
+   215→
+   216→        Args:
+   217→            contact_hash: SHA-256 hash of the contact identifier.
+   218→            e: Server's public exponent.
+   219→            n: Server's RSA modulus.
+   220→
+   221→        Returns:
+   222→            Tuple of (blinded_token_bytes, blinding_factor).
+   223→
+   224→        Raises:
+   225→            BlindSignatureError: If the hash is too large for the modulus.
+   226→        """
+   227→        h = BlindSignatureProtocol._hash_to_int(contact_hash)
+   228→        if h >= n:
+   229→            raise BlindSignatureError("Contact hash exceeds RSA modulus size.")
+   230→
+   231→        # Generate random blinding factor coprime to n
+   232→        r = 0
+   233→        from math import gcd
+   234→        while r <= 1 or gcd(r, n) != 1:
+   235→            r = int.from_bytes(os.urandom((n.bit_length() + 7) // 8), byteorder="big") % n
+   236→
+   237→        # blinded = hash * r^e mod n
+   238→        blinded = (h * pow(r, e, n)) % n
+   239→        blinded_bytes = blinded.to_bytes((n.bit_length() + 7) // 8, byteorder="big")
+   240→
+   241→        return blinded_bytes, r
+   242→
+   243→    @staticmethod
+   244→    def sign(blinded_token: bytes, d: int, n: int) -> bytes:
+   245→        """Sign a blinded token with the server's private key.
+   246→
+   247→        Args:
+   248→            blinded_token: The blinded value received from the client.
+   249→            d: Server's private exponent.
+   250→            n: Server's RSA modulus.
+   251→
+   252→        Returns:
+   253→            Signature bytes on the blinded token.
+   254→        """
+   255→        m = int.from_bytes(blinded_token, byteorder="big")
+   256→        sig = pow(m, d, n)
+   257→        return sig.to_bytes((n.bit_length() + 7) // 8, byteorder="big")
+   258→
+   259→    @staticmethod
+   260→    def unblind(
+   261→        blinded_signature: bytes,
+   262→        blinding_factor: int,
+   263→        e: int,
+   264→        n: int,
+   265→    ) -> bytes:
+   266→        """Remove the blinding factor to reveal the true signature.
+   267→
+   268→        Args:
+   269→            blinded_signature: Signature returned by the server.
+   270→            blinding_factor: The *r* value used during blinding.
+   271→            e: Server's public exponent.
+   272→            n: Server's RSA modulus.
+   273→
+   274→        Returns:
+   275→            Unblinded signature bytes.
+   276→
+   277→        Raises:
+   278→            BlindSignatureError: If the blinding factor has no modular inverse.
+   279→        """
+   280→        from math import gcd
+   281→        sig_int = int.from_bytes(blinded_signature, byteorder="big")
+   282→        r = blinding_factor
+   283→
+   284→        if gcd(r, n) != 1:
+   285→            raise BlindSignatureError("Blinding factor is not coprime with modulus.")
+   286→
+   287→        r_inv = pow(r, -1, n)
+   288→        unblinded = (sig_int * r_inv) % n
+   289→        return unblinded.to_bytes((n.bit_length() + 7) // 8, byteorder="big")
+   290→
+   291→    @staticmethod
+   292→    def verify(contact_hash: bytes, signature: bytes, e: int, n: int) -> bool:
+   293→        """Verify that a signature is valid for a given contact hash.
+   294→
+   295→        Args:
+   296→            contact_hash: Original SHA-256 hash.
+   297→            signature: Unblinded signature bytes.
+   298→            e: Server's public exponent.
+   299→            n: Server's RSA modulus.
+   300→
+   301→        Returns:
+   302→            True if the signature is valid.
+   303→        """
+   304→        h = BlindSignatureProtocol._hash_to_int(contact_hash)
+   305→        sig_int = int.from_bytes(signature, byteorder="big")
+   306→        recovered = pow(sig_int, e, n)
+   307→        return recovered == h
+   308→
+   309→
+   310→# ---------------------------------------------------------------------------
+   311→# Discovery Server
+   312→# ---------------------------------------------------------------------------
+   313→
+   314→class DiscoveryServer:
+   315→    """Server-side component of the contact discovery protocol.
+   316→
+   317→    Holds a set of registered contact tokens (unblinded signatures of
+   318→    contact hashes) and matches incoming client tokens against them.
+   319→    The server never sees plaintext contact information — it only signs
+   320→    blinded tokens and compares unblinded signatures.
+   321→
+   322→    Rate limiting:
+   323→        Each user is limited to ``RATE_LIMIT_PER_HOUR`` discovery
+   324→        requests per hour.  The rate-limit state is held in memory.
+   325→    """
+   326→
+   327→    def __init__(self, key_bits: int = RSA_KEY_BITS) -> None:
+   328→        self._key_bits = key_bits
+   329→        self._n: Optional[int] = None
+   330→        self._e: Optional[int] = None
+   331→        self._d: Optional[int] = None
+   332→        self._registered_tokens: dict[bytes, str] = {}  # unblinded_sig → user_id
+   333→        self._rate_limits: dict[str, list[float]] = {}  # user_id → [timestamps]
+   334→        self._initialized = False
+   335→
+   336→    async def initialize(self) -> None:
+   337→        """Generate the RSA key pair (may take a moment for large keys).
+   338→
+   339→        Runs in a thread executor to avoid blocking the event loop.
+   340→        """
+   341→        loop = asyncio.get_running_loop()
+   342→        n, e, d, _p, _q = await loop.run_in_executor(
+   343→            None, BlindSignatureProtocol.generate_keypair, self._key_bits
+   344→        )
+   345→        self._n = n
+   346→        self._e = e
+   347→        self._d = d
+   348→        self._initialized = True
+   349→        logger.info("DiscoveryServer initialized with %d-bit RSA key.", self._key_bits)
+   350→
+   351→    @property
+   352→    def public_key(self) -> tuple[int, int]:
+   353→        """Return the server's public key as (e, n).
+   354→
+   355→        Raises:
+   356→            ServerKeyError: If the server has not been initialized.
+   357→        """
+   358→        if not self._initialized or self._e is None or self._n is None:
+   359→            raise ServerKeyError("Server not initialized. Call initialize() first.")
+   360→        return (self._e, self._n)
+   361→
+   362→    # ------------------------------------------------------------------
+   363→    # Token registration
+   364→    # ------------------------------------------------------------------
+   365→
+   366→    def register_token(self, unblinded_signature: bytes, user_id: str) -> None:
+   367→        """Register a contact token for a user.
+   368→
+   369→        The unblinded signature serves as a privacy-preserving identifier:
+   370→        two users who share the same contact will produce the same
+   371→        unblinded signature for that contact's hash.
+   372→
+   373→        Args:
+   374→            unblinded_signature: The unblinded RSA signature on a contact hash.
+   375→            user_id: The user who owns this token.
+   376→        """
+   377→        self._registered_tokens[unblinded_signature] = user_id
+   378→        logger.debug("Token registered for user %s.", user_id[:8])
+   379→
+   380→    def unregister_user(self, user_id: str) -> int:
+   381→        """Remove all tokens belonging to *user_id*.
+   382→
+   383→        Args:
+   384→            user_id: User whose tokens should be removed.
+   385→
+   386→        Returns:
+   387→            Number of tokens removed.
+   388→        """
+   389→        to_remove = [sig for sig, uid in self._registered_tokens.items() if uid == user_id]
+   390→        for sig in to_remove:
+   391→            del self._registered_tokens[sig]
+   392→        return len(to_remove)
+   393→
+   394→    @property
+   395→    def registered_count(self) -> int:
+   396→        """Number of registered contact tokens."""
+   397→        return len(self._registered_tokens)
+   398→
+   399→    # ------------------------------------------------------------------
+   400→    # Signing
+   401→    # ------------------------------------------------------------------
+   402→
+   403→    def sign_tokens(self, blinded_tokens: list[bytes], user_id: str) -> list[bytes]:
+   404→        """Sign a batch of blinded tokens for a client.
+   405→
+   406→        Args:
+   407→            blinded_tokens: List of blinded token bytes from the client.
+   408→            user_id: Identity of the requesting user (for rate limiting).
+   409→
+   410→        Returns:
+   411→            List of signature bytes, one per input token.
+   412→
+   413→        Raises:
+   414→            RateLimitExceededError: If the user has exceeded the rate limit.
+   415→            ServerKeyError: If the server is not initialized.
+   416→            TooManyContactsError: If too many tokens are submitted.
+   417→        """
+   418→        if not self._initialized or self._d is None or self._n is None:
+   419→            raise ServerKeyError("Server not initialized.")
+   420→
+   421→        self._check_rate_limit(user_id)
+   422→
+   423→        if len(blinded_tokens) > MAX_CONTACTS_PER_REQUEST:
+   424→            raise TooManyContactsError(
+   425→                f"Too many contacts ({len(blinded_tokens)}); "
+   426→                f"maximum is {MAX_CONTACTS_PER_REQUEST}."
+   427→            )
+   428→
+   429→        signatures: list[bytes] = []
+   430→        for bt in blinded_tokens:
+   431→            sig = BlindSignatureProtocol.sign(bt, self._d, self._n)
+   432→            signatures.append(sig)
+   433→
+   434→        self._record_request(user_id)
+   435→        logger.debug("Signed %d tokens for user %s.", len(signatures), user_id[:8])
+   436→        return signatures
+   437→
+   438→    # ------------------------------------------------------------------
+   439→    # Matching
+   440→    # ------------------------------------------------------------------
+   441→
+   442→    def find_matches(self, unblinded_signatures: list[bytes]) -> list[tuple[int, str]]:
+   443→        """Find which of the client's tokens match registered contacts.
+   444→
+   445→        Args:
+   446→            unblinded_signatures: List of unblinded signatures from the client.
+   447→
+   448→        Returns:
+   449→            List of (index, matched_user_id) tuples for each match found.
+   450→        """
+   451→        matches: list[tuple[int, str]] = []
+   452→        for idx, sig in enumerate(unblinded_signatures):
+   453→            if sig in self._registered_tokens:
+   454→                matches.append((idx, self._registered_tokens[sig]))
+   455→
+   456→        logger.debug("Found %d matches out of %d tokens.", len(matches), len(unblinded_signatures))
+   457→        return matches
+   458→
+   459→    # ------------------------------------------------------------------
+   460→    # Rate limiting
+   461→    # ------------------------------------------------------------------
+   462→
+   463→    def _check_rate_limit(self, user_id: str) -> None:
+   464→        """Raise if the user has exceeded the hourly rate limit.
+   465→
+   466→        Args:
+   467→            user_id: User to check.
+   468→
+   469→        Raises:
+   470→            RateLimitExceededError: If limit is exceeded.
+   471→        """
+   472→        now = time.time()
+   473→        timestamps = self._rate_limits.get(user_id, [])
+   474→        # Prune old timestamps
+   475→        timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+   476→        if len(timestamps) >= RATE_LIMIT_PER_HOUR:
+   477→            raise RateLimitExceededError(
+   478→                f"User {user_id[:8]} exceeded {RATE_LIMIT_PER_HOUR} "
+   479→                f"discovery requests per hour."
+   480→            )
+   481→        self._rate_limits[user_id] = timestamps
+   482→
+   483→    def _record_request(self, user_id: str) -> None:
+   484→        """Record a discovery request timestamp for rate limiting.
+   485→
+   486→        Args:
+   487→            user_id: User making the request.
+   488→        """
+   489→        now = time.time()
+   490→        if user_id not in self._rate_limits:
+   491→            self._rate_limits[user_id] = []
+   492→        self._rate_limits[user_id].append(now)
+   493→
+   494→
+   495→# ---------------------------------------------------------------------------
+   496→# Discovery Client
+   497→# ---------------------------------------------------------------------------
+   498→
+   499→class DiscoveryClient:
+   500→    """Client-side component of the contact discovery protocol.
+   501→
+   502→    Hashes contact identifiers, blinds them, submits to the server,
+   503→    unblinds the returned signatures, and asks the server to match
+   504→    against its registered set.
+   505→    """
+   506→
+   507→    def __init__(self, user_id: str) -> None:
+   508→        self._user_id = user_id
+   509→        self._server_e: Optional[int] = None
+   510→        self._server_n: Optional[int] = None
+   511→
+   512→    def set_server_public_key(self, e: int, n: int) -> None:
+   513→        """Configure the server's public key for blinding operations.
+   514→
+   515→        Args:
+   516→            e: Server's public exponent.
+   517→            n: Server's RSA modulus.
+   518→        """
+   519→        self._server_e = e
+   520→        self._server_n = n
+   521→
+   522→    @staticmethod
+   523→    def hash_contact(contact: str) -> bytes:
+   524→        """Deterministically hash a contact identifier.
+   525→
+   526→        Uses SHA-256 with a Presidium-specific domain separator to
+   527→        prevent cross-protocol attacks.
+   528→
+   529→        Args:
+   530→            contact: Phone number, email, or username string.
+   531→
+   532→        Returns:
+   533→            32-byte SHA-256 hash.
+   534→        """
+   535→        domain_separator = b"presidium-discovery-v2\x00"
+   536→        data = domain_separator + contact.encode("utf-8")
+   537→        return hashlib.sha256(data).digest()
+   538→
+   539→    def create_tokens(self, contacts: list[str]) -> list[DiscoveryToken]:
+   540→        """Create blinded discovery tokens for a list of contacts.
+   541→
+   542→        Args:
+   543→            contacts: List of contact identifier strings.
+   544→
+   545→        Returns:
+   546→            List of DiscoveryToken with blinded_token and blinding_factor set.
+   547→
+   548→        Raises:
+   549→            BlindSignatureError: If the server public key is not set.
+   550→        """
+   551→        if self._server_e is None or self._server_n is None:
+   552→            raise BlindSignatureError("Server public key not configured.")
+   553→
+   554→        tokens: list[DiscoveryToken] = []
+   555→        for contact in contacts:
+   556→            contact_hash = self.hash_contact(contact)
+   557→            blinded_bytes, r = BlindSignatureProtocol.blind(
+   558→                contact_hash, self._server_e, self._server_n
+   559→            )
+   560→            tokens.append(DiscoveryToken(
+   561→                contact_hash=contact_hash,
+   562→                blinded_token=blinded_bytes,
+   563→                blinding_factor=r,
+   564→            ))
+   565→
+   566→        logger.debug("Created %d blinded tokens for user %s.", len(tokens), self._user_id[:8])
+   567→        return tokens
+   568→
+   569→    def unblind_tokens(self, tokens: list[DiscoveryToken], signatures: list[bytes]) -> list[DiscoveryToken]:
+   570→        """Unblind server signatures and complete the token lifecycle.
+   571→
+   572→        Args:
+   573→            tokens: Tokens previously created by :meth:`create_tokens`.
+   574→            signatures: Corresponding signature bytes from the server.
+   575→
+   576→        Returns:
+   577→            The same tokens with *signature* and *unblinded_sig* fields set.
+   578→
+   579→        Raises:
+   580→            BlindSignatureError: If lengths mismatch or key is missing.
+   581→        """
+   582→        if self._server_e is None or self._server_n is None:
+   583→            raise BlindSignatureError("Server public key not configured.")
+   584→
+   585→        if len(tokens) != len(signatures):
+   586→            raise BlindSignatureError(
+   587→                f"Token/signature count mismatch: {len(tokens)} vs {len(signatures)}."
+   588→            )
+   589→
+   590→        for token, sig in zip(tokens, signatures):
+   591→            token.signature = sig
+   592→            token.unblinded_sig = BlindSignatureProtocol.unblind(
+   593→                sig, token.blinding_factor, self._server_e, self._server_n
+   594→            )
+   595→
+   596→        return tokens
+   597→
+   598→    @property
+   599→    def user_id(self) -> str:
+   600→        """The client's user identifier."""
+   601→        return self._user_id
+   602→
+   603→
+   604→# ---------------------------------------------------------------------------
+   605→# Contact Discovery V2 — main integration class
+   606→# ---------------------------------------------------------------------------
+   607→
+   608→class ContactDiscoveryV2:
+   609→    """Full contact discovery system integrating client and server.
+   610→
+   611→    For local / in-process testing both client and server are co-located.
+   612→    In production the server runs remotely and the client communicates
+   613→    over an encrypted channel.
+   614→
+   615→    Lifecycle::
+   616→
+   617→        cd = ContactDiscoveryV2(user_id="alice")
+   618→        await cd.initialize()
+   619→
+   620→        # Register your own contacts on the server
+   621→        await cd.register_contacts(["+15551234567", "bob@example.com"])
+   622→
+   623→        # Discover which of YOUR contacts are also Presidium users
+   624→        matches = await cd.discover_contacts(["+15551234567", "+15559876543"])
+   625→
+   626→        await cd.shutdown()
+   627→    """
+   628→
+   629→    def __init__(self, user_id: str, key_bits: int = RSA_KEY_BITS) -> None:
+   630→        self._user_id = user_id
+   631→        self._server = DiscoveryServer(key_bits)
+   632→        self._client = DiscoveryClient(user_id)
+   633→        self._initialized = False
+   634→
+   635→    async def initialize(self) -> None:
+   636→        """Generate RSA keys and configure the client with the server's public key.
+   637→
+   638→        Must be called before any discovery or registration.
+   639→        """
+   640→        await self._server.initialize()
+   641→        e, n = self._server.public_key
+   642→        self._client.set_server_public_key(e, n)
+   643→        self._initialized = True
+   644→        logger.info("ContactDiscoveryV2 initialized for user %s.", self._user_id[:8])
+   645→
+   646→    async def register_contacts(self, contacts: list[str]) -> int:
+   647→        """Register this user's contacts on the discovery server.
+   648→
+   649→        Hashes each contact, blinds it, gets the server to sign the
+   650→        blinded token, unblinds, and stores the result as a registered
+   651→        token on the server.
+   652→
+   653→        Args:
+   654→            contacts: List of contact identifier strings.
+   655→
+   656→        Returns:
+   657→            Number of contacts successfully registered.
+   658→
+   659→        Raises:
+   660→            DiscoveryV2Error: If not initialized.
+   661→        """
+   662→        if not self._initialized:
+   663→            raise DiscoveryV2Error("Not initialized. Call initialize() first.")
+   664→
+   665→        tokens = self._client.create_tokens(contacts)
+   666→        blinded = [t.blinded_token for t in tokens]
+   667→        signatures = self._server.sign_tokens(blinded, self._user_id)
+   668→        completed = self._client.unblind_tokens(tokens, signatures)
+   669→
+   670→        for token in completed:
+   671→            self._server.register_token(token.unblinded_sig, self._user_id)
+   672→
+   673→        logger.info("Registered %d contacts for user %s.", len(completed), self._user_id[:8])
+   674→        return len(completed)
+   675→
+   676→    async def discover_contacts(self, contacts: list[str]) -> list[str]:
+   677→        """Discover which contacts are also registered Presidium users.
+   678→
+   679→        Full protocol round-trip:
+   680→            1. Hash and blind each contact
+   681→            2. Server signs the blinded tokens
+   682→            3. Client unblinds the signatures
+   683→            4. Server matches unblinded signatures against registered set
+   684→
+   685→        Args:
+   686→            contacts: List of contact identifier strings to check.
+   687→
+   688→        Returns:
+   689→            List of matched contact strings that are Presidium users.
+   690→
+   691→        Raises:
+   692→            DiscoveryV2Error: If not initialized.
+   693→            RateLimitExceededError: If rate limit is exceeded.
+   694→        """
+   695→        if not self._initialized:
+   696→            raise DiscoveryV2Error("Not initialized. Call initialize() first.")
+   697→
+   698→        # Step 1: Create blinded tokens
+   699→        tokens = self._client.create_tokens(contacts)
+   700→
+   701→        # Step 2: Server signs
+   702→        blinded = [t.blinded_token for t in tokens]
+   703→        signatures = self._server.sign_tokens(blinded, self._user_id)
+   704→
+   705→        # Step 3: Client unblinds
+   706→        completed = self._client.unblind_tokens(tokens, signatures)
+   707→
+   708→        # Step 4: Server matches
+   709→        unblinded_sigs = [t.unblinded_sig for t in completed]
+   710→        match_indices = self._server.find_matches(unblinded_sigs)
+   711→
+   712→        # Map indices back to original contact strings
+   713→        matched_contacts = [contacts[idx] for idx, _uid in match_indices]
+   714→
+   715→        logger.info(
+   716→            "Discovery for %s: %d matches out of %d contacts.",
+   717→            self._user_id[:8], len(matched_contacts), len(contacts),
+   718→        )
+   719→        return matched_contacts
+   720→
+   721→    async def discover_tokens(self, contacts: list[str]) -> list[DiscoveryToken]:
+   722→        """Run the discovery protocol and return the completed tokens.
+   723→
+   724→        Unlike :meth:`discover_contacts`, this returns the full token
+   725→        objects (including cryptographic material) for inspection or
+   726→        further processing.
+   727→
+   728→        Args:
+   729→            contacts: Contact identifiers to discover.
+   730→
+   731→        Returns:
+   732→            List of completed DiscoveryToken objects.
+   733→        """
+   734→        if not self._initialized:
+   735→            raise DiscoveryV2Error("Not initialized. Call initialize() first.")
+   736→
+   737→        tokens = self._client.create_tokens(contacts)
+   738→        blinded = [t.blinded_token for t in tokens]
+   739→        signatures = self._server.sign_tokens(blinded, self._user_id)
+   740→        completed = self._client.unblind_tokens(tokens, signatures)
+   741→        return completed
+   742→
+   743→    async def shutdown(self) -> None:
+   744→        """Clean up server state (rate-limit tables, keys)."""
+   745→        self._server._registered_tokens.clear()
+   746→        self._server._rate_limits.clear()
+   747→        self._initialized = False
+   748→        logger.info("ContactDiscoveryV2 shut down for user %s.", self._user_id[:8])
+   749→
+   750→    # ------------------------------------------------------------------
+   751→    # Properties
+   752→    # ------------------------------------------------------------------
+   753→
+   754→    @property
+   755→    def server(self) -> DiscoveryServer:
+   756→        """Access the embedded discovery server."""
+   757→        return self._server
+   758→
+   759→    @property
+   760→    def client(self) -> DiscoveryClient:
+   761→        """Access the embedded discovery client."""
+   762→        return self._client
+   763→
+   764→    @property
+   765→    def registered_count(self) -> int:
+   766→        """Number of tokens registered on the server."""
+   767→        return self._server.registered_count
+   768→

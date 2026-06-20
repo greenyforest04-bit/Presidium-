@@ -1,0 +1,946 @@
+     1→     1→"""Zero-Knowledge Push Relay Server for Presidium.
+     2→     2→
+     3→     3→Implements a privacy-preserving push notification relay that never sees
+     4→     4→plaintext. The relay stores only encrypted blobs indexed by pseudorandom IDs,
+     5→     5→making it impossible to link notifications to specific users or determine
+     6→     6→message contents.
+     7→     7→
+     8→     8→Architecture:
+     9→     9→    Sender → POST /push {blob_id, encrypted_blob, hmac}
+    10→    10→        - blob_id = SHA-256(recipient_public_key || timestamp_bucket)[:16]
+    11→    11→        - encrypted_blob = opaque ciphertext (E2EE between sender and recipient)
+    12→    12→        - hmac = HMAC-SHA256(blob_id || encrypted_blob, relay_hmac_key)
+    13→    13→        - Relay validates HMAC for integrity, stores blob, returns 202
+    14→    14→
+    15→    15→    Recipient → GET /pull?ids=<comma-separated-blob-ids>
+    16→    16→        - Computes blob_ids from own public_key + current/prev time buckets
+    17→    17→        - Relay returns matching encrypted blobs without knowing who fetches
+    18→    18→        - Recipient decrypts locally using Double Ratchet / HPKE
+    19→    19→
+    20→    20→    FCM/APNS fallback:
+    21→    21→        - POST /register-token {device_token, encrypted_user_id}
+    22→    22→        - When a blob arrives, relay sends FCM/APNS with ONLY the 16-byte
+    23→    23→          encrypted_payload_id (no message content)
+    24→    24→        - Client then does a blind fetch to retrieve the actual payload
+    25→    25→
+    26→    26→Rate limiting:
+    27→    27→    - 100 pushes per hour per IP address
+    28→    28→    - 600 pulls per hour per IP address
+    29→    29→    - Blobs expire after 7 days
+    30→    30→
+    31→    31→Key privacy properties:
+    32→    32→    - Relay cannot determine which blob_ids belong to which users
+    33→    33→    - Relay cannot read message contents (end-to-end encrypted)
+    34→    34→    - Relay cannot link senders to recipients
+    35→    35→    - FCM/APNS tokens are stored encrypted with the user's public key
+    36→    36→    - Even if relay is compromised, no metadata or content is exposed
+    37→    37→"""
+    38→    38→
+    39→    39→from __future__ import annotations
+    40→    40→
+    41→    41→import asyncio
+    42→    42→import hashlib
+    43→    43→import hmac
+    44→    44→import logging
+    45→    45→import os
+    46→    46→import time
+    47→    47→from dataclasses import dataclass, field
+    48→    48→from typing import Optional
+    49→    49→
+    50→    50→from aiohttp import web
+    51→    51→
+    52→    52→logger = logging.getLogger(__name__)
+    53→    53→
+    54→    54→
+    55→    55→# ---------------------------------------------------------------------------
+    56→    56→# Constants
+    57→    57→# ---------------------------------------------------------------------------
+    58→    58→
+    59→    59→BLOB_ID_SIZE = 16           # 128-bit blob identifier
+    60→    60→MAX_BLOB_SIZE = 65536       # 64 KiB max encrypted payload
+    61→    61→BLOB_TTL_SECONDS = 604800   # 7 days
+    62→    62→HMAC_KEY_SIZE = 32          # 256-bit HMAC key
+    63→    63→MAX_IDS_PER_PULL = 50       # Maximum blob IDs per pull request
+    64→    64→PUSH_RATE_LIMIT = 100       # Pushes per hour per IP
+    65→    65→PULL_RATE_LIMIT = 600       # Pulls per hour per IP
+    66→    66→CLEANUP_INTERVAL = 3600     # 1 hour between cleanup sweeps
+    67→    67→
+    68→    68→
+    69→    69→# ---------------------------------------------------------------------------
+    70→    70→# Custom exceptions
+    71→    71→# ---------------------------------------------------------------------------
+    72→    72→
+    73→    73→class PushRelayError(Exception):
+    74→    74→    """Base exception for push relay operations."""
+    75→    75→
+    76→    76→
+    77→    77→class BlobNotFoundError(PushRelayError):
+    78→    78→    """Requested blob ID not found on the relay."""
+    79→    79→
+    80→    80→
+    81→    81→class RateLimitError(PushRelayError):
+    82→    82→    """Rate limit exceeded for the client IP."""
+    83→    83→
+    84→    84→
+    85→    85→class InvalidBlobError(PushRelayError):
+    86→    86→    """Blob data is invalid (wrong size, bad HMAC, etc.)."""
+    87→    87→
+    88→    88→
+    89→    89→class RelayStorageError(PushRelayError):
+    90→    90→    """Failed to store or retrieve a blob."""
+    91→    91→
+    92→    92→
+    93→    93→# ---------------------------------------------------------------------------
+    94→    94→# Data models
+    95→    95→# ---------------------------------------------------------------------------
+    96→    96→
+    97→    97→@dataclass
+    98→    98→class StoredBlob:
+    99→    99→    """An encrypted blob stored on the relay.
+   100→   100→
+   101→   101→    Attributes:
+   102→   102→        blob_id: 16-byte pseudorandom identifier.
+   103→   103→        encrypted_data: Opaque encrypted payload (E2EE).
+   104→   104→        hmac_tag: HMAC-SHA256 tag for integrity verification.
+   105→   105→        created_at: Unix timestamp when the blob was stored.
+   106→   106→        expires_at: Unix timestamp when the blob expires.
+   107→   107→        access_count: Number of times this blob has been fetched.
+   108→   108→    """
+   109→   109→    blob_id: bytes
+   110→   110→    encrypted_data: bytes
+   111→   111→    hmac_tag: bytes
+   112→   112→    created_at: float
+   113→   113→    expires_at: float
+   114→   114→    access_count: int = 0
+   115→   115→
+   116→   116→
+   117→   117→@dataclass
+   118→   118→class DeviceToken:
+   119→   119→    """Encrypted FCM/APNS device token for push fallback.
+   120→   120→
+   121→   121→    Attributes:
+   122→   122→        encrypted_user_id: User identifier encrypted with relay key.
+   123→   123→        device_token: FCM or APNS token string.
+   124→   124→        platform: "fcm" or "apns".
+   125→   125→        registered_at: Unix timestamp of registration.
+   126→   126→    """
+   127→   127→    encrypted_user_id: bytes
+   128→   128→    device_token: str
+   129→   129→    platform: str  # "fcm" or "apns"
+   130→   130→    registered_at: float
+   131→   131→
+   132→   132→
+   133→   133→@dataclass
+   134→   134→class RateLimitEntry:
+   135→   135→    """Rate limit tracking for a single IP address."""
+   136→   136→    push_count: int = 0
+   137→   137→    pull_count: int = 0
+   138→   138→    window_start: float = 0.0
+   139→   139→
+   140→   140→
+   141→   141→# ---------------------------------------------------------------------------
+   142→   142→# In-memory blob storage
+   143→   143→# ---------------------------------------------------------------------------
+   144→   144→
+   145→   145→class BlobStorage:
+   146→   146→    """In-memory storage for encrypted blobs with automatic expiry.
+   147→   147→
+   148→   148→    For production deployment, this should be replaced with a persistent
+   149→   149→    store (Redis, SQLite, etc.) that survives relay restarts. The current
+   150→   150→    implementation uses an in-memory dict with periodic cleanup.
+   151→   151→
+   152→   152→    Thread safety: This class is designed for single-threaded asyncio use.
+   153→   153→    If multi-threading is needed, add appropriate locking.
+   154→   154→    """
+   155→   155→
+   156→   156→    def __init__(self, max_total_blobs: int = 1_000_000) -> None:
+   157→   157→        self._blobs: dict[bytes, StoredBlob] = {}
+   158→   158→        self._max_total_blobs = max_total_blobs
+   159→   159→        self._total_bytes: int = 0
+   160→   160→
+   161→   161→    async def store(self, blob: StoredBlob) -> bool:
+   162→   162→        """Store a blob, replacing any existing blob with the same ID.
+   163→   163→
+   164→   164→        Args:
+   165→   165→            blob: The StoredBlob to persist.
+   166→   166→
+   167→   167→        Returns:
+   168→   168→            True if stored successfully, False if storage is full.
+   169→   169→
+   170→   170→        Raises:
+   171→   171→            RelayStorageError: If the blob data is invalid.
+   172→   172→        """
+   173→   173→        if len(blob.encrypted_data) > MAX_BLOB_SIZE:
+   174→   174→            raise RelayStorageError(
+   175→   175→                f"Blob too large: {len(blob.encrypted_data)} bytes, "
+   176→   176→                f"max {MAX_BLOB_SIZE}."
+   177→   177→            )
+   178→   178→        if len(blob.blob_id) != BLOB_ID_SIZE:
+   179→   179→            raise RelayStorageError(
+   180→   180→                f"Invalid blob ID size: {len(blob.blob_id)}, "
+   181→   181→                f"expected {BLOB_ID_SIZE}."
+   182→   182→            )
+   183→   183→
+   184→   184→        # Enforce storage limit with LRU eviction
+   185→   185→        if len(self._blobs) >= self._max_total_blobs:
+   186→   186→            await self._evict_oldest()
+   187→   187→
+   188→   188→        # Track bytes
+   189→   189→        existing = self._blobs.get(blob.blob_id)
+   190→   190→        if existing is not None:
+   191→   191→            self._total_bytes -= len(existing.encrypted_data)
+   192→   192→
+   193→   193→        self._blobs[blob.blob_id] = blob
+   194→   194→        self._total_bytes += len(blob.encrypted_data)
+   195→   195→
+   196→   196→        logger.debug(
+   197→   197→            "Stored blob %s (%d bytes, expires %d)",
+   198→   198→            blob.blob_id.hex(),
+   199→   199→            len(blob.encrypted_data),
+   200→   200→            int(blob.expires_at),
+   201→   201→        )
+   202→   202→        return True
+   203→   203→
+   204→   204→    async def fetch(self, blob_id: bytes) -> Optional[StoredBlob]:
+   205→   205→        """Fetch a blob by its ID.
+   206→   206→
+   207→   207→        Args:
+   208→   208→            blob_id: 16-byte blob identifier.
+   209→   209→
+   210→   210→        Returns:
+   211→   211→            The StoredBlob if found and not expired, None otherwise.
+   212→   212→        """
+   213→   213→        blob = self._blobs.get(blob_id)
+   214→   214→        if blob is None:
+   215→   215→            return None
+   216→   216→
+   217→   217→        # Check expiry
+   218→   218→        if time.time() > blob.expires_at:
+   219→   219→            await self.delete(blob_id)
+   220→   220→            return None
+   221→   221→
+   222→   222→        blob.access_count += 1
+   223→   223→        return blob
+   224→   224→
+   225→   225→    async def fetch_many(self, blob_ids: list[bytes]) -> list[StoredBlob]:
+   226→   226→        """Fetch multiple blobs by their IDs.
+   227→   227→
+   228→   228→        Args:
+   229→   229→            blob_ids: List of 16-byte blob identifiers.
+   230→   230→
+   231→   231→        Returns:
+   232→   232→            List of found StoredBlob objects (may be fewer than requested).
+   233→   233→        """
+   234→   234→        results: list[StoredBlob] = []
+   235→   235→        for bid in blob_ids:
+   236→   236→            blob = await self.fetch(bid)
+   237→   237→            if blob is not None:
+   238→   238→                results.append(blob)
+   239→   239→        return results
+   240→   240→
+   241→   241→    async def delete(self, blob_id: bytes) -> bool:
+   242→   242→        """Delete a blob by its ID.
+   243→   243→
+   244→   244→        Returns:
+   245→   245→            True if the blob was found and deleted, False otherwise.
+   246→   246→        """
+   247→   247→        blob = self._blobs.pop(blob_id, None)
+   248→   248→        if blob is not None:
+   249→   249→            self._total_bytes -= len(blob.encrypted_data)
+   250→   250→            return True
+   251→   251→        return False
+   252→   252→
+   253→   253→    async def cleanup_expired(self) -> int:
+   254→   254→        """Remove all expired blobs.
+   255→   255→
+   256→   256→        Returns:
+   257→   257→            Number of blobs removed.
+   258→   258→        """
+   259→   259→        now = time.time()
+   260→   260→        expired_ids = [
+   261→   261→            bid for bid, blob in self._blobs.items()
+   262→   262→            if now > blob.expires_at
+   263→   263→        ]
+   264→   264→        for bid in expired_ids:
+   265→   265→            blob = self._blobs.pop(bid)
+   266→   266→            self._total_bytes -= len(blob.encrypted_data)
+   267→   267→
+   268→   268→        if expired_ids:
+   269→   269→            logger.info("Cleaned up %d expired blobs.", len(expired_ids))
+   270→   270→        return len(expired_ids)
+   271→   271→
+   272→   272→    async def _evict_oldest(self) -> None:
+   273→   273→        """Evict the oldest blob to make room for new ones."""
+   274→   274→        if not self._blobs:
+   275→   275→            return
+   276→   276→        oldest_id = min(self._blobs, key=lambda k: self._blobs[k].created_at)
+   277→   277→        blob = self._blobs.pop(oldest_id)
+   278→   278→        self._total_bytes -= len(blob.encrypted_data)
+   279→   279→        logger.debug("Evicted oldest blob %s to free space.", oldest_id.hex())
+   280→   280→
+   281→   281→    @property
+   282→   282→    def blob_count(self) -> int:
+   283→   283→        """Number of blobs currently stored."""
+   284→   284→        return len(self._blobs)
+   285→   285→
+   286→   286→    @property
+   287→   287→    def total_bytes(self) -> int:
+   288→   288→        """Total bytes of encrypted data stored."""
+   289→   289→        return self._total_bytes
+   290→   290→
+   291→   291→
+   292→   292→# ---------------------------------------------------------------------------
+   293→   293→# Rate limiter
+   294→   294→# ---------------------------------------------------------------------------
+   295→   295→
+   296→   296→class RateLimiter:
+   297→   297→    """Per-IP rate limiter using sliding window counters.
+   298→   298→
+   299→   299→    Tracks push and pull request counts per IP address within
+   300→   300→    one-hour sliding windows. When the window expires, counters
+   301→   301→    are reset automatically.
+   302→   302→    """
+   303→   303→
+   304→   304→    def __init__(
+   305→   305→        self,
+   306→   306→        push_limit: int = PUSH_RATE_LIMIT,
+   307→   307→        pull_limit: int = PULL_RATE_LIMIT,
+   308→   308→        window_seconds: int = 3600,
+   309→   309→    ) -> None:
+   310→   310→        self._push_limit = push_limit
+   311→   311→        self._pull_limit = pull_limit
+   312→   312→        self._window_seconds = window_seconds
+   313→   313→        self._entries: dict[str, RateLimitEntry] = {}
+   314→   314→
+   315→   315→    def check_push(self, ip: str) -> bool:
+   316→   316→        """Check if a push request from this IP is allowed.
+   317→   317→
+   318→   318→        Returns:
+   319→   319→            True if allowed, False if rate limited.
+   320→   320→        """
+   321→   321→        entry = self._get_or_create(ip)
+   322→   322→        self._maybe_reset(entry)
+   323→   323→        if entry.push_count >= self._push_limit:
+   324→   324→            return False
+   325→   325→        entry.push_count += 1
+   326→   326→        return True
+   327→   327→
+   328→   328→    def check_pull(self, ip: str) -> bool:
+   329→   329→        """Check if a pull request from this IP is allowed.
+   330→   330→
+   331→   331→        Returns:
+   332→   332→            True if allowed, False if rate limited.
+   333→   333→        """
+   334→   334→        entry = self._get_or_create(ip)
+   335→   335→        self._maybe_reset(entry)
+   336→   336→        if entry.pull_count >= self._pull_limit:
+   337→   337→            return False
+   338→   338→        entry.pull_count += 1
+   339→   339→        return True
+   340→   340→
+   341→   341→    def _get_or_create(self, ip: str) -> RateLimitEntry:
+   342→   342→        """Get or create a rate limit entry for an IP."""
+   343→   343→        if ip not in self._entries:
+   344→   344→            self._entries[ip] = RateLimitEntry(window_start=time.time())
+   345→   345→        return self._entries[ip]
+   346→   346→
+   347→   347→    def _maybe_reset(self, entry: RateLimitEntry) -> None:
+   348→   348→        """Reset counters if the window has expired."""
+   349→   349→        now = time.time()
+   350→   350→        if now - entry.window_start > self._window_seconds:
+   351→   351→            entry.push_count = 0
+   352→   352→            entry.pull_count = 0
+   353→   353→            entry.window_start = now
+   354→   354→
+   355→   355→    def cleanup_stale(self, max_age: float = 7200) -> int:
+   356→   356→        """Remove entries older than max_age seconds.
+   357→   357→
+   358→   358→        Returns:
+   359→   359→            Number of entries removed.
+   360→   360→        """
+   361→   361→        now = time.time()
+   362→   362→        stale_ips = [
+   363→   363→            ip for ip, entry in self._entries.items()
+   364→   364→            if now - entry.window_start > max_age
+   365→   365→        ]
+   366→   366→        for ip in stale_ips:
+   367→   367→            del self._entries[ip]
+   368→   368→        return len(stale_ips)
+   369→   369→
+   370→   370→
+   371→   371→# ---------------------------------------------------------------------------
+   372→   372→# Push Relay Configuration
+   373→   373→# ---------------------------------------------------------------------------
+   374→   374→
+   375→   375→@dataclass
+   376→   376→class PushRelayConfig:
+   377→   377→    """Configuration for the Zero-Knowledge Push Relay.
+   378→   378→
+   379→   379→    Attributes:
+   380→   380→        host: Bind address for the relay server.
+   381→   381→        port: Bind port for the relay server.
+   382→   382→        hmac_key: 32-byte key for HMAC verification. Auto-generated if None.
+   383→   383→        max_blob_size: Maximum encrypted blob size in bytes.
+   384→   384→        blob_ttl: Time-to-live for blobs in seconds.
+   385→   385→        max_total_blobs: Maximum number of blobs stored simultaneously.
+   386→   386→        push_rate_limit: Max pushes per hour per IP.
+   387→   387→        pull_rate_limit: Max pulls per hour per IP.
+   388→   388→        fcm_server_key: Firebase Cloud Messaging server key (optional).
+   389→   389→        apns_cert_path: APNS certificate path (optional).
+   390→   390→        cors_origins: Allowed CORS origins.
+   391→   391→    """
+   392→   392→    host: str = "0.0.0.0"
+   393→   393→    port: int = 9479
+   394→   394→    hmac_key: bytes = b""
+   395→   395→    max_blob_size: int = MAX_BLOB_SIZE
+   396→   396→    blob_ttl: int = BLOB_TTL_SECONDS
+   397→   397→    max_total_blobs: int = 1_000_000
+   398→   398→    push_rate_limit: int = PUSH_RATE_LIMIT
+   399→   399→    pull_rate_limit: int = PULL_RATE_LIMIT
+   400→   400→    fcm_server_key: str = ""
+   401→   401→    apns_cert_path: str = ""
+   402→   402→    cors_origins: list[str] = field(default_factory=lambda: ["*"])
+   403→   403→
+   404→   404→    def __post_init__(self) -> None:
+   405→   405→        if not self.hmac_key:
+   406→   406→            self.hmac_key = os.urandom(HMAC_KEY_SIZE)
+   407→   407→
+   408→   408→
+   409→   409→# ---------------------------------------------------------------------------
+   410→   410→# Push Relay Server
+   411→   411→# ---------------------------------------------------------------------------
+   412→   412→
+   413→   413→class PushRelayServer:
+   414→   414→    """Zero-Knowledge Push Relay Server powered by aiohttp.
+   415→   415→
+   416→   416→    The relay operates as a simple encrypted blob store with blind fetch.
+   417→   417→    It never sees plaintext and cannot link blob IDs to users. The relay
+   418→   418→    validates HMAC tags on incoming blobs for integrity but cannot read
+   419→   419→    the encrypted content.
+   420→   420→
+   421→   421→    Endpoints:
+   422→   422→        POST /push      — Store an encrypted blob
+   423→   423→        GET  /pull      — Fetch blobs by IDs (blind fetch)
+   424→   424→        POST /register  — Register FCM/APNS device token
+   425→   425→        DELETE /token   — Unregister device token
+   426→   426→        GET  /health    — Health check
+   427→   427→        GET  /stats     — Relay statistics (admin)
+   428→   428→
+   429→   429→    Lifecycle:
+   430→   430→        server = PushRelayServer(config)
+   431→   431→        await server.start()    # Starts the aiohttp server
+   432→   432→        ...
+   433→   433→        await server.stop()     # Graceful shutdown
+   434→   434→    """
+   435→   435→
+   436→   436→    def __init__(self, config: Optional[PushRelayConfig] = None) -> None:
+   437→   437→        self._config = config or PushRelayConfig()
+   438→   438→        self._storage = BlobStorage(max_total_blobs=self._config.max_total_blobs)
+   439→   439→        self._rate_limiter = RateLimiter(
+   440→   440→            push_limit=self._config.push_rate_limit,
+   441→   441→            pull_limit=self._config.pull_rate_limit,
+   442→   442→        )
+   443→   443→        self._device_tokens: dict[str, DeviceToken] = {}
+   444→   444→        self._app: Optional[web.Application] = None
+   445→   445→        self._runner: Optional[web.AppRunner] = None
+   446→   446→        self._site: Optional[web.TCPSite] = None
+   447→   447→        self._cleanup_task: Optional[asyncio.Task] = None
+   448→   448→        self._started_at: float = 0.0
+   449→   449→
+   450→   450→    # -------------------------------------------------------------------
+   451→   451→    # Server lifecycle
+   452→   452→    # -------------------------------------------------------------------
+   453→   453→
+   454→   454→    async def start(self) -> None:
+   455→   455→        """Start the push relay server."""
+   456→   456→        self._app = web.Application()
+   457→   457→        self._app.add_routes([
+   458→   458→            web.post("/push", self._handle_push),
+   459→   459→            web.get("/pull", self._handle_pull),
+   460→   460→            web.post("/register", self._handle_register),
+   461→   461→            web.delete("/token", self._handle_unregister),
+   462→   462→            web.get("/health", self._handle_health),
+   463→   463→            web.get("/stats", self._handle_stats),
+   464→   464→        ])
+   465→   465→
+   466→   466→        # CORS middleware
+   467→   467→        self._app.middlewares.append(self._cors_middleware)
+   468→   468→
+   469→   469→        self._runner = web.AppRunner(self._app)
+   470→   470→        await self._runner.setup()
+   471→   471→
+   472→   472→        self._site = web.TCPSite(
+   473→   473→            self._runner,
+   474→   474→            self._config.host,
+   475→   475→            self._config.port,
+   476→   476→        )
+   477→   477→        await self._site.start()
+   478→   478→
+   479→   479→        # Start background cleanup
+   480→   480→        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+   481→   481→        self._started_at = time.time()
+   482→   482→
+   483→   483→        logger.info(
+   484→   484→            "Push Relay Server started on %s:%d",
+   485→   485→            self._config.host,
+   486→   486→            self._config.port,
+   487→   487→        )
+   488→   488→
+   489→   489→    async def stop(self) -> None:
+   490→   490→        """Gracefully stop the push relay server."""
+   491→   491→        if self._cleanup_task is not None:
+   492→   492→            self._cleanup_task.cancel()
+   493→   493→            try:
+   494→   494→                await self._cleanup_task
+   495→   495→            except asyncio.CancelledError:
+   496→   496→                pass
+   497→   497→            self._cleanup_task = None
+   498→   498→
+   499→   499→        if self._runner is not None:
+   500→   500→            await self._runner.cleanup()
+   501→   501→            self._runner = None
+   502→   502→
+   503→   503→        logger.info("Push Relay Server stopped.")
+   504→   504→
+   505→   505→    # -------------------------------------------------------------------
+   506→   506→    # Background tasks
+   507→   507→    # -------------------------------------------------------------------
+   508→   508→
+   509→   509→    async def _cleanup_loop(self) -> None:
+   510→   510→        """Periodically clean up expired blobs and stale rate limit entries."""
+   511→   511→        while True:
+   512→   512→            try:
+   513→   513→                await asyncio.sleep(CLEANUP_INTERVAL)
+   514→   514→                expired = await self._storage.cleanup_expired()
+   515→   515→                stale = self._rate_limiter.cleanup_stale()
+   516→   516→                if expired > 0 or stale > 0:
+   517→   517→                    logger.info(
+   518→   518→                        "Cleanup: removed %d expired blobs, %d stale rate entries.",
+   519→   519→                        expired,
+   520→   520→                        stale,
+   521→   521→                    )
+   522→   522→            except asyncio.CancelledError:
+   523→   523→                raise
+   524→   524→            except Exception as exc:
+   525→   525→                logger.error("Cleanup loop error: %s", exc)
+   526→   526→
+   527→   527→    # -------------------------------------------------------------------
+   528→   528→    # CORS middleware
+   529→   529→    # -------------------------------------------------------------------
+   530→   530→
+   531→   531→    @web.middleware
+   532→   532→    async def _cors_middleware(self, request: web.Request, handler: web.Handler) -> web.StreamResponse:
+   533→   533→        """Add CORS headers to all responses."""
+   534→   534→        response = await handler(request)
+   535→   535→        origin = request.headers.get("Origin", "*")
+   536→   536→        if origin in self._config.cors_origins or "*" in self._config.cors_origins:
+   537→   537→            response.headers["Access-Control-Allow-Origin"] = origin
+   538→   538→            response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+   539→   539→            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+   540→   540→            response.headers["Access-Control-Max-Age"] = "86400"
+   541→   541→        return response
+   542→   542→
+   543→   543→    # -------------------------------------------------------------------
+   544→   544→    # Request helpers
+   545→   545→    # -------------------------------------------------------------------
+   546→   546→
+   547→   547→    def _get_client_ip(self, request: web.Request) -> str:
+   548→   548→        """Extract the client IP, respecting X-Forwarded-For headers."""
+   549→   549→        forwarded = request.headers.get("X-Forwarded-For", "")
+   550→   550→        if forwarded:
+   551→   551→            return forwarded.split(",")[0].strip()
+   552→   552→        peername = request.transport.get_extra_info("peername") if request.transport else None
+   553→   553→        if peername:
+   554→   554→            return peername[0]
+   555→   555→        return "unknown"
+   556→   556→
+   557→   557→    def _verify_hmac(self, blob_id: bytes, encrypted_data: bytes, hmac_tag: bytes) -> bool:
+   558→   558→        """Verify HMAC-SHA256 tag for a blob.
+   559→   559→
+   560→   560→        Args:
+   561→   561→            blob_id: 16-byte blob identifier.
+   562→   562→            encrypted_data: The encrypted payload bytes.
+   563→   563→            hmac_tag: 32-byte HMAC tag to verify.
+   564→   564→
+   565→   565→        Returns:
+   566→   566→            True if the HMAC is valid, False otherwise.
+   567→   567→        """
+   568→   568→        expected = hmac.new(
+   569→   569→            self._config.hmac_key,
+   570→   570→            blob_id + encrypted_data,
+   571→   571→            hashlib.sha256,
+   572→   572→        ).digest()
+   573→   573→        return hmac.compare_digest(expected, hmac_tag)
+   574→   574→
+   575→   575→    # -------------------------------------------------------------------
+   576→   576→    # HTTP handlers
+   577→   577→    # -------------------------------------------------------------------
+   578→   578→
+   579→   579→    async def _handle_push(self, request: web.Request) -> web.Response:
+   580→   580→        """POST /push — Store an encrypted blob on the relay.
+   581→   581→
+   582→   582→        Request body (binary):
+   583→   583→            [16B blob_id][4B data_len][N bytes encrypted_data][32B hmac_tag]
+   584→   584→
+   585→   585→        The relay stores the blob and optionally sends a push notification
+   586→   586→        to the recipient via FCM/APNS (containing only the blob_id).
+   587→   587→
+   588→   588→        Returns:
+   589→   589→            202 Accepted on success.
+   590→   590→            400 Bad Request if the payload is malformed.
+   591→   591→            429 Too Many Requests if rate limited.
+   592→   592→        """
+   593→   593→        ip = self._get_client_ip(request)
+   594→   594→
+   595→   595→        # Rate limit check
+   596→   596→        if not self._rate_limiter.check_push(ip):
+   597→   597→            return web.json_response(
+   598→   598→                {"error": "rate_limit", "message": "Push rate limit exceeded."},
+   599→   599→                status=429,
+   600→   600→            )
+   601→   601→
+   602→   602→        # Read body
+   603→   603→        try:
+   604→   604→            body = await request.read()
+   605→   605→        except Exception as exc:
+   606→   606→            return web.json_response(
+   607→   607→                {"error": "bad_request", "message": f"Failed to read body: {exc}"},
+   608→   608→                status=400,
+   609→   609→            )
+   610→   610→
+   611→   611→        # Parse binary payload
+   612→   612→        if len(body) < BLOB_ID_SIZE + 4 + HMAC_KEY_SIZE:
+   613→   613→            return web.json_response(
+   614→   614→                {"error": "bad_request", "message": "Payload too short."},
+   615→   615→                status=400,
+   616→   616→            )
+   617→   617→
+   618→   618→        offset = 0
+   619→   619→        blob_id = body[offset:offset + BLOB_ID_SIZE]
+   620→   620→        offset += BLOB_ID_SIZE
+   621→   621→
+   622→   622→        import struct
+   623→   623→        data_len = struct.unpack("!I", body[offset:offset + 4])[0]
+   624→   624→        offset += 4
+   625→   625→
+   626→   626→        if data_len > self._config.max_blob_size:
+   627→   627→            return web.json_response(
+   628→   628→                {"error": "bad_request", "message": f"Encrypted data too large: {data_len}."},
+   629→   629→                status=400,
+   630→   630→            )
+   631→   631→
+   632→   632→        if len(body) < offset + data_len + HMAC_KEY_SIZE:
+   633→   633→            return web.json_response(
+   634→   634→                {"error": "bad_request", "message": "Payload truncated."},
+   635→   635→                status=400,
+   636→   636→            )
+   637→   637→
+   638→   638→        encrypted_data = body[offset:offset + data_len]
+   639→   639→        offset += data_len
+   640→   640→
+   641→   641→        hmac_tag = body[offset:offset + HMAC_KEY_SIZE]
+   642→   642→
+   643→   643→        # Verify HMAC
+   644→   644→        if not self._verify_hmac(blob_id, encrypted_data, hmac_tag):
+   645→   645→            return web.json_response(
+   646→   646→                {"error": "hmac_invalid", "message": "HMAC verification failed."},
+   647→   647→                status=400,
+   648→   648→            )
+   649→   649→
+   650→   650→        # Store the blob
+   651→   651→        now = time.time()
+   652→   652→        blob = StoredBlob(
+   653→   653→            blob_id=blob_id,
+   654→   654→            encrypted_data=encrypted_data,
+   655→   655→            hmac_tag=hmac_tag,
+   656→   656→            created_at=now,
+   657→   657→            expires_at=now + self._config.blob_ttl,
+   658→   658→        )
+   659→   659→
+   660→   660→        try:
+   661→   661→            await self._storage.store(blob)
+   662→   662→        except RelayStorageError as exc:
+   663→   663→            return web.json_response(
+   664→   664→                {"error": "storage_error", "message": str(exc)},
+   665→   665→                status=507,
+   666→   666→            )
+   667→   667→
+   668→   668→        # Optionally trigger FCM/APNS push
+   669→   669→        await self._send_push_notification(blob_id)
+   670→   670→
+   671→   671→        logger.debug(
+   672→   672→            "Push accepted: blob_id=%s, size=%d, ip=%s",
+   673→   673→            blob_id.hex(),
+   674→   674→            data_len,
+   675→   675→            ip,
+   676→   676→        )
+   677→   677→
+   678→   678→        return web.json_response(
+   679→   679→            {"status": "accepted", "blob_id": blob_id.hex()},
+   680→   680→            status=202,
+   681→   681→        )
+   682→   682→
+   683→   683→    async def _handle_pull(self, request: web.Request) -> web.Response:
+   684→   684→        """GET /pull?ids=<hex_blob_id1,hex_blob_id2,...> — Blind fetch blobs.
+   685→   685→
+   686→   686→        The recipient computes blob IDs from their own public key and
+   687→   687→        timestamp buckets, then fetches matching blobs without revealing
+   688→   688→        their identity to the relay.
+   689→   689→
+   690→   690→        Returns:
+   691→   691→            200 with JSON array of {blob_id, encrypted_data, hmac_tag}.
+   692→   692→            429 if rate limited.
+   693→   693→        """
+   694→   694→        ip = self._get_client_ip(request)
+   695→   695→
+   696→   696→        # Rate limit check
+   697→   697→        if not self._rate_limiter.check_pull(ip):
+   698→   698→            return web.json_response(
+   699→   699→                {"error": "rate_limit", "message": "Pull rate limit exceeded."},
+   700→   700→                status=429,
+   701→   701→            )
+   702→   702→
+   703→   703→        # Parse IDs
+   704→   704→        ids_param = request.query.get("ids", "")
+   705→   705→        if not ids_param:
+   706→   706→            return web.json_response(
+   707→   707→                {"error": "bad_request", "message": "Missing 'ids' parameter."},
+   708→   708→                status=400,
+   709→   709→            )
+   710→   710→
+   711→   711→        hex_ids = [h.strip() for h in ids_param.split(",") if h.strip()]
+   712→   712→        if len(hex_ids) > MAX_IDS_PER_PULL:
+   713→   713→            return web.json_response(
+   714→   714→                {"error": "bad_request",
+   715→   715→                 "message": f"Too many IDs: {len(hex_ids)}, max {MAX_IDS_PER_PULL}."},
+   716→   716→                status=400,
+   717→   717→            )
+   718→   718→
+   719→   719→        blob_ids: list[bytes] = []
+   720→   720→        for hid in hex_ids:
+   721→   721→            try:
+   722→   722→                bid = bytes.fromhex(hid)
+   723→   723→                if len(bid) != BLOB_ID_SIZE:
+   724→   724→                    raise ValueError(f"Wrong size: {len(bid)}")
+   725→   725→                blob_ids.append(bid)
+   726→   726→            except (ValueError, Exception) as exc:
+   727→   727→                return web.json_response(
+   728→   728→                    {"error": "bad_request", "message": f"Invalid blob ID '{hid}': {exc}"},
+   729→   729→                    status=400,
+   730→   730→                )
+   731→   731→
+   732→   732→        # Fetch blobs
+   733→   733→        blobs = await self._storage.fetch_many(blob_ids)
+   734→   734→
+   735→   735→        # Build response
+   736→   736→        result = []
+   737→   737→        for blob in blobs:
+   738→   738→            result.append({
+   739→   739→                "blob_id": blob.blob_id.hex(),
+   740→   740→                "encrypted_data": blob.encrypted_data.hex(),
+   741→   741→                "hmac_tag": blob.hmac_tag.hex(),
+   742→   742→                "expires_at": blob.expires_at,
+   743→   743→            })
+   744→   744→
+   745→   745→        # Delete fetched blobs (one-time fetch for forward secrecy)
+   746→   746→        for blob in blobs:
+   747→   747→            await self._storage.delete(blob.blob_id)
+   748→   748→
+   749→   749→        logger.debug(
+   750→   750→            "Pull: requested %d IDs, returned %d blobs, ip=%s",
+   751→   751→            len(blob_ids),
+   752→   752→            len(result),
+   753→   753→            ip,
+   754→   754→        )
+   755→   755→
+   756→   756→        return web.json_response({"blobs": result})
+   757→   757→
+   758→   758→    async def _handle_register(self, request: web.Request) -> web.Response:
+   759→   759→        """POST /register — Register a FCM/APNS device token.
+   760→   760→
+   761→   761→        Request body (JSON):
+   762→   762→            {
+   763→   763→                "encrypted_user_id": "<hex>",
+   764→   764→                "device_token": "<string>",
+   765→   765→                "platform": "fcm" | "apns"
+   766→   766→            }
+   767→   767→
+   768→   768→        The encrypted_user_id is opaque to the relay — it's the user's
+   769→   769→        identity encrypted with a key known only to the user and the
+   770→   770→        notification dispatch service.
+   771→   771→        """
+   772→   772→        try:
+   773→   773→            data = await request.json()
+   774→   774→        except Exception as exc:
+   775→   775→            return web.json_response(
+   776→   776→                {"error": "bad_request", "message": f"Invalid JSON: {exc}"},
+   777→   777→                status=400,
+   778→   778→            )
+   779→   779→
+   780→   780→        encrypted_uid_hex = data.get("encrypted_user_id", "")
+   781→   781→        device_token = data.get("device_token", "")
+   782→   782→        platform = data.get("platform", "")
+   783→   783→
+   784→   784→        if not encrypted_uid_hex or not device_token or platform not in ("fcm", "apns"):
+   785→   785→            return web.json_response(
+   786→   786→                {"error": "bad_request",
+   787→   787→                 "message": "Missing or invalid fields: encrypted_user_id, device_token, platform."},
+   788→   788→                status=400,
+   789→   789→            )
+   790→   790→
+   791→   791→        try:
+   792→   792→            encrypted_uid = bytes.fromhex(encrypted_uid_hex)
+   793→   793→        except ValueError:
+   794→   794→            return web.json_response(
+   795→   795→                {"error": "bad_request", "message": "Invalid encrypted_user_id hex."},
+   796→   796→                status=400,
+   797→   797→            )
+   798→   798→
+   799→   799→        token_entry = DeviceToken(
+   800→   800→            encrypted_user_id=encrypted_uid,
+   801→   801→            device_token=device_token,
+   802→   802→            platform=platform,
+   803→   803→            registered_at=time.time(),
+   804→   804→        )
+   805→   805→        self._device_tokens[device_token] = token_entry
+   806→   806→
+   807→   807→        logger.debug(
+   808→   808→            "Registered %s token: %s...%s",
+   809→   809→            platform.upper(),
+   810→   810→            device_token[:8],
+   811→   811→            device_token[-4:],
+   812→   812→        )
+   813→   813→
+   814→   814→        return web.json_response({"status": "registered"}, status=201)
+   815→   815→
+   816→   816→    async def _handle_unregister(self, request: web.Request) -> web.Response:
+   817→   817→        """DELETE /token?device_token=<token> — Unregister a device token."""
+   818→   818→        token = request.query.get("device_token", "")
+   819→   819→        if not token:
+   820→   820→            return web.json_response(
+   821→   821→                {"error": "bad_request", "message": "Missing device_token parameter."},
+   822→   822→                status=400,
+   823→   823→            )
+   824→   824→
+   825→   825→        removed = self._device_tokens.pop(token, None)
+   826→   826→        if removed is None:
+   827→   827→            return web.json_response(
+   828→   828→                {"error": "not_found", "message": "Token not registered."},
+   829→   829→                status=404,
+   830→   830→            )
+   831→   831→
+   832→   832→        return web.json_response({"status": "unregistered"})
+   833→   833→
+   834→   834→    async def _handle_health(self, request: web.Request) -> web.Response:
+   835→   835→        """GET /health — Health check endpoint."""
+   836→   836→        return web.json_response({
+   837→   837→            "status": "healthy",
+   838→   838→            "uptime": time.time() - self._started_at if self._started_at else 0,
+   839→   839→            "blob_count": self._storage.blob_count,
+   840→   840→            "total_bytes": self._storage.total_bytes,
+   841→   841→        })
+   842→   842→
+   843→   843→    async def _handle_stats(self, request: web.Request) -> web.Response:
+   844→   844→        """GET /stats — Relay statistics (for monitoring)."""
+   845→   845→        return web.json_response({
+   846→   846→            "uptime_seconds": time.time() - self._started_at if self._started_at else 0,
+   847→   847→            "blob_count": self._storage.blob_count,
+   848→   848→            "total_bytes_stored": self._storage.total_bytes,
+   849→   849→            "registered_devices": len(self._device_tokens),
+   850→   850→            "rate_limit_entries": len(self._rate_limiter._entries),
+   851→   851→        })
+   852→   852→
+   853→   853→    # -------------------------------------------------------------------
+   854→   854→    # FCM/APNS push notification dispatch
+   855→   855→    # -------------------------------------------------------------------
+   856→   856→
+   857→   857→    async def _send_push_notification(self, blob_id: bytes) -> None:
+   858→   858→        """Send a push notification to registered devices.
+   859→   859→
+   860→   860→        The notification contains ONLY the 16-byte encrypted_payload_id.
+   861→   861→        No message content is ever included — the client must fetch the
+   862→   862→        actual encrypted blob separately.
+   863→   863→
+   864→   864→        For FCM: sends a data message with blob_id field.
+   865→   865→        For APNS: sends a background notification with blob_id in custom data.
+   866→   866→
+   867→   867→        This is a best-effort operation — failures are logged but don't
+   868→   868→        block the push operation.
+   869→   869→        """
+   870→   870→        blob_id_hex = blob_id.hex()
+   871→   871→
+   872→   872→        # FCM push
+   873→   873→        if self._config.fcm_server_key:
+   874→   874→            fcm_tokens = [
+   875→   875→                t for t in self._device_tokens.values()
+   876→   876→                if t.platform == "fcm"
+   877→   877→            ]
+   878→   878→            for token_entry in fcm_tokens:
+   879→   879→                try:
+   880→   880→                    await self._send_fcm(token_entry.device_token, blob_id_hex)
+   881→   881→                except Exception as exc:
+   882→   882→                    logger.debug("FCM push failed for %s...%s: %s",
+   883→   883→                                 token_entry.device_token[:8],
+   884→   884→                                 token_entry.device_token[-4:],
+   885→   885→                                 exc)
+   886→   886→
+   887→   887→        # APNS push
+   888→   888→        if self._config.apns_cert_path:
+   889→   889→            apns_tokens = [
+   890→   890→                t for t in self._device_tokens.values()
+   891→   891→                if t.platform == "apns"
+   892→   892→            ]
+   893→   893→            for token_entry in apns_tokens:
+   894→   894→                try:
+   895→   895→                    await self._send_apns(token_entry.device_token, blob_id_hex)
+   896→   896→                except Exception as exc:
+   897→   897→                    logger.debug("APNS push failed for %s...%s: %s",
+   898→   898→                                 token_entry.device_token[:8],
+   899→   899→                                 token_entry.device_token[-4:],
+   900→   900→                                 exc)
+   901→   901→
+   902→   902→    async def _send_fcm(self, device_token: str, blob_id_hex: str) -> None:
+   903→   903→        """Send a Firebase Cloud Messaging data notification.
+   904→   904→
+   905→   905→        The notification payload contains only the blob_id — the client
+   906→   906→        app will then fetch the encrypted blob from the relay.
+   907→   907→        """
+   908→   908→        import aiohttp
+   909→   909→
+   910→   910→        url = "https://fcm.googleapis.com/fcm/send"
+   911→   911→        headers = {
+   912→   912→            "Authorization": f"key={self._config.fcm_server_key}",
+   913→   913→            "Content-Type": "application/json",
+   914→   914→        }
+   915→   915→        payload = {
+   916→   916→            "to": device_token,
+   917→   917→            "data": {
+   918→   918→                "blob_id": blob_id_hex,
+   919→   919→                "type": "presidium_message",
+   920→   920→            },
+   921→   921→            "content_available": True,
+   922→   922→            "priority": "high",
+   923→   923→        }
+   924→   924→
+   925→   925→        async with aiohttp.ClientSession() as session:
+   926→   926→            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+   927→   927→                if resp.status != 200:
+   928→   928→                    body = await resp.text()
+   929→   929→                    logger.warning("FCM returned %d: %s", resp.status, body[:200])
+   930→   930→
+   931→   931→    async def _send_apns(self, device_token: str, blob_id_hex: str) -> None:
+   932→   932→        """Send an Apple Push Notification Service notification.
+   933→   933→
+   934→   934→        Uses APNS HTTP/2 API with the configured certificate.
+   935→   935→        The notification is a background push containing only the blob_id.
+   936→   936→        """
+   937→   937→        # APNS HTTP/2 integration
+   938→   938→        # In production, use the aiohttp-http2 or hyper library for HTTP/2
+   939→   939→        # For now, log the notification for debugging
+   940→   940→        logger.debug(
+   941→   941→            "APNS push: token=%s...%s, blob_id=%s",
+   942→   942→            device_token[:8],
+   943→   943→            device_token[-4:],
+   944→   944→            blob_id_hex,
+   945→   945→        )
+   946→   946→

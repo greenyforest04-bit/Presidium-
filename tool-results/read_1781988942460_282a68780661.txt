@@ -1,0 +1,1197 @@
+     1→"""End-to-end integration tests for Presidium v1.5 "Presidium Prime".
+     2→
+     3→Tests the complete functionality of all major subsystems using real
+     4→(in-memory) instances — no mocks for core crypto or protocol objects.
+     5→Each test category creates the necessary objects from scratch and
+     6→verifies round-trip behaviour, error handling, and edge cases.
+     7→
+     8→Test categories:
+     9→    crypto          — key generation, signing, encryption, Argon2id
+    10→    network         — DHT operations, peer discovery v2
+    11→    messaging       — Double Ratchet encrypt / decrypt
+    12→    push            — zero-knowledge push relay push / pull
+    13→    voice_message   — voice message encoding / decoding
+    14→    location        — precision reduction and wire format
+    15→    polls           — poll create / vote / close lifecycle
+    16→    i18n            — translation and plural forms
+    17→    a11y            — accessibility profile and screen reader text
+    18→    search          — semantic search indexing and fallback embedding
+    19→    import          — import validation and sanitization
+    20→    sdk             — SDK initialization and message send
+    21→
+    22→All tests use ``@pytest.mark.asyncio`` and real instances.  Fixtures
+    23→provide commonly-shared objects (identity, key pairs, etc.).
+    24→"""
+    25→
+    26→from __future__ import annotations
+    27→
+    28→import asyncio
+    29→import hashlib
+    30→import os
+    31→import struct
+    32→import sys
+    33→import time
+    34→from pathlib import Path
+    35→from typing import Any, Optional
+    36→from unittest.mock import AsyncMock, MagicMock, patch
+    37→
+    38→import pytest
+    39→
+    40→sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    41→
+    42→
+    43→# ==========================================================================
+    44→# Fixtures
+    45→# ==========================================================================
+    46→
+    47→@pytest.fixture
+    48→def ed25519_keypair():
+    49→    """Create a fresh Ed25519 key pair."""
+    50→    from presidium.core.crypto import Ed25519KeyPair
+    51→    return Ed25519KeyPair()
+    52→
+    53→
+    54→@pytest.fixture
+    55→def x25519_keypair():
+    56→    """Create a fresh X25519 key pair."""
+    57→    from presidium.core.crypto import X25519KeyPair
+    58→    return X25519KeyPair()
+    59→
+    60→
+    61→@pytest.fixture
+    62→def two_x25519_pairs():
+    63→    """Create two X25519 pairs (Alice + Bob) for DH exchange."""
+    64→    from presidium.core.crypto import X25519KeyPair
+    65→    return X25519KeyPair(), X25519KeyPair()
+    66→
+    67→
+    68→@pytest.fixture
+    69→def shared_secret(two_x25519_pairs):
+    70→    """Compute a DH shared secret between Alice and Bob."""
+    71→    alice, bob = two_x25519_pairs
+    72→    from presidium.core.crypto import X25519KeyPair
+    73→    sk_alice = X25519KeyPair._dh(alice._private_key, bob._public_key)
+    74→    sk_bob = X25519KeyPair._dh(bob._private_key, alice._public_key)
+    75→    assert sk_alice == sk_bob
+    76→    return sk_alice
+    77→
+    78→
+    79→@pytest.fixture
+    80→def user_id(ed25519_keypair):
+    81→    """Derive a User ID from an Ed25519 public key."""
+    82→    from presidium.core.crypto import compute_user_id
+    83→    return compute_user_id(ed25519_keypair.public_key_bytes)
+    84→
+    85→
+    86→# ==========================================================================
+    87→# P0: Crypto tests
+    88→# ==========================================================================
+    89→
+    90→class TestCrypto:
+    91→    """Test cryptographic primitives for Presidium v1.5."""
+    92→
+    93→    def test_ed25519_sign_verify(self, ed25519_keypair) -> None:
+    94→        """Ed25519 signature should verify against the original message."""
+    95→        message = b"Presidium Prime test message"
+    96→        signature = ed25519_keypair.sign(message)
+    97→        assert ed25519_keypair.verify(message, signature) is True
+    98→
+    99→    def test_ed25519_tampered_message_fails(self, ed25519_keypair) -> None:
+   100→        """Signature verification should fail for tampered messages."""
+   101→        message = b"Original message"
+   102→        signature = ed25519_keypair.sign(message)
+   103→        tampered = b"Tampered message"
+   104→        assert ed25519_keypair.verify(tampered, signature) is False
+   105→
+   106→    def test_ed25519_wrong_key_fails(self) -> None:
+   107→        """Signature should not verify with a different public key."""
+   108→        from presidium.core.crypto import Ed25519KeyPair
+   109→        key_a = Ed25519KeyPair()
+   110→        key_b = Ed25519KeyPair()
+   111→        message = b"Test message"
+   112→        sig = key_a.sign(message)
+   113→        assert key_b.verify(message, sig) is False
+   114→
+   115→    def test_x25519_dh_shared_secret(self, two_x25519_pairs) -> None:
+   116→        """DH shared secret should be identical from both sides."""
+   117→        alice, bob = two_x25519_pairs
+   118→        from presidium.core.crypto import X25519KeyPair
+   119→        sk_alice = X25519KeyPair._dh(alice._private_key, bob._public_key)
+   120→        sk_bob = X25519KeyPair._dh(bob._private_key, alice._public_key)
+   121→        assert sk_alice == sk_bob
+   122→        assert len(sk_alice) == 32
+   123→
+   124→    def test_aes256gcm_encrypt_decrypt(self) -> None:
+   125→        """AES-256-GCM should round-trip correctly."""
+   126→        from presidium.core.crypto import AES256GCM
+   127→        key = os.urandom(32)
+   128→        plaintext = b"Hello, Presidium Prime!"
+   129→        ciphertext = AES256GCM.encrypt(key, plaintext)
+   130→        decrypted = AES256GCM.decrypt(key, ciphertext)
+   131→        assert decrypted == plaintext
+   132→
+   133→    def test_aes256gcm_tampered_fails(self) -> None:
+   134→        """AES-256-GCM decryption should fail if ciphertext is tampered."""
+   135→        from presidium.core.crypto import AES256GCM, DecryptionError
+   136→        key = os.urandom(32)
+   137→        plaintext = b"Secret data"
+   138→        ciphertext = bytearray(AES256GCM.encrypt(key, plaintext))
+   139→        # Flip a byte in the ciphertext
+   140→        ciphertext[-1] ^= 0xFF
+   141→        with pytest.raises(DecryptionError):
+   142→            AES256GCM.decrypt(key, bytes(ciphertext))
+   143→
+   144→    def test_aes256gcm_wrong_key_fails(self) -> None:
+   145→        """AES-256-GCM decryption should fail with the wrong key."""
+   146→        from presidium.core.crypto import AES256GCM, DecryptionError
+   147→        key_a = os.urandom(32)
+   148→        key_b = os.urandom(32)
+   149→        plaintext = b"Encrypted message"
+   150→        ciphertext = AES256GCM.encrypt(key_a, plaintext)
+   151→        with pytest.raises(DecryptionError):
+   152→            AES256GCM.decrypt(key_b, ciphertext)
+   153→
+   154→    def test_compute_user_id(self, ed25519_keypair) -> None:
+   155→        """User ID should be a deterministic 32-char hex string."""
+   156→        from presidium.core.crypto import compute_user_id
+   157→        pk = ed25519_keypair.public_key_bytes
+   158→        uid = compute_user_id(pk)
+   159→        assert len(uid) == 32
+   160→        assert all(c in "0123456789abcdef" for c in uid)
+   161→        # Deterministic
+   162→        uid2 = compute_user_id(pk)
+   163→        assert uid == uid2
+   164→
+   165→    def test_argon2id_key_derivation(self) -> None:
+   166→        """Argon2id should derive a 32-byte key from a password."""
+   167→        from presidium.core.crypto import derive_key_from_password, generate_salt
+   168→        salt = generate_salt(32)
+   169→        key = derive_key_from_password("StrongPassword123!", salt)
+   170→        assert len(bytes(key)) == 32
+   171→        # Same password + salt = same key
+   172→        key2 = derive_key_from_password("StrongPassword123!", salt)
+   173→        assert bytes(key) == bytes(key2)
+   174→
+   175→    def test_argon2id_different_salt(self) -> None:
+   176→        """Different salts should produce different keys."""
+   177→        from presidium.core.crypto import derive_key_from_password, generate_salt
+   178→        key_a = derive_key_from_password("SamePassword", generate_salt(32))
+   179→        key_b = derive_key_from_password("SamePassword", generate_salt(32))
+   180→        assert bytes(key_a) != bytes(key_b)
+   181→
+   182→    def test_secure_bytes_zeroing(self) -> None:
+   183→        """SecureBytes should zero its memory on explicit zero() call."""
+   184→        from presidium.core.crypto import SecureBytes
+   185→        sb = SecureBytes(b"\x01\x02\x03\x04")
+   186→        sb.zero()
+   187→        assert bytes(sb) == b"\x00\x00\x00\x00"
+   188→
+   189→
+   190→# ==========================================================================
+   191→# P0: Double Ratchet tests
+   192→# ==========================================================================
+   193→
+   194→class TestDoubleRatchet:
+   195→    """Test Double Ratchet encrypt/decrypt for v1.5."""
+   196→
+   197→    def test_ratchet_header_encode_decode(self) -> None:
+   198→        """RatchetHeader should round-trip through encode/decode."""
+   199→        from presidium.core.messaging.ratchet import RatchetHeader, encode_header, decode_header
+   200→        header = RatchetHeader(
+   201→            dh_public_key=os.urandom(32),
+   202→            message_number=7,
+   203→            previous_chain_length=3,
+   204→        )
+   205→        encoded = encode_header(header)
+   206→        decoded = decode_header(encoded)
+   207→        assert decoded.dh_public_key == header.dh_public_key
+   208→        assert decoded.message_number == header.message_number
+   209→        assert decoded.previous_chain_length == header.previous_chain_length
+   210→
+   211→    def test_chain_key_advancement(self) -> None:
+   212→        """Chain key advancement should produce deterministic message keys."""
+   213→        from presidium.core.messaging.ratchet import advance_chain_key
+   214→        ck = os.urandom(32)
+   215→        ck2, mk1 = advance_chain_key(ck)
+   216→        ck3, mk2 = advance_chain_key(ck2)
+   217→        # Each step produces unique keys
+   218→        assert ck != ck2
+   219→        assert ck2 != ck3
+   220→        assert mk1 != mk2
+   221→        # Deterministic
+   222→        ck2_b, mk1_b = advance_chain_key(ck)
+   223→        assert ck2 == ck2_b
+   224→        assert mk1 == mk1_b
+   225→
+   226→    def test_header_encryption_roundtrip(self) -> None:
+   227→        """Header encryption should round-trip."""
+   228→        from presidium.core.messaging.ratchet import (
+   229→            RatchetHeader, encrypt_header, decrypt_header,
+   230→        )
+   231→        header = RatchetHeader(
+   232→            dh_public_key=os.urandom(32),
+   233→            message_number=2,
+   234→            previous_chain_length=0,
+   235→        )
+   236→        hk = os.urandom(32)
+   237→        encrypted = encrypt_header(header, hk)
+   238→        decrypted = decrypt_header(encrypted, hk)
+   239→        assert decrypted.dh_public_key == header.dh_public_key
+   240→        assert decrypted.message_number == header.message_number
+   241→
+   242→    def test_skipped_message_key_store(self) -> None:
+   243→        """SkippedMessageKeys should store and retrieve message keys."""
+   244→        from presidium.core.messaging.ratchet import SkippedMessageKeys
+   245→        store = SkippedMessageKeys(max_skip=10)
+   246→        hk = os.urandom(32)
+   247→        mk = os.urandom(32)
+   248→        store.store(hk, 3, mk)
+   249→        assert store.has_key(hk, 3) is True
+   250→        retrieved = store.retrieve(hk, 3)
+   251→        assert retrieved == mk
+   252→        # After retrieval, key should be gone
+   253→        assert store.retrieve(hk, 3) is None
+   254→        assert store.has_key(hk, 3) is False
+   255→
+   256→    def test_skipped_message_key_eviction(self) -> None:
+   257→        """SkippedMessageKeys should evict oldest when full."""
+   258→        from presidium.core.messaging.ratchet import SkippedMessageKeys
+   259→        store = SkippedMessageKeys(max_skip=3)
+   260→        hk = os.urandom(32)
+   261→        for i in range(4):
+   262→            store.store(hk, i, os.urandom(32))
+   263→        # Oldest (0) should be evicted
+   264→        assert store.has_key(hk, 0) is False
+   265→        # Newest entries should remain
+   266→        assert store.has_key(hk, 1) is True
+   267→        assert store.has_key(hk, 2) is True
+   268→        assert store.has_key(hk, 3) is True
+   269→
+   270→    def test_header_decrypt_wrong_key_fails(self) -> None:
+   271→        """Decrypting a header with the wrong key should fail."""
+   272→        from presidium.core.messaging.ratchet import (
+   273→            RatchetHeader, encrypt_header, decrypt_header, HeaderDecryptError,
+   274→        )
+   275→        header = RatchetHeader(
+   276→            dh_public_key=os.urandom(32),
+   277→            message_number=1,
+   278→            previous_chain_length=0,
+   279→        )
+   280→        hk = os.urandom(32)
+   281→        wrong_hk = os.urandom(32)
+   282→        encrypted = encrypt_header(header, hk)
+   283→        with pytest.raises(HeaderDecryptError):
+   284→            decrypt_header(encrypted, wrong_hk)
+   285→
+   286→
+   287→# ==========================================================================
+   288→# P0: DHT tests
+   289→# ==========================================================================
+   290→
+   291→class TestDHT:
+   292→    """Test DHT operations for Presidium v1.5."""
+   293→
+   294→    def test_xor_distance(self) -> None:
+   295→        """XOR distance should be symmetric and correct."""
+   296→        from presidium.core.network.dht import xor_distance
+   297→        a = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
+   298→        b = bytes.fromhex("1112131415161718191a1b1c1d1e1f20")
+   299→        d_ab = xor_distance(a, b)
+   300→        d_ba = xor_distance(b, a)
+   301→        assert d_ab == d_ba  # Symmetric
+   302→        assert d_ab > 0
+   303→
+   304→    def test_xor_distance_self_is_zero(self) -> None:
+   305→        """XOR distance of a node with itself should be zero."""
+   306→        from presidium.core.network.dht import xor_distance
+   307→        node_id = os.urandom(16)
+   308→        assert xor_distance(node_id, node_id) == 0
+   309→
+   310→    def test_bucket_index_for_distance(self) -> None:
+   311→        """Bucket index should reflect the position of the highest set bit."""
+   312→        from presidium.core.network.dht import bucket_index_for_distance
+   313→        assert bucket_index_for_distance(0) == 0
+   314→        assert bucket_index_for_distance(1) == 1
+   315→        assert bucket_index_for_distance(2) == 2
+   316→        assert bucket_index_for_distance(3) == 2
+   317→        assert bucket_index_for_distance(4) == 3
+   318→        assert bucket_index_for_distance(255) == 8
+   319→
+   320→    def test_kbucket_insert(self) -> None:
+   321→        """KBucket should insert nodes up to its capacity."""
+   322→        from presidium.core.network.dht import KBucket, DHTNodeInfo
+   323→        bucket = KBucket(k=4)
+   324→        for i in range(4):
+   325→            node = DHTNodeInfo(node_id=os.urandom(16), addr=("127.0.0.1", 9000 + i))
+   326→            assert bucket.add(node) is True
+   327→        assert len(bucket) == 4
+   328→        # Fifth should fail
+   329→        node5 = DHTNodeInfo(node_id=os.urandom(16), addr=("127.0.0.1", 9004))
+   330→        assert bucket.add(node5) is False
+   331→
+   332→    def test_kbucket_replace_stale(self) -> None:
+   333→        """KBucket should replace the least-recently-seen node when full."""
+   334→        from presidium.core.network.dht import KBucket, DHTNodeInfo
+   335→        bucket = KBucket(k=2)
+   336→        n1 = DHTNodeInfo(node_id=os.urandom(16), addr=("1.1.1.1", 1))
+   337→        n2 = DHTNodeInfo(node_id=os.urandom(16), addr=("2.2.2.2", 2))
+   338→        bucket.add(n1)
+   339→        bucket.add(n2)
+   340→        # Mark n1 as stale (old last_seen)
+   341→        bucket._nodes[0] = (n1, time.time() - 10000)
+   342→        # Adding n3 should replace n1
+   343→        n3 = DHTNodeInfo(node_id=os.urandom(16), addr=("3.3.3.3", 3))
+   344→        result = bucket.add(n3)
+   345→        assert result is True
+   346→        ids = [n.node_id for n, _ in bucket._nodes]
+   347→        assert n1.node_id not in ids
+   348→        assert n3.node_id in ids
+   349→
+   350→
+   351→# ==========================================================================
+   352→# P0: Discovery v2 tests
+   353→# ==========================================================================
+   354→
+   355→class TestDiscoveryV2:
+   356→    """Test privacy-preserving contact discovery with blind signatures."""
+   357→
+   358→    @pytest.mark.asyncio
+   359→    async def test_full_discovery_roundtrip(self) -> None:
+   360→        """Full discovery protocol: register → discover → match."""
+   361→        from presidium.core.network.discovery_v2 import ContactDiscoveryV2
+   362→
+   363→        # Alice registers her contacts
+   364→        alice = ContactDiscoveryV2(user_id="alice", key_bits=1024)
+   365→        await alice.initialize()
+   366→        await alice.register_contacts(["+15551234567", "bob@example.com"])
+   367→
+   368→        # Bob also registers "bob@example.com"
+   369→        bob = ContactDiscoveryV2(user_id="bob", key_bits=1024)
+   370→        # Share the same server for the test
+   371→        await bob.initialize()
+   372→        await bob.register_contacts(["bob@example.com", "carol@example.com"])
+   373→
+   374→        # Alice discovers using Bob's server
+   375→        # (In production the server is shared; here we use Alice's server
+   376→        #  and manually register Bob's token there.)
+   377→        bob_tokens = bob.client.create_tokens(["bob@example.com"])
+   378→        blinded = [t.blinded_token for t in bob_tokens]
+   379→        sigs = alice.server.sign_tokens(blinded, "bob")
+   380→        completed = bob.client.unblind_tokens(bob_tokens, sigs)
+   381→        for token in completed:
+   382→            alice.server.register_token(token.unblinded_sig, "bob")
+   383→
+   384→        # Alice discovers her contacts
+   385→        matches = await alice.discover_contacts(["+15551234567", "bob@example.com"])
+   386→        assert "bob@example.com" in matches
+   387→
+   388→        await alice.shutdown()
+   389→        await bob.shutdown()
+   390→
+   391→    @pytest.mark.asyncio
+   392→    async def test_rate_limiting(self) -> None:
+   393→        """Server should reject requests beyond the hourly limit."""
+   394→        from presidium.core.network.discovery_v2 import (
+   395→            DiscoveryServer, RateLimitExceededError, RATE_LIMIT_PER_HOUR,
+   396→        )
+   397→
+   398→        server = DiscoveryServer(key_bits=1024)
+   399→        await server.initialize()
+   400→        dummy_token = os.urandom(256)
+   401→
+   402→        for i in range(RATE_LIMIT_PER_HOUR):
+   403→            server.sign_tokens([dummy_token], f"limited_user")
+   404→
+   405→        with pytest.raises(RateLimitExceededError):
+   406→            server.sign_tokens([dummy_token], f"limited_user")
+   407→
+   408→    @pytest.mark.asyncio
+   409→    async def test_no_match_returns_empty(self) -> None:
+   410→        """Discovery with no matching contacts should return empty list."""
+   411→        from presidium.core.network.discovery_v2 import ContactDiscoveryV2
+   412→
+   413→        cd = ContactDiscoveryV2(user_id="solo", key_bits=1024)
+   414→        await cd.initialize()
+   415→        matches = await cd.discover_contacts(["+19999999999"])
+   416→        assert matches == []
+   417→        await cd.shutdown()
+   418→
+   419→    def test_contact_hash_deterministic(self) -> None:
+   420→        """Same contact string should always produce the same hash."""
+   421→        from presidium.core.network.discovery_v2 import DiscoveryClient
+   422→        h1 = DiscoveryClient.hash_contact("+15551234567")
+   423→        h2 = DiscoveryClient.hash_contact("+15551234567")
+   424→        assert h1 == h2
+   425→
+   426→    def test_different_contacts_different_hashes(self) -> None:
+   427→        """Different contact strings should produce different hashes."""
+   428→        from presidium.core.network.discovery_v2 import DiscoveryClient
+   429→        h1 = DiscoveryClient.hash_contact("+15551234567")
+   430→        h2 = DiscoveryClient.hash_contact("+15559876543")
+   431→        assert h1 != h2
+   432→
+   433→
+   434→# ==========================================================================
+   435→# P0: Push relay tests
+   436→# ==========================================================================
+   437→
+   438→class TestPushRelay:
+   439→    """Test zero-knowledge push relay push/pull."""
+   440→
+   441→    def test_push_blob_store_and_retrieve(self) -> None:
+   442→        """A pushed blob should be retrievable by its blob_id."""
+   443→        from presidium.push.relay_server import PushRelayServer
+   444→        server = PushRelayServer()
+   445→        server.start()
+   446→
+   447→        blob_id = hashlib.sha256(os.urandom(32) + struct.pack("!Q", int(time.time()))).digest()[:16]
+   448→        encrypted_blob = os.urandom(256)
+   449→        hmac_value = hashlib.sha256(blob_id + encrypted_blob).digest()
+   450→
+   451→        server.store_blob(blob_id, encrypted_blob, hmac_value)
+   452→        result = server.get_blob(blob_id)
+   453→        assert result == encrypted_blob
+   454→
+   455→        server.stop()
+   456→
+   457→    def test_push_blob_not_found(self) -> None:
+   458→        """Requesting a non-existent blob_id should return None."""
+   459→        from presidium.push.relay_server import PushRelayServer
+   460→        server = PushRelayServer()
+   461→        server.start()
+   462→        result = server.get_blob(os.urandom(16))
+   463→        assert result is None
+   464→        server.stop()
+   465→
+   466→    def test_blob_expiry(self) -> None:
+   467→        """Blobs should be evicted after their expiry time."""
+   468→        from presidium.push.relay_server import PushRelayServer
+   469→        server = PushRelayServer()
+   470→        server.start()
+   471→
+   472→        blob_id = hashlib.sha256(b"test-expiry").digest()[:16]
+   473→        encrypted_blob = os.urandom(128)
+   474→        hmac_value = hashlib.sha256(blob_id + encrypted_blob).digest()
+   475→
+   476→        # Store with immediate expiry (1 second)
+   477→        server.store_blob(blob_id, encrypted_blob, hmac_value, ttl_seconds=1)
+   478→
+   479→        # Should be available now
+   480→        assert server.get_blob(blob_id) == encrypted_blob
+   481→
+   482→        # Wait for expiry
+   483→        time.sleep(1.5)
+   484→        server._evict_expired()
+   485→
+   486→        # Should be gone
+   487→        assert server.get_blob(blob_id) is None
+   488→        server.stop()
+   489→
+   490→    def test_push_rate_limiting(self) -> None:
+   491→        """Push relay should rate-limit per IP."""
+   492→        from presidium.push.relay_server import PushRelayServer
+   493→        server = PushRelayServer()
+   494→        server.start()
+   495→
+   496→        # Exhaust the rate limit
+   497→        ip = "10.0.0.1"
+   498→        for _ in range(100):
+   499→            blob_id = os.urandom(16)
+   500→            encrypted_blob = os.urandom(64)
+   501→            hmac_value = hashlib.sha256(blob_id + encrypted_blob).digest()
+   502→            server.store_blob(blob_id, encrypted_blob, hmac_value, source_ip=ip)
+   503→
+   504→        # Next push should be rate-limited
+   505→        from presidium.push.relay_server import RateLimitExceededError
+   506→        with pytest.raises(RateLimitExceededError):
+   507→            blob_id = os.urandom(16)
+   508→            encrypted_blob = os.urandom(64)
+   509→            hmac_value = hashlib.sha256(blob_id + encrypted_blob).digest()
+   510→            server.store_blob(blob_id, encrypted_blob, hmac_value, source_ip=ip)
+   511→
+   512→        server.stop()
+   513→
+   514→
+   515→# ==========================================================================
+   516→# P1: Voice Message tests
+   517→# ==========================================================================
+   518→
+   519→class TestVoiceMessage:
+   520→    """Test voice message encoding and decoding."""
+   521→
+   522→    def test_voice_message_encode_decode(self) -> None:
+   523→        """VoiceMessage wire format should round-trip correctly."""
+   524→        from presidium.core.messaging.voice_message import VoiceMessage
+   525→        msg = VoiceMessage(
+   526→            duration_ms=5000,
+   527→            bitrate_kbps=16,
+   528→            waveform_samples=[0.1, 0.5, 0.9, 0.3, 0.7],
+   529→            opus_data=os.urandom(1024),
+   530→        )
+   531→        encoded = msg.encode()
+   532→        decoded = VoiceMessage.decode(encoded)
+   533→        assert decoded.duration_ms == msg.duration_ms
+   534→        assert decoded.bitrate_kbps == msg.bitrate_kbps
+   535→        assert decoded.waveform_samples == msg.waveform_samples
+   536→        assert decoded.opus_data == msg.opus_data
+   537→
+   538→    def test_voice_message_default_waveform(self) -> None:
+   539→        """VoiceMessage with no waveform should have an empty list."""
+   540→        from presidium.core.messaging.voice_message import VoiceMessage
+   541→        msg = VoiceMessage(
+   542→            duration_ms=3000,
+   543→            bitrate_kbps=24,
+   544→            opus_data=os.urandom(512),
+   545→        )
+   546→        assert msg.waveform_samples == []
+   547→
+   548→    def test_voice_waveform_widget_amplitude(self) -> None:
+   549→        """VoiceWaveformModel should normalize amplitudes correctly."""
+   550→        from presidium.core.messaging.voice_message import VoiceWaveformModel
+   551→        samples = [0.0, 0.5, 1.0, 0.25]
+   552→        model = VoiceWaveformModel(samples=samples)
+   553→        amplitudes = model.normalized_amplitudes(bar_count=4)
+   554→        assert len(amplitudes) == 4
+   555→        assert all(0.0 <= a <= 1.0 for a in amplitudes)
+   556→
+   557→
+   558→# ==========================================================================
+   559→# P1: Location tests
+   560→# ==========================================================================
+   561→
+   562→class TestLocation:
+   563→    """Test location precision reduction and wire format."""
+   564→
+   565→    def test_location_encode_decode_roundtrip(self) -> None:
+   566→        """LocationMessage should round-trip through encode/decode."""
+   567→        from presidium.core.messaging.location import (
+   568→            LocationMessage, LocationType, LocationPrecision, GeoCoordinate,
+   569→        )
+   570→        msg = LocationMessage(
+   571→            location_type=LocationType.STATIC,
+   572→            coordinate=GeoCoordinate(latitude=40.7128, longitude=-74.0060, altitude=10.0),
+   573→            precision=LocationPrecision.BUILDING,
+   574→            timestamp=time.time(),
+   575→            label="NYC Office",
+   576→            duration_minutes=0,
+   577→        )
+   578→        encoded = msg.encode()
+   579→        decoded = LocationMessage.decode(encoded)
+   580→        assert decoded.location_type == LocationType.STATIC
+   581→        assert abs(decoded.coordinate.latitude - msg.coordinate.latitude) < 0.001
+   582→        assert decoded.label == "NYC Office"
+   583→        assert decoded.precision == LocationPrecision.BUILDING
+   584→
+   585→    def test_precision_reduction_building(self) -> None:
+   586→        """Building-level precision should reduce to ~3 decimal places."""
+   587→        from presidium.core.messaging.location import GeoCoordinate, LocationPrecision
+   588→        coord = GeoCoordinate(latitude=40.712836, longitude=-74.006021)
+   589→        reduced = coord.reduce_precision(LocationPrecision.BUILDING)
+   590→        # Building precision: ~111m, so ~3 decimal places
+   591→        assert abs(reduced.latitude - 40.713) < 0.01
+   592→        assert abs(reduced.longitude - (-74.006)) < 0.01
+   593→
+   594→    def test_precision_reduction_city(self) -> None:
+   595→        """City-level precision should reduce to ~1 decimal place."""
+   596→        from presidium.core.messaging.location import GeoCoordinate, LocationPrecision
+   597→        coord = GeoCoordinate(latitude=40.712836, longitude=-74.006021)
+   598→        reduced = coord.reduce_precision(LocationPrecision.CITY)
+   599→        assert abs(reduced.latitude - 40.7) < 0.2
+   600→        assert abs(reduced.longitude - (-74.0)) < 0.2
+   601→
+   602→    def test_precision_reduction_exact_unchanged(self) -> None:
+   603→        """Exact precision should not modify the coordinate."""
+   604→        from presidium.core.messaging.location import GeoCoordinate, LocationPrecision
+   605→        coord = GeoCoordinate(latitude=40.712836, longitude=-74.006021)
+   606→        reduced = coord.reduce_precision(LocationPrecision.EXACT)
+   607→        assert reduced.latitude == coord.latitude
+   608→        assert reduced.longitude == coord.longitude
+   609→
+   610→    def test_haversine_distance(self) -> None:
+   611→        """Great-circle distance should match known NYC↔LA distance."""
+   612→        from presidium.core.messaging.location import GeoCoordinate
+   613→        nyc = GeoCoordinate(latitude=40.7128, longitude=-74.0060)
+   614→        la = GeoCoordinate(latitude=34.0522, longitude=-118.2437)
+   615→        dist = nyc.distance_to(la)
+   616→        # Known distance: ~3940 km
+   617→        assert 3900 < dist < 4000
+   618→
+   619→    def test_location_expiry(self) -> None:
+   620→        """Live location should expire after the configured duration."""
+   621→        from presidium.core.messaging.location import (
+   622→            LocationMessage, LocationType, GeoCoordinate, LocationPrecision,
+   623→        )
+   624→        msg = LocationMessage(
+   625→            location_type=LocationType.LIVE_START,
+   626→            coordinate=GeoCoordinate(latitude=40.7, longitude=-74.0),
+   627→            precision=LocationPrecision.BUILDING,
+   628→            timestamp=time.time() - 3601,  # 1 hour + 1 second ago
+   629→            duration_minutes=60,
+   630→        )
+   631→        assert msg.is_expired() is True
+   632→
+   633→    def test_static_location_never_expires(self) -> None:
+   634→        """Static location should never report as expired."""
+   635→        from presidium.core.messaging.location import (
+   636→            LocationMessage, LocationType, GeoCoordinate, LocationPrecision,
+   637→        )
+   638→        msg = LocationMessage(
+   639→            location_type=LocationType.STATIC,
+   640→            coordinate=GeoCoordinate(latitude=40.7, longitude=-74.0),
+   641→            precision=LocationPrecision.EXACT,
+   642→            timestamp=time.time() - 999999,
+   643→        )
+   644→        assert msg.is_expired() is False
+   645→
+   646→
+   647→# ==========================================================================
+   648→# P1: Polls tests
+   649→# ==========================================================================
+   650→
+   651→class TestPolls:
+   652→    """Test poll create / vote / close lifecycle."""
+   653→
+   654→    def test_poll_definition_encode_decode(self) -> None:
+   655→        """PollDefinition should round-trip through encode/decode."""
+   656→        from presidium.core.messaging.polls import PollDefinition, PollSettings
+   657→        poll = PollDefinition(
+   658→            poll_id=os.urandom(16),
+   659→            question="Where should we have lunch?",
+   660→            options=["Pizza Place", "Sushi Bar", "Taco Truck"],
+   661→            settings=PollSettings(anonymous=False, multi_choice=False, auto_close_timestamp=0),
+   662→            creator_user_id="alice",
+   663→        )
+   664→        encoded = poll.encode()
+   665→        decoded = PollDefinition.decode(encoded)
+   666→        assert decoded.question == poll.question
+   667→        assert decoded.options == poll.options
+   668→        assert decoded.poll_id == poll.poll_id
+   669→
+   670→    def test_poll_vote_encode_decode(self) -> None:
+   671→        """PollVote should round-trip through encode/decode."""
+   672→        from presidium.core.messaging.polls import PollVote
+   673→        vote = PollVote(
+   674→            poll_id=os.urandom(16),
+   675→            option_index=2,
+   676→            commitment_hash=hashlib.sha256(b"my_vote_commitment").digest(),
+   677→            timestamp=int(time.time()),
+   678→            voter_ed25519_pk=os.urandom(32),
+   679→            signature=os.urandom(64),
+   680→        )
+   681→        encoded = vote.encode()
+   682→        decoded = PollVote.decode(encoded)
+   683→        assert decoded.poll_id == vote.poll_id
+   684→        assert decoded.option_index == vote.option_index
+   685→        assert decoded.commitment_hash == vote.commitment_hash
+   686→
+   687→    def test_poll_tally(self) -> None:
+   688→        """PollTally should count votes correctly."""
+   689→        from presidium.core.messaging.polls import PollTally
+   690→        tally = PollTally(poll_id=os.urandom(16), option_counts={0: 5, 1: 3, 2: 7})
+   691→        assert tally.total_votes == 15
+   692→        assert tally.winning_option == 2
+   693→
+   694→    def test_poll_tally_tie(self) -> None:
+   695→        """PollTally with a tie should return None for winning_option."""
+   696→        from presidium.core.messaging.polls import PollTally
+   697→        tally = PollTally(poll_id=os.urandom(16), option_counts={0: 5, 1: 5})
+   698→        assert tally.winning_option is None
+   699→
+   700→
+   701→# ==========================================================================
+   702→# P1: i18n tests
+   703→# ==========================================================================
+   704→
+   705→class TestI18n:
+   706→    """Test internationalization and translation."""
+   707→
+   708→    def test_default_locale_english(self) -> None:
+   709→        """Default locale should be English."""
+   710→        from presidium.i18n import I18nManager
+   711→        mgr = I18nManager()
+   712→        assert mgr.get_current_locale() == "en"
+   713→
+   714→    def test_translate_falls_back_to_key(self) -> None:
+   715→        """Unknown translation keys should fall back to the key itself."""
+   716→        from presidium.i18n import I18nManager
+   717→        mgr = I18nManager()
+   718→        result = mgr.translate("Nonexistent Key XYZ")
+   719→        assert result == "Nonexistent Key XYZ"
+   720→
+   721→    def test_translate_with_interpolation(self) -> None:
+   722→        """Translation should support {variable} interpolation."""
+   723→        from presidium.i18n import I18nManager
+   724→        mgr = I18nManager()
+   725→        result = mgr.translate("You have {count} messages", count=5)
+   726→        assert "5" in result
+   727→
+   728→    def test_plural_rules_english(self) -> None:
+   729→        """English plural rules: one vs other."""
+   730→        from presidium.i18n import PluralRules
+   731→        assert PluralRules.get_plural_form("en", 1) == "one"
+   732→        assert PluralRules.get_plural_form("en", 0) == "other"
+   733→        assert PluralRules.get_plural_form("en", 5) == "other"
+   734→
+   735→    def test_plural_rules_russian(self) -> None:
+   736→        """Russian plural rules: one, few, many, other."""
+   737→        from presidium.i18n import PluralRules
+   738→        assert PluralRules.get_plural_form("ru", 1) == "one"
+   739→        assert PluralRules.get_plural_form("ru", 2) == "few"
+   740→        assert PluralRules.get_plural_form("ru", 5) == "many"
+   741→        assert PluralRules.get_plural_form("ru", 11) == "many"
+   742→        assert PluralRules.get_plural_form("ru", 21) == "one"
+   743→
+   744→    def test_plural_rules_arabic(self) -> None:
+   745→        """Arabic plural rules: zero, one, two, few, many, other."""
+   746→        from presidium.i18n import PluralRules
+   747→        assert PluralRules.get_plural_form("ar", 0) == "zero"
+   748→        assert PluralRules.get_plural_form("ar", 1) == "one"
+   749→        assert PluralRules.get_plural_form("ar", 2) == "two"
+   750→        assert PluralRules.get_plural_form("ar", 5) == "few"
+   751→        assert PluralRules.get_plural_form("ar", 50) == "many"
+   752→
+   753→    def test_locale_dataclass(self) -> None:
+   754→        """Locale dataclass should store translations and detect RTL."""
+   755→        from presidium.i18n import Locale
+   756→        en = Locale(code="en", name="English", translations={"Hello": "Hello"})
+   757→        assert en.is_rtl is False
+   758→        assert en.text_direction.value == "ltr"
+   759→
+   760→        ar = Locale(code="ar", name="العربية", translations={"Hello": "مرحبا"})
+   761→        assert ar.is_rtl is True
+   762→
+   763→
+   764→# ==========================================================================
+   765→# P2: Accessibility tests
+   766→# ==========================================================================
+   767→
+   768→class TestA11y:
+   769→    """Test accessibility profile and screen reader text generation."""
+   770→
+   771→    def test_chat_bubble_description_own(self) -> None:
+   772→        """Screen reader description for own message bubble."""
+   773→        from presidium.a11y.manager import ScreenReaderText
+   774→        desc = ScreenReaderText.chat_bubble_description(
+   775→            sender_name="Alice",
+   776→            message_text="Hello, world!",
+   777→            timestamp="14:32",
+   778→            is_own=True,
+   779→            is_read=True,
+   780→        )
+   781→        assert "You" in desc
+   782→        assert "Hello, world!" in desc
+   783→        assert "14:32" in desc
+   784→        assert "read" in desc
+   785→
+   786→    def test_chat_bubble_description_peer(self) -> None:
+   787→        """Screen reader description for peer's message bubble."""
+   788→        from presidium.a11y.manager import ScreenReaderText
+   789→        desc = ScreenReaderText.chat_bubble_description(
+   790→            sender_name="Bob",
+   791→            message_text="Hey there!",
+   792→            timestamp="14:33",
+   793→            is_own=False,
+   794→        )
+   795→        assert "Bob" in desc
+   796→        assert "Hey there!" in desc
+   797→        assert "read" not in desc  # No read status for peer messages
+   798→
+   799→    def test_chat_bubble_description_with_reply(self) -> None:
+   800→        """Screen reader description with reply indicator."""
+   801→        from presidium.a11y.manager import ScreenReaderText
+   802→        desc = ScreenReaderText.chat_bubble_description(
+   803→            sender_name="Carol",
+   804→            message_text="I agree!",
+   805→            timestamp="14:35",
+   806→            reply_to="Alice",
+   807→        )
+   808→        assert "reply to Alice" in desc
+   809→
+   810→    def test_contact_description(self) -> None:
+   811→        """Screen reader description for a contact item."""
+   812→        from presidium.a11y.manager import ScreenReaderText
+   813→        desc = ScreenReaderText.contact_description(
+   814→            name="Dave",
+   815→            user_id="abc123",
+   816→            is_online=True,
+   817→            unread_count=3,
+   818→        )
+   819→        assert "Dave" in desc
+   820→        assert "online" in desc
+   821→        assert "3 unread" in desc
+   822→
+   823→    def test_voice_message_description(self) -> None:
+   824→        """Screen reader description for a voice message."""
+   825→        from presidium.a11y.manager import ScreenReaderText
+   826→        desc = ScreenReaderText.voice_message_description(
+   827→            duration_seconds=125,
+   828→            is_playing=False,
+   829→        )
+   830→        assert "2:05" in desc
+   831→
+   832→    def test_voice_message_description_playing(self) -> None:
+   833→        """Screen reader description for a playing voice message."""
+   834→        from presidium.a11y.manager import ScreenReaderText
+   835→        desc = ScreenReaderText.voice_message_description(
+   836→            duration_seconds=60,
+   837→            is_playing=True,
+   838→            position_seconds=30,
+   839→        )
+   840→        assert "playing" in desc
+   841→        assert "0:30" in desc
+   842→        assert "1:00" in desc
+   843→
+   844→    def test_color_blind_palette_transform(self) -> None:
+   845→        """Color-blind palette should transform colors correctly."""
+   846→        from presidium.a11y.manager import ColorBlindPalette
+   847→        from PySide6.QtGui import QColor
+   848→        original = QColor(255, 0, 0)
+   849→        transformed = ColorBlindPalette.transform_color(original, "protan")
+   850→        assert isinstance(transformed, QColor)
+   851→        # Should be different from original
+   852→        assert (transformed.red(), transformed.green(), transformed.blue()) != (255, 0, 0)
+   853→
+   854→    def test_color_blind_palette_safe_colors(self) -> None:
+   855→        """Safe palette should return a dictionary of QColor objects."""
+   856→        from presidium.a11y.manager import ColorBlindPalette
+   857→        palette = ColorBlindPalette.get_safe_palette("deutan")
+   858→        assert "primary" in palette
+   859→        assert "error" in palette
+   860→        assert len(palette) == 8
+   861→
+   862→
+   863→# ==========================================================================
+   864→# P2: Semantic Search tests
+   865→# ==========================================================================
+   866→
+   867→class TestSearch:
+   868→    """Test semantic search indexing and fallback embedding."""
+   869→
+   870→    def test_fallback_embedding_deterministic(self) -> None:
+   871→        """Fallback embedding should be deterministic for the same text."""
+   872→        from presidium.core.search.semantic import EmbeddingService
+   873→        svc = EmbeddingService()
+   874→        text = "Project deadline is next Friday"
+   875→        emb1 = svc._fallback_embed(text)
+   876→        emb2 = svc._fallback_embed(text)
+   877→        assert emb1 == emb2
+   878→
+   879→    def test_fallback_embedding_dimension(self) -> None:
+   880→        """Fallback embedding should have the correct dimension."""
+   881→        from presidium.core.search.semantic import EmbeddingService, EMBEDDING_DIMENSION
+   882→        svc = EmbeddingService()
+   883→        emb = svc._fallback_embed("Test embedding")
+   884→        assert len(emb) == EMBEDDING_DIMENSION
+   885→
+   886→    def test_fallback_embedding_different_texts(self) -> None:
+   887→        """Different texts should produce different embeddings."""
+   888→        from presidium.core.search.semantic import EmbeddingService
+   889→        svc = EmbeddingService()
+   890→        emb1 = svc._fallback_embed("Hello world")
+   891→        emb2 = svc._fallback_embed("Goodbye world")
+   892→        assert emb1 != emb2
+   893→
+   894→    def test_fallback_embedding_empty_text(self) -> None:
+   895→        """Empty text should produce a zero vector."""
+   896→        from presidium.core.search.semantic import EmbeddingService, EMBEDDING_DIMENSION
+   897→        svc = EmbeddingService()
+   898→        emb = svc.embed_text("")
+   899→        assert all(v == 0.0 for v in emb)
+   900→        assert len(emb) == EMBEDDING_DIMENSION
+   901→
+   902→    def test_indexed_message_hash(self) -> None:
+   903→        """IndexedMessage hash should be deterministic."""
+   904→        from presidium.core.search.semantic import IndexedMessage
+   905→        h1 = IndexedMessage.compute_hash("Same content")
+   906→        h2 = IndexedMessage.compute_hash("Same content")
+   907→        assert h1 == h2
+   908→
+   909→    def test_indexed_message_hash_changes(self) -> None:
+   910→        """Different content should produce different hashes."""
+   911→        from presidium.core.search.semantic import IndexedMessage
+   912→        h1 = IndexedMessage.compute_hash("Content A")
+   913→        h2 = IndexedMessage.compute_hash("Content B")
+   914→        assert h1 != h2
+   915→
+   916→    def test_search_query_post_init(self) -> None:
+   917→        """SearchQuery should auto-populate normalized and keywords."""
+   918→        from presidium.core.search.semantic import SearchQuery
+   919→        q = SearchQuery(original="Hello World")
+   920→        assert q.normalized == "hello world"
+   921→        assert q.keywords == ["hello", "world"]
+   922→
+   923→    def test_vector_store_add_and_size(self) -> None:
+   924→        """VectorStore should track added items."""
+   925→        from presidium.core.search.semantic import VectorStore, IndexedMessage, EmbeddingService
+   926→        store = VectorStore()
+   927→        store.initialize()
+   928→        svc = EmbeddingService()
+   929→
+   930→        msg = IndexedMessage(
+   931→            message_id="msg1",
+   932→            peer_user_id="peer1",
+   933→            content="Test message for indexing",
+   934→            timestamp=time.time(),
+   935→        )
+   936→        embedding = svc._fallback_embed(msg.content)
+   937→        store.add(msg, embedding)
+   938→        assert store.size == 1
+   939→
+   940→
+   941→# ==========================================================================
+   942→# P2: Import tests
+   943→# ==========================================================================
+   944→
+   945→class TestImport:
+   946→    """Test import validation and data sanitization."""
+   947→
+   948→    def test_validation_pipeline_sanitize_html(self) -> None:
+   949→        """ValidationPipeline should strip HTML tags from content."""
+   950→        import importlib
+   951→        mod = importlib.import_module("presidium.import")
+   952→        pipeline = mod.ValidationPipeline()
+   953→        result = pipeline.sanitize_text("<script>alert('xss')</script>Hello")
+   954→        assert "<script>" not in result
+   955→        assert "alert" not in result or "xss" not in result
+   956→
+   957→    def test_validation_pipeline_truncate_long_text(self) -> None:
+   958→        """ValidationPipeline should truncate excessively long messages."""
+   959→        import importlib
+   960→        mod = importlib.import_module("presidium.import")
+   961→        pipeline = mod.ValidationPipeline()
+   962→        long_text = "A" * 100000
+   963→        result = pipeline.sanitize_text(long_text)
+   964→        assert len(result) < len(long_text)
+   965→
+   966→    def test_import_result_dataclass(self) -> None:
+   967→        """ImportResult should summarize the import outcome."""
+   968→        import importlib
+   969→        mod = importlib.import_module("presidium.import")
+   970→        result = mod.ImportResult(
+   971→            total=100,
+   972→            imported=95,
+   973→            skipped=3,
+   974→            errors=2,
+   975→            source="signal",
+   976→        )
+   977→        assert result.total == 100
+   978→        assert result.imported == 95
+   979→        assert result.success_rate == 95.0
+   980→
+   981→    def test_import_result_zero_total(self) -> None:
+   982→        """ImportResult with zero total should not divide by zero."""
+   983→        import importlib
+   984→        mod = importlib.import_module("presidium.import")
+   985→        result = mod.ImportResult(total=0, imported=0, skipped=0, errors=0, source="signal")
+   986→        assert result.success_rate == 0.0
+   987→
+   988→
+   989→# ==========================================================================
+   990→# P3: SDK tests
+   991→# ==========================================================================
+   992→
+   993→class TestSDK:
+   994→    """Test SDK initialization and message send."""
+   995→
+   996→    def test_sdk_config_defaults(self) -> None:
+   997→        """SDKConfig should have sensible defaults."""
+   998→        from presidium.sdk import SDKConfig
+   999→        config = SDKConfig()
+  1000→        assert config.data_dir is not None
+  1001→        assert config.enable_voice is True
+  1002→        assert config.enable_location is True
+  1003→
+  1004→    def test_sdk_error_hierarchy(self) -> None:
+  1005→        """SDK errors should form a proper hierarchy."""
+  1006→        from presidium.sdk import SDKError, SDKNotInitializedError, SDKConnectionError
+  1007→        assert issubclass(SDKNotInitializedError, SDKError)
+  1008→        assert issubclass(SDKConnectionError, SDKError)
+  1009→
+  1010→    def test_sdk_event_types(self) -> None:
+  1011→        """SDKEvent should cover all event categories."""
+  1012→        from presidium.sdk import SDKEvent, SDKEventType
+  1013→        event = SDKEvent(
+  1014→            event_type=SDKEventType.MESSAGE_RECEIVED,
+  1015→            data={"from": "alice", "content": "Hello"},
+  1016→        )
+  1017→        assert event.event_type == SDKEventType.MESSAGE_RECEIVED
+  1018→        assert event.data["from"] == "alice"
+  1019→
+  1020→    def test_sdk_not_initialized_error(self) -> None:
+  1021→        """Using the SDK before init should raise SDKNotInitializedError."""
+  1022→        from presidium.sdk import PresidiumSDK, SDKNotInitializedError
+  1023→        sdk = PresidiumSDK()
+  1024→        with pytest.raises(SDKNotInitializedError):
+  1025→            sdk.send_message("bob", "Hello")
+  1026→
+  1027→
+  1028→# ==========================================================================
+  1029→# P4: Virtual List widget model tests
+  1030→# ==========================================================================
+  1031→
+  1032→class TestVirtualList:
+  1033→    """Test virtual list model computation."""
+  1034→
+  1035→    def test_model_set_data(self) -> None:
+  1036→        """VirtualListModel should store data and compute geometry."""
+  1037→        from presidium.ui.components.virtual_list import VirtualListModel
+  1038→        model = VirtualListModel()
+  1039→        model.set_data(["a", "b", "c", "d", "e"])
+  1040→        assert model.item_count == 5
+  1041→        assert model.total_height == 5 * 64  # DEFAULT_ITEM_HEIGHT
+  1042→
+  1043→    def test_model_visible_range(self) -> None:
+  1044→        """Visible range should include the buffer zone."""
+  1045→        from presidium.ui.components.virtual_list import VirtualListModel, VISIBLE_BUFFER
+  1046→        model = VirtualListModel()
+  1047→        model.set_data(list(range(100)))
+  1048→        start, end = model.visible_range(0, 200)  # First ~3 items visible
+  1049→        assert start == 0
+  1050→        assert end >= 3 + VISIBLE_BUFFER
+  1051→
+  1052→    def test_model_index_for_y(self) -> None:
+  1053→        """index_for_y should return the correct row for a pixel offset."""
+  1054→        from presidium.ui.components.virtual_list import VirtualListModel
+  1055→        model = VirtualListModel()
+  1056→        model.set_data(list(range(20)))
+  1057→        # At y=0, index should be 0
+  1058→        assert model.index_for_y(0) == 0
+  1059→        # At y=64, index should be 1
+  1060→        assert model.index_for_y(64) == 1
+  1061→        # At y=128, index should be 2
+  1062→        assert model.index_for_y(128) == 2
+  1063→
+  1064→    def test_model_variable_height(self) -> None:
+  1065→        """Model should handle variable-height items correctly."""
+  1066→        from presidium.ui.components.virtual_list import VirtualListModel
+  1067→        model = VirtualListModel()
+  1068→        model.set_data(["short", "tall", "medium"])
+  1069→        model.set_actual_height(0, 40)
+  1070→        model.set_actual_height(1, 120)
+  1071→        model.set_actual_height(2, 80)
+  1072→        assert model.total_height == 40 + 120 + 80
+  1073→        assert model.y_for_index(0) == 0
+  1074→        assert model.y_for_index(1) == 40
+  1075→        assert model.y_for_index(2) == 160
+  1076→
+  1077→    def test_model_append_data(self) -> None:
+  1078→        """Appending data should update the item count."""
+  1079→        from presidium.ui.components.virtual_list import VirtualListModel
+  1080→        model = VirtualListModel()
+  1081→        model.set_data(["a", "b"])
+  1082→        model.append_data("c", estimated_height=80)
+  1083→        assert model.item_count == 3
+  1084→        assert model.get_height(2) == 80
+  1085→
+  1086→    def test_model_remove_data(self) -> None:
+  1087→        """Removing data should update the item count and heights."""
+  1088→        from presidium.ui.components.virtual_list import VirtualListModel
+  1089→        model = VirtualListModel()
+  1090→        model.set_data(["a", "b", "c"])
+  1091→        removed = model.remove_data(1)
+  1092→        assert removed == "b"
+  1093→        assert model.item_count == 2
+  1094→
+  1095→    def test_model_invalid_index_raises(self) -> None:
+  1096→        """Accessing an invalid index should raise InvalidIndexError."""
+  1097→        from presidium.ui.components.virtual_list import VirtualListModel, InvalidIndexError
+  1098→        model = VirtualListModel()
+  1099→        model.set_data(["a"])
+  1100→        with pytest.raises(InvalidIndexError):
+  1101→            model.get_data(5)
+  1102→        with pytest.raises(InvalidIndexError):
+  1103→            model.remove_data(-1)
+  1104→
+  1105→    def test_model_clear(self) -> None:
+  1106→        """Clearing the model should reset all state."""
+  1107→        from presidium.ui.components.virtual_list import VirtualListModel
+  1108→        model = VirtualListModel()
+  1109→        model.set_data(["a", "b", "c"])
+  1110→        model.clear()
+  1111→        assert model.item_count == 0
+  1112→        assert model.total_height == 0
+  1113→
+  1114→
+  1115→# ==========================================================================
+  1116→# P4: Welcome v2 wizard tests
+  1117→# ==========================================================================
+  1118→
+  1119→class TestWelcomeV2:
+  1120→    """Test onboarding wizard logic."""
+  1121→
+  1122→    def test_wizard_step_enum(self) -> None:
+  1123→        """WizardStep should have exactly 5 steps."""
+  1124→        from presidium.ui.screens.welcome_v2 import WizardStep
+  1125→        assert len(WizardStep) == 5
+  1126→        assert WizardStep.WELCOME == 0
+  1127→        assert WizardStep.READY == 4
+  1128→
+  1129→    def test_recovery_phrase_generation(self) -> None:
+  1130→        """Recovery phrase should have 12 words from the word list."""
+  1131→        from presidium.ui.screens.welcome_v2 import generate_recovery_phrase
+  1132→        phrase = generate_recovery_phrase()
+  1133→        assert len(phrase) == 12
+  1134→        assert all(isinstance(w, str) for w in phrase)
+  1135→        assert all(len(w) > 0 for w in phrase)
+  1136→
+  1137→    def test_recovery_phrase_custom_count(self) -> None:
+  1138→        """Recovery phrase should support custom word counts."""
+  1139→        from presidium.ui.screens.welcome_v2 import generate_recovery_phrase
+  1140→        phrase = generate_recovery_phrase(word_count=24)
+  1141→        assert len(phrase) == 24
+  1142→
+  1143→    def test_recovery_phrase_randomness(self) -> None:
+  1144→        """Two recovery phrases should (almost certainly) differ."""
+  1145→        from presidium.ui.screens.welcome_v2 import generate_recovery_phrase
+  1146→        p1 = generate_recovery_phrase()
+  1147→        p2 = generate_recovery_phrase()
+  1148→        assert p1 != p2
+  1149→
+  1150→    def test_password_validation_too_short(self) -> None:
+  1151→        """Short passwords should raise WeakPasswordError."""
+  1152→        from presidium.ui.screens.welcome_v2 import WelcomeWizard, WeakPasswordError
+  1153→        wizard = WelcomeWizard()
+  1154→        wizard._password_input = MagicMock()
+  1155→        wizard._confirm_input = MagicMock()
+  1156→        wizard._password_input.text = MagicMock(return_value="short")
+  1157→        wizard._confirm_input.text = MagicMock(return_value="short")
+  1158→        with pytest.raises(WeakPasswordError):
+  1159→            wizard._validate_password()
+  1160→
+  1161→    def test_password_validation_mismatch(self) -> None:
+  1162→        """Mismatched passwords should raise PasswordMismatchError."""
+  1163→        from presidium.ui.screens.welcome_v2 import WelcomeWizard, PasswordMismatchError
+  1164→        wizard = WelcomeWizard()
+  1165→        wizard._password_input = MagicMock()
+  1166→        wizard._confirm_input = MagicMock()
+  1167→        wizard._password_input.text = MagicMock(return_value="LongPassword1")
+  1168→        wizard._confirm_input.text = MagicMock(return_value="LongPassword2")
+  1169→        with pytest.raises(PasswordMismatchError):
+  1170→            wizard._validate_password()
+  1171→
+  1172→    def test_password_validation_weak_all_same(self) -> None:
+  1173→        """All-same-character passwords should raise WeakPasswordError."""
+  1174→        from presidium.ui.screens.welcome_v2 import WelcomeWizard, WeakPasswordError
+  1175→        wizard = WelcomeWizard()
+  1176→        wizard._password_input = MagicMock()
+  1177→        wizard._confirm_input = MagicMock()
+  1178→        wizard._password_input.text = MagicMock(return_value="aaaaaaaa")
+  1179→        wizard._confirm_input.text = MagicMock(return_value="aaaaaaaa")
+  1180→        with pytest.raises(WeakPasswordError):
+  1181→            wizard._validate_password()
+  1182→
+  1183→    def test_password_validation_success(self) -> None:
+  1184→        """Valid passwords should pass validation."""
+  1185→        from presidium.ui.screens.welcome_v2 import WelcomeWizard
+  1186→        wizard = WelcomeWizard()
+  1187→        wizard._password_input = MagicMock()
+  1188→        wizard._confirm_input = MagicMock()
+  1189→        wizard._password_input.text = MagicMock(return_value="SecurePass1")
+  1190→        wizard._confirm_input.text = MagicMock(return_value="SecurePass1")
+  1191→        result = wizard._validate_password()
+  1192→        assert result == "SecurePass1"
+  1193→
+  1194→
+  1195→if __name__ == "__main__":
+  1196→    pytest.main([__file__, "-v", "--tb=short"])
+  1197→
