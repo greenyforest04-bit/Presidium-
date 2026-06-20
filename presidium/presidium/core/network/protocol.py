@@ -41,7 +41,7 @@ MAX_PAYLOAD_SIZE = 65536  # 64 KiB per datagram
 # Message types enum
 # ---------------------------------------------------------------------------
 
-class MessageType(enum.Uint8):
+class MessageType(enum.IntEnum):
     """Wire-level message type identifiers."""
     # Handshake
     HELLO = 1
@@ -236,7 +236,7 @@ class DHTFindValueRespPayload(msgspec.Struct):
     closest_nodes: list[DHTNodeInfo] = field(default_factory=list)
 
 
-class FileOfferPayload(msgspec.Struct):
+class FileOfferPayload(msgspec.Struct, kw_only=True):
     """Offer a file for transfer."""
     session_id: bytes
     file_name: str

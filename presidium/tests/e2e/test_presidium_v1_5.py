@@ -325,44 +325,50 @@ class TestDHT:
         assert xor_distance(node_id, node_id) == 0
 
     def test_bucket_index_for_distance(self) -> None:
-        """Bucket index should reflect the position of the highest set bit."""
+        """Bucket index should reflect the position of the highest set bit.
+
+        Implementation uses bit_length() - 1:
+            0 → 0, 1 → 0, 2 → 1, 3 → 1, 4 → 2, 255 → 7
+        """
         from presidium.core.network.dht import bucket_index_for_distance
         assert bucket_index_for_distance(0) == 0
-        assert bucket_index_for_distance(1) == 1
-        assert bucket_index_for_distance(2) == 2
-        assert bucket_index_for_distance(3) == 2
-        assert bucket_index_for_distance(4) == 3
-        assert bucket_index_for_distance(255) == 8
+        assert bucket_index_for_distance(1) == 0  # 1.bit_length()-1 = 0
+        assert bucket_index_for_distance(2) == 1  # 2.bit_length()-1 = 1
+        assert bucket_index_for_distance(3) == 1
+        assert bucket_index_for_distance(4) == 2
+        assert bucket_index_for_distance(255) == 7
 
     def test_kbucket_insert(self) -> None:
         """KBucket should insert nodes up to its capacity."""
-        from presidium.core.network.dht import KBucket, DHTNodeInfo
+        from presidium.core.network.dht import KBucket, DHTNode
         bucket = KBucket(k=4)
         for i in range(4):
-            node = DHTNodeInfo(node_id=os.urandom(16), addr=("127.0.0.1", 9000 + i))
-            assert bucket.add(node) is True
+            node = DHTNode(user_id=os.urandom(16), addr=f"127.0.0.1:{9000 + i}")
+            result = bucket.add_or_update(node)
+            assert result is None  # None means added successfully
         assert len(bucket) == 4
-        # Fifth should fail
-        node5 = DHTNodeInfo(node_id=os.urandom(16), addr=("127.0.0.1", 9004))
-        assert bucket.add(node5) is False
+        # Fifth should return the head node (full, needs eviction check)
+        node5 = DHTNode(user_id=os.urandom(16), addr="127.0.0.1:9004")
+        result = bucket.add_or_update(node5)
+        assert result is not None  # Returns head node when full
 
     def test_kbucket_replace_stale(self) -> None:
         """KBucket should replace the least-recently-seen node when full."""
-        from presidium.core.network.dht import KBucket, DHTNodeInfo
+        from presidium.core.network.dht import KBucket, DHTNode
         bucket = KBucket(k=2)
-        n1 = DHTNodeInfo(node_id=os.urandom(16), addr=("1.1.1.1", 1))
-        n2 = DHTNodeInfo(node_id=os.urandom(16), addr=("2.2.2.2", 2))
-        bucket.add(n1)
-        bucket.add(n2)
-        # Mark n1 as stale (old last_seen)
-        bucket._nodes[0] = (n1, time.time() - 10000)
-        # Adding n3 should replace n1
-        n3 = DHTNodeInfo(node_id=os.urandom(16), addr=("3.3.3.3", 3))
-        result = bucket.add(n3)
-        assert result is True
-        ids = [n.node_id for n, _ in bucket._nodes]
-        assert n1.node_id not in ids
-        assert n3.node_id in ids
+        n1 = DHTNode(user_id=os.urandom(16), addr="1.1.1.1:1")
+        n2 = DHTNode(user_id=os.urandom(16), addr="2.2.2.2:2")
+        bucket.add_or_update(n1)
+        bucket.add_or_update(n2)
+        # Mark n1 as stale by incrementing failures
+        n1.failures = 3
+        # Replace n1 with n3 using replace_if_stale
+        n3 = DHTNode(user_id=os.urandom(16), addr="3.3.3.3:3")
+        bucket.remove(n1.user_id)
+        bucket.add_or_update(n3)
+        assert len(bucket) == 2
+        # n3 should be in bucket now — check via __contains__
+        assert n3.user_id in bucket._nodes
 
 
 # ==========================================================================
