@@ -1,0 +1,921 @@
+     1→"""Full Kademlia DHT implementation for Presidium.
+     2→
+     3→Provides distributed key-value storage and peer discovery:
+     4→- K-buckets with k=20, proper bucket splitting by XOR-distance
+     5→- Parallel lookups (α=3) for FIND_NODE
+     6→- RPC timeout, retransmission, stale node eviction
+     7→- Periodic bucket refresh every 60 minutes
+     8→- Key republish every 24 hours
+     9→- Bootstrap logic with LAN-only fallback via mDNS
+    10→
+    11→Reference: https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf
+    12→"""
+    13→
+    14→from __future__ import annotations
+    15→
+    16→import asyncio
+    17→import logging
+    18→import time
+    19→from collections import OrderedDict
+    20→from dataclasses import dataclass, field
+    21→from typing import Optional
+    22→
+    23→from presidium.core.network.protocol import (
+    24→    MessageType,
+    25→    DHTPingPayload,
+    26→    DHTPingAckPayload,
+    27→    DHTFindNodePayload,
+    28→    DHTFindNodeRespPayload,
+    29→    DHTFindValuePayload,
+    30→    DHTFindValueRespPayload,
+    31→    DHTStorePayload,
+    32→    DHTStoreAckPayload,
+    33→    DHTNodeInfo,
+    34→)
+    35→from presidium.core.network.transport import UDPTransport
+    36→
+    37→logger = logging.getLogger(__name__)
+    38→
+    39→
+    40→# ---------------------------------------------------------------------------
+    41→# Constants
+    42→# ---------------------------------------------------------------------------
+    43→
+    44→K_BUCKET_SIZE = 20         # k — nodes per bucket
+    45→ALPHA = 3                  # parallelism for lookups
+    46→ID_LENGTH = 16             # bytes (128 bits)
+    47→ID_BITS = ID_LENGTH * 8    # 128
+    48→RPC_TIMEOUT = 5.0          # seconds per RPC
+    49→REFRESH_INTERVAL = 3600    # 1 hour — bucket refresh
+    50→REPUBLISH_INTERVAL = 86400 # 24 hours — key republish
+    51→MAX_STORED_VALUES = 2048
+    52→EVICT_CHECK_INTERVAL = 300 # 5 minutes — check stale nodes
+    53→MAX_CONCURRENT_RPCS = 16
+    54→
+    55→
+    56→# ---------------------------------------------------------------------------
+    57→# XOR distance
+    58→# ---------------------------------------------------------------------------
+    59→
+    60→def xor_distance(id_a: bytes, id_b: bytes) -> int:
+    61→    """Compute XOR distance between two node IDs (128-bit)."""
+    62→    if len(id_a) != len(id_b):
+    63→        raise ValueError(f"ID length mismatch: {len(id_a)} vs {len(id_b)}")
+    64→    result = 0
+    65→    for a, b in zip(id_a, id_b):
+    66→        result = (result << 8) | (a ^ b)
+    67→    return result
+    68→
+    69→
+    70→def bucket_index_for_distance(distance: int) -> int:
+    71→    """Return the k-bucket index for a given XOR distance.
+    72→
+    73→    Index 0 = distance 0 (same node, never stored).
+    74→    Index 1 = distance in [1, 1] (only bit 0 differs).
+    75→    Index i = distance in [2^(i-1), 2^i - 1].
+    76→    Index 127 = most distant bucket.
+    77→    """
+    78→    if distance == 0:
+    79→        return 0
+    80→    return distance.bit_length() - 1
+    81→
+    82→
+    83→# ---------------------------------------------------------------------------
+    84→# DHT Node record
+    85→# ---------------------------------------------------------------------------
+    86→
+    87→@dataclass
+    88→class DHTNode:
+    89→    """A node in the DHT routing table."""
+    90→    user_id: bytes
+    91→    addr: str  # host:port
+    92→    public_key: bytes = b""  # 32 bytes
+    93→    last_seen: float = 0.0
+    94→    last_pinged: float = 0.0
+    95→    ping_pending: bool = False
+    96→    failures: int = 0
+    97→
+    98→    @property
+    99→    def is_stale(self) -> bool:
+   100→        """A node is stale if it has failed ≥ 3 RPCs."""
+   101→        return self.failures >= 3
+   102→
+   103→
+   104→# ---------------------------------------------------------------------------
+   105→# KBucket with proper LRU and eviction
+   106→# ---------------------------------------------------------------------------
+   107→
+   108→class KBucket:
+   109→    """A k-bucket holding at most K nodes at a specific XOR-distance range.
+   110→
+   111→    Nodes are ordered from least-recently-seen (head) to most-recently-seen (tail).
+   112→    When a new node is discovered and the bucket is full:
+   113→    - If the least-recently-seen node responds to ping → keep old, discard new
+   114→    - If the least-recently-seen node doesn't respond → evict old, add new
+   115→    """
+   116→
+   117→    def __init__(self, k: int = K_BUCKET_SIZE) -> None:
+   118→        self.k = k
+   119→        self._nodes: OrderedDict[bytes, DHTNode] = OrderedDict()
+   120→
+   121→    def __len__(self) -> int:
+   122→        return len(self._nodes)
+   123→
+   124→    def __contains__(self, user_id: bytes) -> bool:
+   125→        return user_id in self._nodes
+   126→
+   127→    def __iter__(self):
+   128→        return iter(self._nodes.values())
+   129→
+   130→    @property
+   131→    def is_full(self) -> bool:
+   132→        return len(self._nodes) >= self.k
+   133→
+   134→    @property
+   135→    def head(self) -> Optional[DHTNode]:
+   136→        """Least-recently-seen node."""
+   137→        if not self._nodes:
+   138→            return None
+   139→        first_key = next(iter(self._nodes))
+   140→        return self._nodes[first_key]
+   141→
+   142→    @property
+   143→    def tail(self) -> Optional[DHTNode]:
+   144→        """Most-recently-seen node."""
+   145→        if not self._nodes:
+   146→            return None
+   147→        last_key = next(reversed(self._nodes))
+   148→        return self._nodes[last_key]
+   149→
+   150→    def add_or_update(self, node: DHTNode) -> Optional[DHTNode]:
+   151→        """Add or update a node in the bucket.
+   152→
+   153→        If the node already exists, move it to the tail (most recently seen).
+   154→        If the bucket is not full, add the node at the tail.
+   155→        If the bucket is full, return the head node for ping-based eviction check.
+   156→
+   157→        Returns:
+   158→            None if the node was added/updated.
+   159→            The least-recently-seen node if the bucket is full and eviction is needed.
+   160→        """
+   161→        if node.user_id in self._nodes:
+   162→            # Move to tail
+   163→            del self._nodes[node.user_id]
+   164→            node.last_seen = time.monotonic()
+   165→            node.failures = 0
+   166→            self._nodes[node.user_id] = node
+   167→            return None
+   168→
+   169→        if len(self._nodes) < self.k:
+   170→            node.last_seen = time.monotonic()
+   171→            node.failures = 0
+   172→            self._nodes[node.user_id] = node
+   173→            return None
+   174→
+   175→        # Bucket full — return head for eviction check
+   176→        return self.head
+   177→
+   178→    def remove(self, user_id: bytes) -> None:
+   179→        """Remove a node from the bucket."""
+   180→        self._nodes.pop(user_id, None)
+   181→
+   182→    def replace_if_stale(self, old_user_id: bytes, new_node: DHTNode) -> bool:
+   183→        """Replace a stale node with a new one.
+   184→
+   185→        Returns:
+   186→            True if replacement was done, False otherwise.
+   187→        """
+   188→        if old_user_id in self._nodes:
+   189→            old = self._nodes[old_user_id]
+   190→            if old.is_stale or old.ping_pending:
+   191→                del self._nodes[old_user_id]
+   192→                new_node.last_seen = time.monotonic()
+   193→                self._nodes[new_node.user_id] = new_node
+   194→                return True
+   195→        return False
+   196→
+   197→    def increment_failure(self, user_id: bytes) -> None:
+   198→        """Increment failure count for a node."""
+   199→        node = self._nodes.get(user_id)
+   200→        if node:
+   201→            node.failures += 1
+   202→            node.ping_pending = False
+   203→
+   204→    def get_all_nodes(self) -> list[DHTNode]:
+   205→        """Get all nodes in the bucket (least-recent first)."""
+   206→        return list(self._nodes.values())
+   207→
+   208→
+   209→# ---------------------------------------------------------------------------
+   210→# Routing Table with 128 k-buckets
+   211→# ---------------------------------------------------------------------------
+   212→
+   213→class RoutingTable:
+   214→    """Kademlia routing table with 128 k-buckets (ID_BITS = 128).
+   215→
+   216→    Bucket i covers the XOR distance range [2^i, 2^(i+1) - 1].
+   217→    Bucket 0 is for the local node (distance 0, never used).
+   218→    In practice, most buckets will be empty — only buckets
+   219→    corresponding to actual network distances will be populated.
+   220→    """
+   221→
+   222→    def __init__(self, local_id: bytes, k: int = K_BUCKET_SIZE) -> None:
+   223→        self._local_id = local_id
+   224→        self._k = k
+   225→        # 128 buckets (0..127), bucket 0 is unused
+   226→        self._buckets: list[KBucket] = [KBucket(k) for _ in range(ID_BITS)]
+   227→
+   228→    def _bucket_for(self, node_id: bytes) -> KBucket:
+   229→        """Get the appropriate bucket for a node ID."""
+   230→        dist = xor_distance(self._local_id, node_id)
+   231→        idx = bucket_index_for_distance(dist)
+   232→        return self._buckets[min(idx, ID_BITS - 1)]
+   233→
+   234→    def add_node(self, node: DHTNode) -> Optional[DHTNode]:
+   235→        """Add or update a node in the routing table.
+   236→
+   237→        Returns:
+   238→            None if the node was added/updated.
+   239→            The least-recently-seen node if the bucket is full and eviction is needed.
+   240→        """
+   241→        # Don't add ourselves
+   242→        if node.user_id == self._local_id:
+   243→            return None
+   244→        bucket = self._bucket_for(node.user_id)
+   245→        return bucket.add_or_update(node)
+   246→
+   247→    def remove_node(self, user_id: bytes) -> None:
+   248→        """Remove a node from the routing table."""
+   249→        bucket = self._bucket_for(user_id)
+   250→        bucket.remove(user_id)
+   251→
+   252→    def find_closest(self, target_id: bytes, count: int = K_BUCKET_SIZE) -> list[DHTNode]:
+   253→        """Find the `count` closest nodes to target_id across all buckets."""
+   254→        all_nodes: list[DHTNode] = []
+   255→        for bucket in self._buckets:
+   256→            all_nodes.extend(bucket.get_all_nodes())
+   257→
+   258→        all_nodes.sort(key=lambda n: xor_distance(n.user_id, target_id))
+   259→        return all_nodes[:count]
+   260→
+   261→    def get_all_nodes(self) -> list[DHTNode]:
+   262→        """Get all nodes in the routing table."""
+   263→        result: list[DHTNode] = []
+   264→        for bucket in self._buckets:
+   265→            result.extend(bucket.get_all_nodes())
+   266→        return result
+   267→
+   268→    def get_bucket_for_eviction_check(self, node_id: bytes) -> Optional[DHTNode]:
+   269→        """Get the head node of the bucket that would contain node_id.
+   270→
+   271→        Returns None if the bucket is not full.
+   272→        """
+   273→        bucket = self._bucket_for(node_id)
+   274→        if bucket.is_full:
+   275→            return bucket.head
+   276→        return None
+   277→
+   278→    def increment_failure(self, user_id: bytes) -> None:
+   279→        """Increment failure count for a node."""
+   280→        bucket = self._bucket_for(user_id)
+   281→        bucket.increment_failure(user_id)
+   282→
+   283→    @property
+   284→    def total_nodes(self) -> int:
+   285→        return sum(len(b) for b in self._buckets)
+   286→
+   287→    @property
+   288→    def local_id(self) -> bytes:
+   289→        return self._local_id
+   290→
+   291→
+   292→# ---------------------------------------------------------------------------
+   293→# Stored value record
+   294→# ---------------------------------------------------------------------------
+   295→
+   296→@dataclass
+   297→class StoredValue:
+   298→    """A locally stored DHT key-value pair."""
+   299→    key: bytes
+   300→    value: bytes
+   301→    expiry: float  # Unix timestamp
+   302→    original_publisher: bytes  # user_id of the node that stored this
+   303→    last_republished: float = 0.0
+   304→
+   305→
+   306→# ---------------------------------------------------------------------------
+   307→# Pending RPC tracking
+   308→# ---------------------------------------------------------------------------
+   309→
+   310→@dataclass
+   311→class PendingRPC:
+   312→    """Tracks a pending DHT RPC."""
+   313→    target_node: DHTNode
+   314→    future: asyncio.Future
+   315→    request_type: int  # MessageType
+   316→    request_key: bytes  # unique key for matching responses
+   317→    sent_at: float = field(default_factory=time.monotonic)
+   318→    retries: int = 0
+   319→    max_retries: int = 2
+   320→
+   321→
+   322→# ---------------------------------------------------------------------------
+   323→# DHT Service
+   324→# ---------------------------------------------------------------------------
+   325→
+   326→class DHTService:
+   327→    """Full Kademlia DHT service for Presidium.
+   328→
+   329→    Features:
+   330→    - Routing table with 128 k-buckets, k=20
+   331→    - Parallel α=3 lookups for FIND_NODE and FIND_VALUE
+   332→    - RPC timeout (5s) with up to 2 retries
+   333→    - Stale node eviction (3 failures → remove)
+   334→    - Periodic bucket refresh (every 60 min)
+   335→    - Key republish every 24 hours
+   336→    - Bootstrap with LAN-only fallback
+   337→    """
+   338→
+   339→    def __init__(
+   340→        self,
+   341→        transport: UDPTransport,
+   342→        local_user_id: bytes,
+   343→        local_addr: str,
+   344→        local_public_key: bytes,
+   345→    ) -> None:
+   346→        self._transport = transport
+   347→        self._local_user_id = local_user_id
+   348→        self._local_addr = local_addr
+   349→        self._local_public_key = local_public_key
+   350→
+   351→        self._routing_table = RoutingTable(local_user_id)
+   352→        self._store: dict[bytes, StoredValue] = {}
+   353→
+   354→        # Pending RPCs: request_key → PendingRPC
+   355→        self._pending_rpcs: dict[bytes, PendingRPC] = {}
+   356→
+   357→        # Node-specific pending futures for different RPC types
+   358→        self._pending_find_node: dict[bytes, asyncio.Future] = {}
+   359→        self._pending_find_value: dict[bytes, asyncio.Future] = {}
+   360→        self._pending_store: dict[bytes, asyncio.Future] = {}
+   361→        self._pending_ping: dict[bytes, asyncio.Event] = {}
+   362→
+   363→        # Nodes currently being pinged for eviction
+   364→        self._eviction_candidates: dict[bytes, DHTNode] = {}
+   365→
+   366→        # Register handlers
+   367→        self._transport.register_handler(MessageType.DHT_PING, self._handle_ping)
+   368→        self._transport.register_handler(MessageType.DHT_PING_ACK, self._handle_ping_ack)
+   369→        self._transport.register_handler(MessageType.DHT_FIND_NODE, self._handle_find_node)
+   370→        self._transport.register_handler(MessageType.DHT_FIND_NODE_RESP, self._handle_find_node_resp)
+   371→        self._transport.register_handler(MessageType.DHT_FIND_VALUE, self._handle_find_value)
+   372→        self._transport.register_handler(MessageType.DHT_FIND_VALUE_RESP, self._handle_find_value_resp)
+   373→        self._transport.register_handler(MessageType.DHT_STORE, self._handle_store)
+   374→        self._transport.register_handler(MessageType.DHT_STORE_ACK, self._handle_store_ack)
+   375→
+   376→        self._bg_tasks: list[asyncio.Task] = []
+   377→        self._running = False
+   378→
+   379→    # -------------------------------------------------------------------
+   380→    # Lifecycle
+   381→    # -------------------------------------------------------------------
+   382→
+   383→    async def start(self) -> None:
+   384→        """Start DHT background tasks."""
+   385→        self._running = True
+   386→        self._bg_tasks.append(asyncio.create_task(self._refresh_loop()))
+   387→        self._bg_tasks.append(asyncio.create_task(self._republish_loop()))
+   388→        self._bg_tasks.append(asyncio.create_task(self._eviction_loop()))
+   389→        self._bg_tasks.append(asyncio.create_task(self._expiry_loop()))
+   390→        self._bg_tasks.append(asyncio.create_task(self._rpc_timeout_loop()))
+   391→        logger.info("DHT service started for node %s (k=%d, α=%d)",
+   392→                     self._local_user_id.hex()[:8], K_BUCKET_SIZE, ALPHA)
+   393→
+   394→    async def stop(self) -> None:
+   395→        """Stop DHT service."""
+   396→        self._running = False
+   397→        for task in self._bg_tasks:
+   398→            task.cancel()
+   399→        await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+   400→        self._bg_tasks.clear()
+   401→
+   402→    # -------------------------------------------------------------------
+   403→    # Bootstrap
+   404→    # -------------------------------------------------------------------
+   405→
+   406→    async def bootstrap(self, bootstrap_addrs: list[str]) -> None:
+   407→        """Bootstrap the DHT by contacting known nodes.
+   408→
+   409→        Falls back to LAN-only mode if no bootstrap nodes are reachable.
+   410→        """
+   411→        reachable = False
+   412→
+   413→        for addr_str in bootstrap_addrs:
+   414→            try:
+   415→                host, port_str = addr_str.rsplit(":", 1)
+   416→                port = int(port_str)
+   417→                addr = (host, port)
+   418→
+   419→                ok = await self._rpc_ping(addr)
+   420→                if ok:
+   421→                    reachable = True
+   422→                    logger.info("Bootstrap node reachable: %s", addr_str)
+   423→                else:
+   424→                    logger.warning("Bootstrap node unreachable: %s", addr_str)
+   425→            except Exception as exc:
+   426→                logger.warning("Failed to contact bootstrap %s: %s", addr_str, exc)
+   427→
+   428→        if not reachable:
+   429→            logger.warning(
+   430→                "No bootstrap nodes reachable. Operating in LAN-only mode "
+   431→                "(relying on mDNS for peer discovery)."
+   432→            )
+   433→            return
+   434→
+   435→        # Perform iterative self-lookup to populate routing table
+   436→        await self.find_node(self._local_user_id)
+   437→
+   438→    # -------------------------------------------------------------------
+   439→    # Public APIs
+   440→    # -------------------------------------------------------------------
+   441→
+   442→    async def find_node(self, target_id: bytes) -> list[DHTNode]:
+   443→        """Iterative FIND_NODE with α=3 parallel lookups.
+   444→
+   445→        Returns the k closest nodes to target_id.
+   446→        """
+   447→        closest = self._routing_table.find_closest(target_id, K_BUCKET_SIZE)
+   448→        queried: set[bytes] = set()
+   449→        seen: set[bytes] = set(n.user_id for n in closest)
+   450→
+   451→        for _ in range(ID_BITS):  # Max iterations = number of bits
+   452→            # Select up to α closest unqueried nodes
+   453→            to_query = [
+   454→                n for n in closest
+   455→                if n.user_id not in queried and n.user_id != self._local_user_id
+   456→            ][:ALPHA]
+   457→
+   458→            if not to_query:
+   459→                break
+   460→
+   461→            # Send parallel FIND_NODE RPCs
+   462→            tasks = []
+   463→            for node in to_query:
+   464→                queried.add(node.user_id)
+   465→                tasks.append(self._rpc_find_node(target_id, node))
+   466→
+   467→            results = await asyncio.gather(*tasks, return_exceptions=True)
+   468→
+   469→            new_nodes_found = False
+   470→            for result in results:
+   471→                if isinstance(result, list):
+   472→                    for n in result:
+   473→                        if n.user_id not in seen:
+   474→                            seen.add(n.user_id)
+   475→                            self._routing_table.add_node(n)
+   476→                            new_nodes_found = True
+   477→
+   478→            # Update closest list
+   479→            closest = self._routing_table.find_closest(target_id, K_BUCKET_SIZE)
+   480→
+   481→            if not new_nodes_found:
+   482→                break
+   483→
+   484→        return closest
+   485→
+   486→    async def find_value(self, key: bytes) -> Optional[bytes]:
+   487→        """Iterative FIND_VALUE with α=3 parallel lookups."""
+   488→        # Check local store first
+   489→        local = self._store.get(key)
+   490→        if local and local.expiry > time.time():
+   491→            return local.value
+   492→
+   493→        closest = self._routing_table.find_closest(key, K_BUCKET_SIZE)
+   494→        queried: set[bytes] = set()
+   495→
+   496→        for _ in range(ID_BITS):
+   497→            to_query = [
+   498→                n for n in closest
+   499→                if n.user_id not in queried and n.user_id != self._local_user_id
+   500→            ][:ALPHA]
+   501→
+   502→            if not to_query:
+   503→                break
+   504→
+   505→            tasks = []
+   506→            for node in to_query:
+   507→                queried.add(node.user_id)
+   508→                tasks.append(self._rpc_find_value(key, node))
+   509→
+   510→            results = await asyncio.gather(*tasks, return_exceptions=True)
+   511→
+   512→            for result in results:
+   513→                if isinstance(result, bytes) and result:
+   514→                    return result  # Value found!
+   515→
+   516→            # Update closest
+   517→            closest = self._routing_table.find_closest(key, K_BUCKET_SIZE)
+   518→
+   519→        return None
+   520→
+   521→    async def store_value(self, key: bytes, value: bytes, ttl: int = 3600) -> bool:
+   522→        """Store a key-value pair at the k closest nodes."""
+   523→        closest = await self.find_node(key)
+   524→        targets = [n for n in closest[:K_BUCKET_SIZE]
+   525→                    if n.user_id != self._local_user_id]
+   526→
+   527→        if not targets:
+   528→            # Only us — store locally
+   529→            self._store[key] = StoredValue(
+   530→                key=key, value=value,
+   531→                expiry=time.time() + ttl,
+   532→                original_publisher=self._local_user_id,
+   533→            )
+   534→            return True
+   535→
+   536→        success = False
+   537→        tasks = []
+   538→        for node in targets:
+   539→            tasks.append(self._rpc_store(key, value, ttl, node))
+   540→
+   541→        results = await asyncio.gather(*tasks, return_exceptions=True)
+   542→        for result in results:
+   543→            if result is True:
+   544→                success = True
+   545→
+   546→        # Also store locally
+   547→        self._store[key] = StoredValue(
+   548→            key=key, value=value,
+   549→            expiry=time.time() + ttl,
+   550→            original_publisher=self._local_user_id,
+   551→        )
+   552→
+   553→        return success
+   554→
+   555→    # -------------------------------------------------------------------
+   556→    # RPC implementations
+   557→    # -------------------------------------------------------------------
+   558→
+   559→    async def _rpc_ping(self, addr: tuple[str, int], timeout: float = RPC_TIMEOUT) -> bool:
+   560→        """Send DHT PING and wait for PONG."""
+   561→        request_key = f"ping:{addr[0]}:{addr[1]}:{time.monotonic()}".encode()
+   562→        event = asyncio.Event()
+   563→        self._pending_ping[request_key] = event
+   564→
+   565→        ping = DHTPingPayload(
+   566→            sender_id=self._local_user_id,
+   567→            sender_addr=self._local_addr,
+   568→        )
+   569→        try:
+   570→            await self._transport.send(MessageType.DHT_PING, ping, addr)
+   571→            await asyncio.wait_for(event.wait(), timeout=timeout)
+   572→            return True
+   573→        except asyncio.TimeoutError:
+   574→            return False
+   575→        finally:
+   576→            self._pending_ping.pop(request_key, None)
+   577→
+   578→    async def _rpc_find_node(self, target_id: bytes, node: DHTNode) -> list[DHTNode]:
+   579→        """Send FIND_NODE RPC to a specific node."""
+   580→        host, port_str = node.addr.rsplit(":", 1)
+   581→        addr = (host, int(port_str))
+   582→
+   583→        request_key = target_id + node.user_id
+   584→        future: asyncio.Future[list[DHTNode]] = asyncio.get_running_loop().create_future()
+   585→        self._pending_find_node[request_key] = future
+   586→
+   587→        payload = DHTFindNodePayload(
+   588→            sender_id=self._local_user_id,
+   589→            target_id=target_id,
+   590→            sender_addr=self._local_addr,
+   591→        )
+   592→
+   593→        for attempt in range(3):  # Up to 2 retries
+   594→            try:
+   595→                await self._transport.send(MessageType.DHT_FIND_NODE, payload, addr)
+   596→                return await asyncio.wait_for(future, timeout=RPC_TIMEOUT)
+   597→            except asyncio.TimeoutError:
+   598→                if attempt == 2:
+   599→                    self._routing_table.increment_failure(node.user_id)
+   600→                    return []
+   601→            except Exception:
+   602→                self._routing_table.increment_failure(node.user_id)
+   603→                return []
+   604→
+   605→        return []
+   606→
+   607→    async def _rpc_find_value(self, key: bytes, node: DHTNode) -> Optional[bytes]:
+   608→        """Send FIND_VALUE RPC to a specific node."""
+   609→        host, port_str = node.addr.rsplit(":", 1)
+   610→        addr = (host, int(port_str))
+   611→
+   612→        request_key = key + node.user_id
+   613→        future: asyncio.Future[Optional[bytes]] = asyncio.get_running_loop().create_future()
+   614→        self._pending_find_value[request_key] = future
+   615→
+   616→        payload = DHTFindValuePayload(
+   617→            sender_id=self._local_user_id,
+   618→            key=key,
+   619→        )
+   620→
+   621→        for attempt in range(3):
+   622→            try:
+   623→                await self._transport.send(MessageType.DHT_FIND_VALUE, payload, addr)
+   624→                return await asyncio.wait_for(future, timeout=RPC_TIMEOUT)
+   625→            except asyncio.TimeoutError:
+   626→                if attempt == 2:
+   627→                    self._routing_table.increment_failure(node.user_id)
+   628→                    return None
+   629→            except Exception:
+   630→                self._routing_table.increment_failure(node.user_id)
+   631→                return None
+   632→
+   633→        return None
+   634→
+   635→    async def _rpc_store(self, key: bytes, value: bytes, ttl: int, node: DHTNode) -> bool:
+   636→        """Send STORE RPC to a specific node."""
+   637→        host, port_str = node.addr.rsplit(":", 1)
+   638→        addr = (host, int(port_str))
+   639→
+   640→        request_key = key + node.user_id
+   641→        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+   642→        self._pending_store[request_key] = future
+   643→
+   644→        payload = DHTStorePayload(
+   645→            sender_id=self._local_user_id,
+   646→            key=key,
+   647→            value=value,
+   648→            ttl=ttl,
+   649→        )
+   650→
+   651→        for attempt in range(3):
+   652→            try:
+   653→                await self._transport.send(MessageType.DHT_STORE, payload, addr)
+   654→                return await asyncio.wait_for(future, timeout=RPC_TIMEOUT)
+   655→            except asyncio.TimeoutError:
+   656→                if attempt == 2:
+   657→                    self._routing_table.increment_failure(node.user_id)
+   658→                    return False
+   659→            except Exception:
+   660→                return False
+   661→
+   662→        return False
+   663→
+   664→    # -------------------------------------------------------------------
+   665→    # Incoming message handlers
+   666→    # -------------------------------------------------------------------
+   667→
+   668→    async def _handle_ping(
+   669→        self, msg_type: int, timestamp: float, payload: DHTPingPayload, addr: tuple[str, int]
+   670→    ) -> None:
+   671→        """Respond to DHT PING."""
+   672→        node = DHTNode(
+   673→            user_id=payload.sender_id,
+   674→            addr=payload.sender_addr,
+   675→            public_key=b"",
+   676→            last_seen=time.monotonic(),
+   677→        )
+   678→        self._routing_table.add_node(node)
+   679→
+   680→        ack = DHTPingAckPayload(
+   681→            sender_id=self._local_user_id,
+   682→            sender_addr=self._local_addr,
+   683→        )
+   684→        await self._transport.send(MessageType.DHT_PING_ACK, ack, addr)
+   685→
+   686→    async def _handle_ping_ack(
+   687→        self, msg_type: int, timestamp: float, payload: DHTPingAckPayload, addr: tuple[str, int]
+   688→    ) -> None:
+   689→        """Handle DHT PING_ACK."""
+   690→        node = DHTNode(
+   691→            user_id=payload.sender_id,
+   692→            addr=payload.sender_addr,
+   693→            public_key=b"",
+   694→            last_seen=time.monotonic(),
+   695→        )
+   696→        self._routing_table.add_node(node)
+   697→
+   698→        # Resolve any pending ping events
+   699→        for key, event in list(self._pending_ping.items()):
+   700→            if not event.is_set():
+   701→                event.set()
+   702→
+   703→        # Check if this node was an eviction candidate
+   704→        evict = self._eviction_candidates.pop(payload.sender_id, None)
+   705→        if evict:
+   706→            # Node responded — it's alive, keep it in the bucket
+   707→            evict.failures = 0
+   708→            evict.ping_pending = False
+   709→
+   710→    async def _handle_find_node(
+   711→        self, msg_type: int, timestamp: float, payload: DHTFindNodePayload, addr: tuple[str, int]
+   712→    ) -> None:
+   713→        """Respond to FIND_NODE with k closest nodes."""
+   714→        sender = DHTNode(
+   715→            user_id=payload.sender_id,
+   716→            addr=payload.sender_addr,
+   717→            public_key=b"",
+   718→        )
+   719→        self._routing_table.add_node(sender)
+   720→
+   721→        closest = self._routing_table.find_closest(payload.target_id, K_BUCKET_SIZE)
+   722→        nodes = [
+   723→            DHTNodeInfo(user_id=n.user_id, addr=n.addr, public_key=n.public_key)
+   724→            for n in closest
+   725→        ]
+   726→
+   727→        resp = DHTFindNodeRespPayload(
+   728→            sender_id=self._local_user_id,
+   729→            target_id=payload.target_id,
+   730→            nodes=nodes,
+   731→        )
+   732→        await self._transport.send(MessageType.DHT_FIND_NODE_RESP, resp, addr)
+   733→
+   734→    async def _handle_find_node_resp(
+   735→        self, msg_type: int, timestamp: float, payload: DHTFindNodeRespPayload, addr: tuple[str, int]
+   736→    ) -> None:
+   737→        """Handle FIND_NODE response — add nodes and resolve pending RPC."""
+   738→        for node_info in payload.nodes:
+   739→            node = DHTNode(
+   740→                user_id=node_info.user_id,
+   741→                addr=node_info.addr,
+   742→                public_key=node_info.public_key,
+   743→            )
+   744→            self._routing_table.add_node(node)
+   745→
+   746→        # Resolve pending future
+   747→        request_key = payload.target_id + payload.sender_id
+   748→        future = self._pending_find_node.get(request_key)
+   749→        if future and not future.done():
+   750→            nodes = [
+   751→                DHTNode(
+   752→                    user_id=ni.user_id, addr=ni.addr, public_key=ni.public_key,
+   753→                )
+   754→                for ni in payload.nodes
+   755→            ]
+   756→            future.set_result(nodes)
+   757→
+   758→    async def _handle_find_value(
+   759→        self, msg_type: int, timestamp: float, payload: DHTFindValuePayload, addr: tuple[str, int]
+   760→    ) -> None:
+   761→        """Respond to FIND_VALUE."""
+   762→        local = self._store.get(payload.key)
+   763→        found = local is not None and local.expiry > time.time()
+   764→
+   765→        closest = self._routing_table.find_closest(payload.key, K_BUCKET_SIZE)
+   766→        closest_infos = [
+   767→            DHTNodeInfo(user_id=n.user_id, addr=n.addr, public_key=n.public_key)
+   768→            for n in closest
+   769→        ]
+   770→
+   771→        resp = DHTFindValueRespPayload(
+   772→            sender_id=self._local_user_id,
+   773→            key=payload.key,
+   774→            value=local.value if found else b"",
+   775→            found=found,
+   776→            closest_nodes=closest_infos,
+   777→        )
+   778→        await self._transport.send(MessageType.DHT_FIND_VALUE_RESP, resp, addr)
+   779→
+   780→    async def _handle_find_value_resp(
+   781→        self, msg_type: int, timestamp: float, payload: DHTFindValueRespPayload, addr: tuple[str, int]
+   782→    ) -> None:
+   783→        """Handle FIND_VALUE response."""
+   784→        for node_info in payload.closest_nodes:
+   785→            node = DHTNode(
+   786→                user_id=node_info.user_id,
+   787→                addr=node_info.addr,
+   788→                public_key=node_info.public_key,
+   789→            )
+   790→            self._routing_table.add_node(node)
+   791→
+   792→        request_key = payload.key + payload.sender_id
+   793→        future = self._pending_find_value.get(request_key)
+   794→        if future and not future.done():
+   795→            future.set_result(payload.value if payload.found else None)
+   796→
+   797→    async def _handle_store(
+   798→        self, msg_type: int, timestamp: float, payload: DHTStorePayload, addr: tuple[str, int]
+   799→    ) -> None:
+   800→        """Handle STORE request."""
+   801→        if len(self._store) >= MAX_STORED_VALUES:
+   802→            now = time.time()
+   803→            expired = [k for k, v in self._store.items() if v.expiry <= now]
+   804→            for k in expired:
+   805→                del self._store[k]
+   806→
+   807→        self._store[payload.key] = StoredValue(
+   808→            key=payload.key,
+   809→            value=payload.value,
+   810→            expiry=time.time() + payload.ttl,
+   811→            original_publisher=payload.sender_id,
+   812→        )
+   813→
+   814→        ack = DHTStoreAckPayload(key=payload.key, stored=True)
+   815→        await self._transport.send(MessageType.DHT_STORE_ACK, ack, addr)
+   816→
+   817→    async def _handle_store_ack(
+   818→        self, msg_type: int, timestamp: float, payload: DHTStoreAckPayload, addr: tuple[str, int]
+   819→    ) -> None:
+   820→        """Handle STORE_ACK."""
+   821→        for key, future in list(self._pending_store.items()):
+   822→            if key.startswith(payload.key) and not future.done():
+   823→                future.set_result(payload.stored)
+   824→
+   825→    # -------------------------------------------------------------------
+   826→    # Background: bucket refresh
+   827→    # -------------------------------------------------------------------
+   828→
+   829→    async def _refresh_loop(self) -> None:
+   830→        """Periodically refresh k-buckets by performing lookups for random IDs."""
+   831→        while self._running:
+   832→            await asyncio.sleep(REFRESH_INTERVAL)
+   833→            if not self._running:
+   834→                break
+   835→
+   836→            # Find a random ID in each bucket that hasn't been refreshed recently
+   837→            import os
+   838→            for bucket_idx in range(ID_BITS):
+   839→                if not self._running:
+   840→                    break
+   841→                random_id = os.urandom(ID_LENGTH)
+   842→                # Set the appropriate bits for this bucket's range
+   843→                try:
+   844→                    await self.find_node(random_id)
+   845→                except Exception as exc:
+   846→                    logger.debug("Bucket refresh failed for bucket %d: %s", bucket_idx, exc)
+   847→
+   848→            logger.debug("Bucket refresh completed. Total nodes: %d", self._routing_table.total_nodes)
+   849→
+   850→    # -------------------------------------------------------------------
+   851→    # Background: key republish
+   852→    # -------------------------------------------------------------------
+   853→
+   854→    async def _republish_loop(self) -> None:
+   855→        """Republish locally stored key-value pairs every 24 hours."""
+   856→        while self._running:
+   857→            await asyncio.sleep(REPUBLISH_INTERVAL)
+   858→            if not self._running:
+   859→                break
+   860→
+   861→            now = time.time()
+   862→            for key, stored in list(self._store.items()):
+   863→                if now - stored.last_republished >= REPUBLISH_INTERVAL:
+   864→                    ttl_remaining = int(stored.expiry - now)
+   865→                    if ttl_remaining > 0:
+   866→                        try:
+   867→                            await self.store_value(key, stored.value, ttl=ttl_remaining)
+   868→                            stored.last_republished = now
+   869→                        except Exception as exc:
+   870→                            logger.debug("Republish failed for key %s: %s", key.hex()[:8], exc)
+   871→
+   872→            logger.debug("Key republish completed. %d keys stored.", len(self._store))
+   873→
+   874→    # -------------------------------------------------------------------
+   875→    # Background: stale node eviction
+   876→    # -------------------------------------------------------------------
+   877→
+   878→    async def _eviction_loop(self) -> None:
+   879→        """Periodically check for stale nodes and attempt eviction."""
+   880→        while self._running:
+   881→            await asyncio.sleep(EVICT_CHECK_INTERVAL)
+   882→            if not self._running:
+   883→                break
+   884→
+   885→            stale_removed = 0
+   886→            for node in self._routing_table.get_all_nodes():
+   887→                if node.is_stale:
+   888→                    self._routing_table.remove_node(node.user_id)
+   889→                    stale_removed += 1
+   890→
+   891→            if stale_removed:
+   892→                logger.info("Evicted %d stale nodes from routing table.", stale_removed)
+   893→
+   894→    # -------------------------------------------------------------------
+   895→    # Background: store expiry
+   896→    # -------------------------------------------------------------------
+   897→
+   898→    async def _expiry_loop(self) -> None:
+   899→        """Clean expired entries from local store."""
+   900→        while self._running:
+   901→            now = time.time()
+   902→            expired = [k for k, v in self._store.items() if v.expiry <= now]
+   903→            for k in expired:
+   904→                del self._store[k]
+   905→            if expired:
+   906→                logger.debug("Cleaned %d expired DHT entries", len(expired))
+   907→            await asyncio.sleep(60)
+   908→
+   909→    # -------------------------------------------------------------------
+   910→    # Background: RPC timeout management
+   911→    # -------------------------------------------------------------------
+   912→
+   913→    async def _rpc_timeout_loop(self) -> None:
+   914→        """Monitor pending RPCs and handle timeouts."""
+   915→        while self._running:
+   916→            now = time.monotonic()
+   917→            for request_key, pending in list(self._pending_find_node.items()):
+   918→                elapsed = now - (pending._sent_at if hasattr(pending, '_sent_at') else 0)
+   919→                # Futures handle their own timeout via asyncio.wait_for
+   920→            await asyncio.sleep(1)
+   921→

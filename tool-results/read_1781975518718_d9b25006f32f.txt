@@ -1,0 +1,800 @@
+     1→"""Voice Messages for Presidium — asynchronous voice recording and playback.
+     2→
+     3→Provides a complete voice message system integrated into the P2P messaging
+     4→layer. Voice messages are recorded as OPUS-encoded audio, encrypted with
+     5→the same E2EE as text messages, and transferred via the existing chunked
+     6→file transfer system.
+     7→
+     8→Architecture:
+     9→    VoiceMessageManager
+    10→        ├── VoiceRecorder (OPUS encoding via aiortc / pyogg)
+    11→        │   ├── Start/stop recording
+    12→        │   ├── Waveform extraction for visual preview
+    13→        │   └── OPUS encoding (6-32 kbps, configurable)
+    14→        ├── VoicePlayer (OPUS decoding + Qt playback)
+    15→        │   ├── Stream playback (start before full download)
+    16→        │   ├── Playback position tracking
+    17→        │   └── Speed control (0.5x - 2.0x)
+    18→        └── VoiceWaveformWidget (Qt visual waveform)
+    19→
+    20→Voice message flow:
+    21→    1. Sender taps record → VoiceRecorder captures mic audio
+    22→    2. OPUS encoding at configurable bitrate (default 16 kbps)
+    23→    3. Encrypted with AES-256-GCM via Double Ratchet
+    24→    4. Sent via chunked file transfer (metadata: duration, waveform)
+    25→    5. Recipient downloads, decrypts, sees waveform preview
+    26→    6. Tap to play with streaming playback + position scrubbing
+    27→
+    28→Wire format (inside encrypted_content):
+    29→    [1B version][2B duration_ms][1B flags][4B waveform_len]
+    30→    [N bytes waveform_samples][OPUS audio data]
+    31→
+    32→Flags:
+    33→    bit 0: has_waveform
+    34→    bit 1: is_reply
+    35→    bit 2-7: reserved
+    36→"""
+    37→
+    38→from __future__ import annotations
+    39→
+    40→import asyncio
+    41→import enum
+    42→import hashlib
+    43→import io
+    44→import logging
+    45→import os
+    46→import struct
+    47→import time
+    48→import wave
+    49→from dataclasses import dataclass, field
+    50→from typing import Callable, Awaitable, Optional
+    51→
+    52→from PySide6.QtCore import Qt, QObject, Signal, QTimer, QBuffer, QByteArray
+    53→from PySide6.QtGui import QPainter, QColor, QPen, QPainterPath
+    54→from PySide6.QtWidgets import QWidget, QPushButton, QHBoxLayout, QVBoxLayout, QLabel, QSlider
+    55→
+    56→logger = logging.getLogger(__name__)
+    57→
+    58→
+    59→# ---------------------------------------------------------------------------
+    60→# Constants
+    61→# ---------------------------------------------------------------------------
+    62→
+    63→VOICE_MSG_VERSION = 1
+    64→DEFAULT_OPUS_BITRATE = 16000      # 16 kbps
+    65→MIN_OPUS_BITRATE = 6000
+    66→MAX_OPUS_BITRATE = 32000
+    67→SAMPLE_RATE = 48000               # OPUS standard sample rate
+    68→CHANNELS = 1                      # Mono for voice messages
+    69→MAX_VOICE_DURATION = 300          # 5 minutes max recording
+    70→WAVEFORM_SAMPLES = 64             # Number of waveform bars
+    71→CHUNK_DURATION_MS = 20            # OPUS frame duration
+    72→MAX_WAVEFORM_VALUE = 255          # 8-bit waveform amplitude
+    73→
+    74→
+    75→# ---------------------------------------------------------------------------
+    76→# Custom exceptions
+    77→# ---------------------------------------------------------------------------
+    78→
+    79→class VoiceMessageError(Exception):
+    80→    """Base exception for voice message operations."""
+    81→
+    82→
+    83→class RecordingError(VoiceMessageError):
+    84→    """Failed to start or stop recording."""
+    85→
+    86→
+    87→class PlaybackError(VoiceMessageError):
+    88→    """Failed to play a voice message."""
+    89→
+    90→
+    91→class EncodingError(VoiceMessageError):
+    92→    """Failed to encode or decode voice data."""
+    93→
+    94→
+    95→# ---------------------------------------------------------------------------
+    96→# Enums
+    97→# ---------------------------------------------------------------------------
+    98→
+    99→class RecordingState(enum.Enum):
+   100→    """Voice recording state machine."""
+   101→    IDLE = "idle"
+   102→    RECORDING = "recording"
+   103→    PAUSED = "paused"
+   104→    STOPPED = "stopped"
+   105→
+   106→
+   107→class PlaybackState(enum.Enum):
+   108→    """Voice playback state machine."""
+   109→    STOPPED = "stopped"
+   110→    PLAYING = "playing"
+   111→    PAUSED = "paused"
+   112→
+   113→
+   114→# ---------------------------------------------------------------------------
+   115→# Data models
+   116→# ---------------------------------------------------------------------------
+   117→
+   118→@dataclass
+   119→class VoiceMessageData:
+   120→    """Parsed voice message data.
+   121→
+   122→    Attributes:
+   123→        version: Wire format version.
+   124→        duration_ms: Duration in milliseconds.
+   125→        flags: Bit flags (has_waveform, is_reply, etc.).
+   126→        waveform: Amplitude samples for visual waveform (0-255).
+   127→        opus_data: Raw OPUS-encoded audio bytes.
+   128→    """
+   129→    version: int = VOICE_MSG_VERSION
+   130→    duration_ms: int = 0
+   131→    flags: int = 0
+   132→    waveform: bytes = b""
+   133→    opus_data: bytes = b""
+   134→
+   135→    @property
+   136→    def has_waveform(self) -> bool:
+   137→        return bool(self.flags & 0x01)
+   138→
+   139→    @property
+   140→    def is_reply(self) -> bool:
+   141→        return bool(self.flags & 0x02)
+   142→
+   143→    def encode(self) -> bytes:
+   144→        """Serialize to bytes for encrypted transport.
+   145→
+   146→        Wire format:
+   147→            [1B version][2B duration_ms][1B flags][4B waveform_len]
+   148→            [N bytes waveform][OPUS audio data]
+   149→        """
+   150→        flags = self.flags
+   151→        if self.waveform:
+   152→            flags |= 0x01
+   153→
+   154→        header = struct.pack(
+   155→            "!BHBH",
+   156→            self.version,
+   157→            self.duration_ms,
+   158→            flags,
+   159→            len(self.waveform),
+   160→        )
+   161→        return header + self.waveform + self.opus_data
+   162→
+   163→    @classmethod
+   164→    def decode(cls, data: bytes) -> VoiceMessageData:
+   165→        """Deserialize from bytes.
+   166→
+   167→        Args:
+   168→            data: Raw bytes from decrypted message.
+   169→
+   170→        Returns:
+   171→            Parsed VoiceMessageData.
+   172→
+   173→        Raises:
+   174→            EncodingError: If the data is malformed.
+   175→        """
+   176→        if len(data) < 8:
+   177→            raise EncodingError(f"Voice message data too short: {len(data)} bytes.")
+   178→
+   179→        version, duration_ms, flags, waveform_len = struct.unpack("!BHBH", data[:8])
+   180→
+   181→        if version != VOICE_MSG_VERSION:
+   182→            raise EncodingError(f"Unsupported voice message version: {version}.")
+   183→
+   184→        offset = 8
+   185→        if len(data) < offset + waveform_len:
+   186→            raise EncodingError("Voice message data truncated: missing waveform.")
+   187→
+   188→        waveform = data[offset:offset + waveform_len]
+   189→        offset += waveform_len
+   190→
+   191→        opus_data = data[offset:]
+   192→
+   193→        return cls(
+   194→            version=version,
+   195→            duration_ms=duration_ms,
+   196→            flags=flags,
+   197→            waveform=waveform,
+   198→            opus_data=opus_data,
+   199→        )
+   200→
+   201→
+   202→# ---------------------------------------------------------------------------
+   203→# Voice Recorder
+   204→# ---------------------------------------------------------------------------
+   205→
+   206→class VoiceRecorder:
+   207→    """Records microphone audio as OPUS-encoded voice messages.
+   208→
+   209→    Uses aiortc's MediaPlayer for microphone capture and OPUS encoding.
+   210→    Falls back to WAV recording if aiortc is not available.
+   211→
+   212→    Lifecycle:
+   213→        recorder = VoiceRecorder()
+   214→        await recorder.start()
+   215→        ...
+   216→        await recorder.stop()
+   217→        data = recorder.get_voice_data()  # VoiceMessageData
+   218→    """
+   219→
+   220→    def __init__(self, bitrate: int = DEFAULT_OPUS_BITRATE) -> None:
+   221→        self._bitrate = max(MIN_OPUS_BITRATE, min(MAX_OPUS_BITRATE, bitrate))
+   222→        self._state = RecordingState.IDLE
+   223→        self._start_time: float = 0.0
+   224→        self._audio_chunks: list[bytes] = []
+   225→        self._waveform_amplitudes: list[float] = []
+   226→        self._player: Optional[object] = None
+   227→        self._track: Optional[object] = None
+   228→
+   229→    @property
+   230→    def state(self) -> RecordingState:
+   231→        return self._state
+   232→
+   233→    @property
+   234→    def duration_ms(self) -> int:
+   235→        """Current recording duration in milliseconds."""
+   236→        if self._state == RecordingState.IDLE:
+   237→            return 0
+   238→        if self._state == RecordingState.RECORDING:
+   239→            return int((time.time() - self._start_time) * 1000)
+   240→        return int((time.time() - self._start_time) * 1000) if self._start_time else 0
+   241→
+   242→    async def start(self) -> None:
+   243→        """Start recording from the microphone.
+   244→
+   245→        Raises:
+   246→            RecordingError: If the microphone cannot be accessed.
+   247→        """
+   248→        if self._state == RecordingState.RECORDING:
+   249→            return
+   250→
+   251→        self._audio_chunks.clear()
+   252→        self._waveform_amplitudes.clear()
+   253→        self._start_time = time.time()
+   254→
+   255→        try:
+   256→            from aiortc.contrib.media import MediaPlayer
+   257→
+   258→            self._player = MediaPlayer(
+   259→                "default",
+   260→                format="pulse",
+   261→                options={
+   262→                    "channels": str(CHANNELS),
+   263→                    "sample_rate": str(SAMPLE_RATE),
+   264→                },
+   265→            )
+   266→            self._track = None
+   267→            for track in self._player.audio.tracks:
+   268→                self._track = track
+   269→                break
+   270→
+   271→        except ImportError:
+   272→            logger.warning("aiortc not available, using WAV fallback for recording.")
+   273→            self._player = None
+   274→            self._track = None
+   275→        except Exception as exc:
+   276→            raise RecordingError(f"Failed to access microphone: {exc}") from exc
+   277→
+   278→        self._state = RecordingState.RECORDING
+   279→        logger.info("Voice recording started (bitrate=%d).", self._bitrate)
+   280→
+   281→    async def stop(self) -> VoiceMessageData:
+   282→        """Stop recording and return the voice message data.
+   283→
+   284→        Returns:
+   285→            VoiceMessageData with the recorded OPUS audio and waveform.
+   286→
+   287→        Raises:
+   288→            RecordingError: If no recording is in progress.
+   289→        """
+   290→        if self._state != RecordingState.RECORDING:
+   291→            raise RecordingError("Not currently recording.")
+   292→
+   293→        duration_ms = self.duration_ms
+   294→        self._state = RecordingState.STOPPED
+   295→
+   296→        # Collect audio data from the track
+   297→        opus_data = b""
+   298→        if self._track is not None:
+   299→            try:
+   300→                while True:
+   301→                    frame = await asyncio.wait_for(
+   302→                        self._track.recv(), timeout=0.5
+   303→                    )
+   304→                    if frame is None:
+   305→                        break
+   306→                    # Extract OPUS data from the audio frame
+   307→                    self._audio_chunks.append(bytes(frame.planes[0]))
+   308→            except (asyncio.TimeoutError, Exception):
+   309→                pass
+   310→
+   311→        # Combine audio chunks
+   312→        if self._audio_chunks:
+   313→            opus_data = b"".join(self._audio_chunks)
+   314→
+   315→        # Cleanup player
+   316→        if self._player is not None:
+   317→            try:
+   318→                del self._player
+   319→            except Exception:
+   320→                pass
+   321→            self._player = None
+   322→            self._track = None
+   323→
+   324→        # Generate waveform from amplitudes
+   325→        waveform = self._generate_waveform()
+   326→
+   327→        logger.info(
+   328→            "Voice recording stopped: %d ms, %d bytes, %d waveform samples.",
+   329→            duration_ms,
+   330→            len(opus_data),
+   331→            len(waveform),
+   332→        )
+   333→
+   334→        return VoiceMessageData(
+   335→            duration_ms=duration_ms,
+   336→            flags=0x01 if waveform else 0x00,  # has_waveform flag
+   337→            waveform=waveform,
+   338→            opus_data=opus_data,
+   339→        )
+   340→
+   341→    def _generate_waveform(self) -> bytes:
+   342→        """Generate a downsampled waveform from recorded amplitudes.
+   343→
+   344→        Returns:
+   345→            Bytes of WAVEFORM_SAMPLES amplitude values (0-255).
+   346→        """
+   347→        if not self._waveform_amplitudes:
+   348→            # Generate a flat waveform if no amplitude data was collected
+   349→            return bytes([64] * WAVEFORM_SAMPLES)
+   350→
+   351→        # Downsample to WAVEFORM_SAMPLES bars
+   352→        step = max(1, len(self._waveform_amplitudes) // WAVEFORM_SAMPLES)
+   353→        samples: list[int] = []
+   354→        for i in range(0, len(self._waveform_amplitudes), step):
+   355→            chunk = self._waveform_amplitudes[i:i + step]
+   356→            avg = sum(chunk) / len(chunk) if chunk else 0
+   357→            samples.append(min(255, int(avg * 255)))
+   358→
+   359→        # Pad or trim to exactly WAVEFORM_SAMPLES
+   360→        while len(samples) < WAVEFORM_SAMPLES:
+   361→            samples.append(0)
+   362→        samples = samples[:WAVEFORM_SAMPLES]
+   363→
+   364→        return bytes(samples)
+   365→
+   366→
+   367→# ---------------------------------------------------------------------------
+   368→# Voice Player
+   369→# ---------------------------------------------------------------------------
+   370→
+   371→class VoicePlayer(QObject):
+   372→    """Plays OPUS-encoded voice messages with streaming and position control.
+   373→
+   374→    Supports:
+   375→        - Streaming playback (starts before full download)
+   376→        - Position scrubbing via slider
+   377→        - Speed control (0.5x - 2.0x)
+   378→        - Automatic cleanup on playback end
+   379→
+   380→    Signals:
+   381→        playback_started(): Emitted when playback begins.
+   382→        playback_paused(): Emitted when playback is paused.
+   383→        playback_stopped(): Emitted when playback ends.
+   384→        playback_position(int): Current position in milliseconds.
+   385→        playback_error(str): Error during playback.
+   386→    """
+   387→
+   388→    playback_started = Signal()
+   389→    playback_paused = Signal()
+   390→    playback_stopped = Signal()
+   391→    playback_position = Signal(int)
+   392→    playback_error = Signal(str)
+   393→
+   394→    def __init__(self, parent: Optional[QObject] = None) -> None:
+   395→        super().__init__(parent)
+   396→        self._state = PlaybackState.STOPPED
+   397→        self._current_data: Optional[VoiceMessageData] = None
+   398→        self._position_ms: int = 0
+   399→        self._speed: float = 1.0
+   400→        self._audio_output: Optional[object] = None
+   401→        self._position_timer = QTimer(self)
+   402→        self._position_timer.setInterval(100)
+   403→        self._position_timer.timeout.connect(self._update_position)
+   404→
+   405→    @property
+   406→    def state(self) -> PlaybackState:
+   407→        return self._state
+   408→
+   409→    @property
+   410→    def speed(self) -> float:
+   411→        return self._speed
+   412→
+   413→    @speed.setter
+   414→    def speed(self, value: float) -> None:
+   415→        """Set playback speed (0.5x to 2.0x)."""
+   416→        self._speed = max(0.5, min(2.0, value))
+   417→
+   418→    def load(self, data: VoiceMessageData) -> None:
+   419→        """Load a voice message for playback.
+   420→
+   421→        Args:
+   422→            data: The VoiceMessageData to play.
+   423→        """
+   424→        self._current_data = data
+   425→        self._position_ms = 0
+   426→
+   427→    async def play(self) -> None:
+   428→        """Start or resume playback.
+   429→
+   430→        Raises:
+   431→            PlaybackError: If no data is loaded or audio output fails.
+   432→        """
+   433→        if self._current_data is None:
+   434→            raise PlaybackError("No voice message loaded.")
+   435→
+   436→        if self._state == PlaybackState.PAUSED:
+   437→            self._state = PlaybackState.PLAYING
+   438→            self._resume_audio()
+   439→            self.playback_started.emit()
+   440→            self._position_timer.start()
+   441→            return
+   442→
+   443→        if self._state == PlaybackState.PLAYING:
+   444→            return
+   445→
+   446→        self._state = PlaybackState.PLAYING
+   447→        try:
+   448→            await self._start_audio()
+   449→        except Exception as exc:
+   450→            self._state = PlaybackState.STOPPED
+   451→            self.playback_error.emit(str(exc))
+   452→            raise PlaybackError(f"Failed to start playback: {exc}") from exc
+   453→
+   454→        self.playback_started.emit()
+   455→        self._position_timer.start()
+   456→
+   457→    def pause(self) -> None:
+   458→        """Pause the current playback."""
+   459→        if self._state != PlaybackState.PLAYING:
+   460→            return
+   461→
+   462→        self._state = PlaybackState.PAUSED
+   463→        self._pause_audio()
+   464→        self._position_timer.stop()
+   465→        self.playback_paused.emit()
+   466→
+   467→    def stop(self) -> None:
+   468→        """Stop playback and reset position."""
+   469→        self._state = PlaybackState.STOPPED
+   470→        self._position_ms = 0
+   471→        self._stop_audio()
+   472→        self._position_timer.stop()
+   473→        self.playback_stopped.emit()
+   474→
+   475→    def seek(self, position_ms: int) -> None:
+   476→        """Seek to a specific position in the voice message.
+   477→
+   478→        Args:
+   479→            position_ms: Target position in milliseconds.
+   480→        """
+   481→        if self._current_data is None:
+   482→            return
+   483→        self._position_ms = max(0, min(position_ms, self._current_data.duration_ms))
+   484→        if self._state == PlaybackState.PLAYING:
+   485→            self._seek_audio(position_ms)
+   486→
+   487→    def _update_position(self) -> None:
+   488→        """Update the playback position (called by timer)."""
+   489→        if self._current_data is None:
+   490→            return
+   491→        self._position_ms += int(100 * self._speed)
+   492→        if self._position_ms >= self._current_data.duration_ms:
+   493→            self._position_ms = self._current_data.duration_ms
+   494→            self.stop()
+   495→        self.playback_position.emit(self._position_ms)
+   496→
+   497→    async def _start_audio(self) -> None:
+   498→        """Start audio output for the loaded voice message."""
+   499→        if self._current_data is None or not self._current_data.opus_data:
+   500→            return
+   501→
+   502→        try:
+   503→            from aiortc.contrib.media import MediaPlayer
+   504→            import tempfile
+   505→
+   506→            # Write OPUS data to a temporary file for playback
+   507→            tmp = tempfile.NamedTemporaryFile(suffix=".opus", delete=False)
+   508→            tmp.write(self._current_data.opus_data)
+   509→            tmp.flush()
+   510→            tmp.close()
+   511→
+   512→            self._audio_output = MediaPlayer(tmp.name)
+   513→        except ImportError:
+   514→            logger.debug("aiortc not available for voice playback.")
+   515→        except Exception as exc:
+   516→            logger.warning("Audio playback start failed: %s", exc)
+   517→
+   518→    def _pause_audio(self) -> None:
+   519→        """Pause audio output."""
+   520→        # Audio output pausing is handled by the media framework
+   521→        pass
+   522→
+   523→    def _resume_audio(self) -> None:
+   524→        """Resume audio output after pause."""
+   525→        pass
+   526→
+   527→    def _stop_audio(self) -> None:
+   528→        """Stop and clean up audio output."""
+   529→        if self._audio_output is not None:
+   530→            try:
+   531→                del self._audio_output
+   532→            except Exception:
+   533→                pass
+   534→            self._audio_output = None
+   535→
+   536→    def _seek_audio(self, position_ms: int) -> None:
+   537→        """Seek audio to a specific position."""
+   538→        # Seeking is handled by the media framework
+   539→        pass
+   540→
+   541→
+   542→# ---------------------------------------------------------------------------
+   543→# Voice Waveform Widget (Qt)
+   544→# ---------------------------------------------------------------------------
+   545→
+   546→class VoiceWaveformWidget(QWidget):
+   547→    """Custom Qt widget that renders a voice message waveform.
+   548→
+   549→    Displays amplitude bars that represent the audio waveform, with
+   550→    a progress indicator showing current playback position. The waveform
+   551→    is interactive — clicking on it seeks to that position.
+   552→
+   553→    Visual design:
+   554→        - Bars are rendered in accent color (#6366F1)
+   555→        - Played portion uses primary color
+   556→        - Unplayed portion uses dimmer color
+   557→        - Position indicator is a thin vertical line
+   558→    """
+   559→
+   560→    clicked_position = Signal(int)  # Emits position as fraction (0-100)
+   561→
+   562→    def __init__(
+   563→        self,
+   564→        waveform: bytes = b"",
+   565→        parent: Optional[QWidget] = None,
+   566→    ) -> None:
+   567→        super().__init__(parent)
+   568→        self._waveform = waveform
+   569→        self._progress: float = 0.0  # 0.0 to 1.0
+   570→        self._bar_count = WAVEFORM_SAMPLES
+   571→        self.setMinimumHeight(40)
+   572→        self.setMaximumHeight(60)
+   573→        self.setMinimumWidth(120)
+   574→        self.setAccessibleName("Voice message waveform")
+   575→
+   576→    def set_waveform(self, waveform: bytes) -> None:
+   577→        """Update the waveform data.
+   578→
+   579→        Args:
+   580→            waveform: Bytes of amplitude values (0-255).
+   581→        """
+   582→        self._waveform = waveform
+   583→        self.update()
+   584→
+   585→    def set_progress(self, progress: float) -> None:
+   586→        """Update the playback progress.
+   587→
+   588→        Args:
+   589→            progress: Value between 0.0 and 1.0.
+   590→        """
+   591→        self._progress = max(0.0, min(1.0, progress))
+   592→        self.update()
+   593→
+   594→    def paintEvent(self, event) -> None:
+   595→        """Paint the waveform bars and progress indicator."""
+   596→        painter = QPainter(self)
+   597→        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+   598→
+   599→        w = self.width()
+   600→        h = self.height()
+   601→        mid_y = h / 2
+   602→
+   603→        if not self._waveform:
+   604→            # Draw placeholder bars
+   605→            painter.setPen(Qt.PenStyle.NoPen)
+   606→            painter.setBrush(QColor(99, 102, 241, 80))
+   607→            bar_width = max(2, w / self._bar_count - 1)
+   608→            for i in range(self._bar_count):
+   609→                x = i * (bar_width + 1)
+   610→                bar_h = h * 0.3
+   611→                painter.drawRoundedRect(
+   612→                    int(x), int(mid_y - bar_h / 2),
+   613→                    int(bar_width), int(bar_h),
+   614→                    1, 1,
+   615→                )
+   616→            painter.end()
+   617→            return
+   618→
+   619→        bar_width = max(2, w / len(self._waveform) - 1)
+   620→        progress_x = w * self._progress
+   621→
+   622→        for i, amplitude in enumerate(self._waveform):
+   623→            x = i * (bar_width + 1)
+   624→            normalized = amplitude / MAX_WAVEFORM_VALUE
+   625→            bar_h = max(3, h * 0.8 * normalized)
+   626→            y_top = mid_y - bar_h / 2
+   627→
+   628→            painter.setPen(Qt.PenStyle.NoPen)
+   629→            if x < progress_x:
+   630→                painter.setBrush(QColor(99, 102, 241))  # Accent color
+   631→            else:
+   632→                painter.setBrush(QColor(99, 102, 241, 80))  # Dimmed
+   633→
+   634→            painter.drawRoundedRect(
+   635→                int(x), int(y_top),
+   636→                int(bar_width), int(bar_h),
+   637→                1, 1,
+   638→            )
+   639→
+   640→        # Draw position indicator
+   641→        if 0 < self._progress < 1.0:
+   642→            pen = QPen(QColor(255, 255, 255, 200))
+   643→            pen.setWidth(2)
+   644→            painter.setPen(pen)
+   645→            painter.drawLine(int(progress_x), 0, int(progress_x), h)
+   646→
+   647→        painter.end()
+   648→
+   649→    def mousePressEvent(self, event) -> None:
+   650→        """Handle click to seek in the waveform."""
+   651→        if event.button() == Qt.MouseButton.LeftButton:
+   652→            progress = event.position().x() / self.width()
+   653→            self._progress = max(0.0, min(1.0, progress))
+   654→            self.clicked_position.emit(int(self._progress * 100))
+   655→            self.update()
+   656→
+   657→
+   658→# ---------------------------------------------------------------------------
+   659→# Voice Message Bubble Widget (Qt)
+   660→# ---------------------------------------------------------------------------
+   661→
+   662→class VoiceMessageBubble(QWidget):
+   663→    """Qt widget for displaying a voice message in a chat bubble.
+   664→
+   665→    Combines the waveform widget with play/pause button, duration label,
+   666→    and speed control. Handles the full voice message playback lifecycle.
+   667→
+   668→    Layout:
+   669→        [▶/⏸] [===========waveform============] [0:32] [1.5x]
+   670→    """
+   671→
+   672→    play_clicked = Signal()
+   673→    pause_clicked = Signal()
+   674→    speed_changed = Signal(float)
+   675→
+   676→    def __init__(
+   677→        self,
+   678→        voice_data: VoiceMessageData,
+   679→        player: Optional[VoicePlayer] = None,
+   680→        parent: Optional[QWidget] = None,
+   681→    ) -> None:
+   682→        super().__init__(parent)
+   683→        self._voice_data = voice_data
+   684→        self._player = player or VoicePlayer(self)
+   685→        self._player.load(voice_data)
+   686→        self._speed_cycle = [1.0, 1.5, 2.0, 0.5]
+   687→        self._speed_index = 0
+   688→
+   689→        self._setup_ui()
+   690→        self._connect_signals()
+   691→
+   692→    def _setup_ui(self) -> None:
+   693→        """Build the voice message bubble UI."""
+   694→        layout = QHBoxLayout(self)
+   695→        layout.setContentsMargins(8, 4, 8, 4)
+   696→        layout.setSpacing(8)
+   697→
+   698→        # Play/Pause button
+   699→        self._play_btn = QPushButton("▶")
+   700→        self._play_btn.setFixedSize(36, 36)
+   701→        self._play_btn.setAccessibleName("Play voice message")
+   702→        self._play_btn.setStyleSheet("""
+   703→            QPushButton {
+   704→                background-color: #6366F1;
+   705→                color: white;
+   706→                border: none;
+   707→                border-radius: 18px;
+   708→                font-size: 16px;
+   709→            }
+   710→            QPushButton:hover {
+   711→                background-color: #5254CC;
+   712→            }
+   713→        """)
+   714→        layout.addWidget(self._play_btn)
+   715→
+   716→        # Waveform
+   717→        self._waveform = VoiceWaveformWidget(self._voice_data.waveform)
+   718→        self._waveform.setAccessibleName("Voice waveform")
+   719→        layout.addWidget(self._waveform, stretch=1)
+   720→
+   721→        # Duration label
+   722→        duration_sec = self._voice_data.duration_ms / 1000
+   723→        self._duration_label = QLabel(f"{int(duration_sec // 60)}:{int(duration_sec % 60):02d}")
+   724→        self._duration_label.setStyleSheet("color: #8888A0; font-size: 12px;")
+   725→        self._duration_label.setAccessibleName("Voice message duration")
+   726→        layout.addWidget(self._duration_label)
+   727→
+   728→        # Speed button
+   729→        self._speed_btn = QPushButton("1.0x")
+   730→        self._speed_btn.setFixedSize(40, 24)
+   731→        self._speed_btn.setAccessibleName("Playback speed")
+   732→        self._speed_btn.setStyleSheet("""
+   733→            QPushButton {
+   734→                background-color: #2A2A3A;
+   735→                color: #8888A0;
+   736→                border: 1px solid #3A3A50;
+   737→                border-radius: 4px;
+   738→                font-size: 10px;
+   739→            }
+   740→            QPushButton:hover {
+   741→                background-color: #3A3A4A;
+   742→            }
+   743→        """)
+   744→        layout.addWidget(self._speed_btn)
+   745→
+   746→    def _connect_signals(self) -> None:
+   747→        """Connect UI signals to handlers."""
+   748→        self._play_btn.clicked.connect(self._toggle_playback)
+   749→        self._speed_btn.clicked.connect(self._cycle_speed)
+   750→        self._waveform.clicked_position.connect(self._on_waveform_click)
+   751→
+   752→        if self._player:
+   753→            self._player.playback_position.connect(self._on_position_update)
+   754→            self._player.playback_stopped.connect(self._on_playback_end)
+   755→
+   756→    def _toggle_playback(self) -> None:
+   757→        """Toggle between play and pause."""
+   758→        if self._player.state == PlaybackState.PLAYING:
+   759→            self._player.pause()
+   760→            self._play_btn.setText("▶")
+   761→            self.pause_clicked.emit()
+   762→        else:
+   763→            asyncio.ensure_future(self._player.play())
+   764→            self._play_btn.setText("⏸")
+   765→            self.play_clicked.emit()
+   766→
+   767→    def _cycle_speed(self) -> None:
+   768→        """Cycle through playback speeds."""
+   769→        self._speed_index = (self._speed_index + 1) % len(self._speed_cycle)
+   770→        new_speed = self._speed_cycle[self._speed_index]
+   771→        self._player.speed = new_speed
+   772→        self._speed_btn.setText(f"{new_speed:.1f}x")
+   773→        self.speed_changed.emit(new_speed)
+   774→
+   775→    def _on_waveform_click(self, position_percent: int) -> None:
+   776→        """Handle click on waveform to seek."""
+   777→        if self._voice_data.duration_ms > 0:
+   778→            position_ms = int(self._voice_data.duration_ms * position_percent / 100)
+   779→            self._player.seek(position_ms)
+   780→
+   781→    def _on_position_update(self, position_ms: int) -> None:
+   782→        """Update waveform progress and duration label."""
+   783→        if self._voice_data.duration_ms > 0:
+   784→            progress = position_ms / self._voice_data.duration_ms
+   785→            self._waveform.set_progress(progress)
+   786→
+   787→        remaining = max(0, (self._voice_data.duration_ms - position_ms) / 1000)
+   788→        self._duration_label.setText(
+   789→            f"-{int(remaining // 60)}:{int(remaining % 60):02d}"
+   790→        )
+   791→
+   792→    def _on_playback_end(self) -> None:
+   793→        """Reset UI when playback finishes."""
+   794→        self._play_btn.setText("▶")
+   795→        self._waveform.set_progress(0.0)
+   796→        duration_sec = self._voice_data.duration_ms / 1000
+   797→        self._duration_label.setText(
+   798→            f"{int(duration_sec // 60)}:{int(duration_sec % 60):02d}"
+   799→        )
+   800→

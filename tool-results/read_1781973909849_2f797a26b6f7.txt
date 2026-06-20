@@ -1,0 +1,808 @@
+     1→"""Group Voice/Video Calls for Presidium — P2P SFU architecture.
+     2→
+     3→Implements group calls using a hybrid mesh/SFU topology:
+     4→    - Mesh (all-to-all): 2-3 participants — lowest latency, no single point
+     5→    - SFU (host forwards): 4-16 participants — host acts as Selective
+     6→      Forwarding Unit, receiving all streams and selectively forwarding
+     7→      to each participant based on bandwidth and subscription.
+     8→
+     9→SFU model (P2P, no central server):
+    10→    The call initiator becomes the "host" and runs a lightweight SFU:
+    11→    1. All participants send their media stream to the host
+    12→    2. Host selectively forwards streams to each participant
+    13→    3. Host does NOT mix/encode — only forwards encoded packets
+    14→    4. Each participant receives only the streams they subscribe to
+    15→
+    16→Simulcast:
+    17→    Each sender encodes 3 quality layers:
+    18→    - Low:  320x180 @ 15fps, 150 kbps
+    19→    - Mid:  640x360 @ 24fps, 400 kbps
+    20→    - High: 1280x720 @ 30fps, 800 kbps
+    21→    The SFU switches layers based on receiver bandwidth.
+    22→
+    23→Signaling:
+    24→    All signaling uses the existing P2P transport with new
+    25→    GROUP_CALL_* message types for offer/answer/ICE/candidate exchange.
+    26→
+    27→Limits:
+    28→    - Maximum 16 participants per call
+    29→    - Video: up to 720p per participant (bandwidth constrained)
+    30→    - Audio: OPUS codec, 48kHz, mono
+    31→    - Screen share: one participant at a time
+    32→
+    33→Call state machine:
+    34→    IDLE → RINGING → JOINING → CONNECTED → LEAVING → IDLE
+    35→"""
+    36→
+    37→from __future__ import annotations
+    38→
+    39→import asyncio
+    40→import enum
+    41→import logging
+    42→import os
+    43→import time
+    44→import uuid
+    45→from dataclasses import dataclass, field
+    46→from typing import Any, Awaitable, Callable, Optional
+    47→
+    48→from presidium.core.network.protocol import MessageType
+    49→
+    50→logger = logging.getLogger(__name__)
+    51→
+    52→
+    53→# ---------------------------------------------------------------------------
+    54→# Constants
+    55→# ---------------------------------------------------------------------------
+    56→
+    57→MAX_PARTICIPANTS = 16
+    58→MESH_THRESHOLD = 3  # Use mesh for <= 3 participants, SFU for > 3
+    59→
+    60→# Simulcast layers
+    61→SIMULCAST_LOW = {"width": 320, "height": 180, "fps": 15, "bitrate": 150_000}
+    62→SIMULCAST_MID = {"width": 640, "height": 360, "fps": 24, "bitrate": 400_000}
+    63→SIMULCAST_HIGH = {"width": 1280, "height": 720, "fps": 30, "bitrate": 800_000}
+    64→
+    65→# Audio codec
+    66→AUDIO_CODEC = "opus"
+    67→AUDIO_SAMPLE_RATE = 48000
+    68→AUDIO_CHANNELS = 1
+    69→
+    70→# Call timeout
+    71→RING_TIMEOUT_SECONDS = 30
+    72→CALL_KEEPALIVE_SECONDS = 15
+    73→
+    74→
+    75→# ---------------------------------------------------------------------------
+    76→# Call state machine
+    77→# ---------------------------------------------------------------------------
+    78→
+    79→class CallState(enum.IntEnum):
+    80→    """State of a group call."""
+    81→    IDLE = 0
+    82→    RINGING = 1
+    83→    JOINING = 2
+    84→    CONNECTED = 3
+    85→    RECONNECTING = 4
+    86→    LEAVING = 5
+    87→    ENDED = 6
+    88→
+    89→
+    90→class CallTopology(enum.IntEnum):
+    91→    """Call network topology."""
+    92→    MESH = 0    # All-to-all (2-3 participants)
+    93→    SFU = 1     # Host-based forwarding (4-16 participants)
+    94→
+    95→
+    96→class MediaState(enum.IntEnum):
+    97→    """Participant media state."""
+    98→    OFF = 0
+    99→    ON = 1
+   100→    MUTED = 2      # Audio muted
+   101→    PAUSED = 3     # Video paused
+   102→
+   103→
+   104→# ---------------------------------------------------------------------------
+   105→# Participant model
+   106→# ---------------------------------------------------------------------------
+   107→
+   108→@dataclass
+   109→class CallParticipant:
+   110→    """A participant in a group call."""
+   111→    user_id: str = ""
+   112→    display_name: str = ""
+   113→    is_host: bool = False
+   114→    audio_state: MediaState = MediaState.OFF
+   115→    video_state: MediaState = MediaState.OFF
+   116→    screen_share: bool = False
+   117→    is_raising_hand: bool = False
+   118→    joined_at: float = 0.0
+   119→    last_seen: float = 0.0
+   120→    connection_quality: float = 1.0  # 0.0-1.0
+   121→
+   122→    # WebRTC peer connection (set at runtime)
+   123→    peer_connection: Any = None  # aiortc.RTCPeerConnection
+   124→
+   125→    # Simulcast subscription (which quality layer this participant receives)
+   126→    subscribed_quality: str = "mid"  # "low" | "mid" | "high"
+   127→
+   128→    @property
+   129→    def is_active(self) -> bool:
+   130→        """Check if the participant is still connected."""
+   131→        return self.audio_state != MediaState.OFF or self.video_state != MediaState.OFF
+   132→
+   133→
+   134→# ---------------------------------------------------------------------------
+   135→# Call session
+   136→# ---------------------------------------------------------------------------
+   137→
+   138→@dataclass
+   139→class GroupCallSession:
+   140→    """Represents an active group call session."""
+   141→    call_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
+   142→    group_id: str = ""          # Associated group chat ID
+   143→    host_user_id: str = ""      # Call initiator / SFU host
+   144→    topology: CallTopology = CallTopology.MESH
+   145→    state: CallState = CallState.IDLE
+   146→    participants: dict[str, CallParticipant] = field(default_factory=dict)
+   147→    created_at: float = field(default_factory=time.time)
+   148→    started_at: float = 0.0
+   149→    ended_at: float = 0.0
+   150→    is_recording: bool = False
+   151→    is_screen_sharing: bool = False
+   152→    screen_sharer_id: str = ""
+   153→
+   154→    @property
+   155→    def participant_count(self) -> int:
+   156→        return len(self.participants)
+   157→
+   158→    @property
+   159→    def is_full(self) -> bool:
+   160→        return self.participant_count >= MAX_PARTICIPANTS
+   161→
+   162→    @property
+   163→    def is_host(self) -> bool:
+   164→        """True if the local user is the call host."""
+   165→        return False  # Set by GroupCallManager
+   166→
+   167→    def add_participant(self, participant: CallParticipant) -> None:
+   168→        """Add a participant to the call."""
+   169→        if self.is_full:
+   170→            raise GroupCallError("Call is full (max 16 participants).")
+   171→        self.participants[participant.user_id] = participant
+   172→
+   173→    def remove_participant(self, user_id: str) -> Optional[CallParticipant]:
+   174→        """Remove a participant from the call."""
+   175→        return self.participants.pop(user_id, None)
+   176→
+   177→    def get_participant(self, user_id: str) -> Optional[CallParticipant]:
+   178→        """Get a participant by user ID."""
+   179→        return self.participants.get(user_id)
+   180→
+   181→    def get_active_speakers(self) -> list[CallParticipant]:
+   182→        """Get participants with audio enabled (potential speakers)."""
+   183→        return [
+   184→            p for p in self.participants.values()
+   185→            if p.audio_state == MediaState.ON
+   186→        ]
+   187→
+   188→    def determine_topology(self) -> CallTopology:
+   189→        """Determine the appropriate topology based on participant count."""
+   190→        if self.participant_count <= MESH_THRESHOLD:
+   191→            return CallTopology.MESH
+   192→        return CallTopology.SFU
+   193→
+   194→
+   195→# ---------------------------------------------------------------------------
+   196→# Signaling messages
+   197→# ---------------------------------------------------------------------------
+   198→
+   199→class GroupCallSignal:
+   200→    """Creates signaling messages for group call setup."""
+   201→
+   202→    @staticmethod
+   203→    def create_offer(
+   204→        call_id: str,
+   205→        group_id: str,
+   206→        host_user_id: str,
+   207→        sdp: str,
+   208→        media_types: list[str] | None = None,
+   209→    ) -> dict[str, Any]:
+   210→        """Create a GROUP_CALL_OFFER signal."""
+   211→        return {
+   212→            "type": "GROUP_CALL_OFFER",
+   213→            "call_id": call_id,
+   214→            "group_id": group_id,
+   215→            "host_user_id": host_user_id,
+   216→            "sdp": sdp,
+   217→            "media_types": media_types or ["audio"],
+   218→            "max_participants": MAX_PARTICIPANTS,
+   219→            "timestamp": time.time(),
+   220→        }
+   221→
+   222→    @staticmethod
+   223→    def create_answer(
+   224→        call_id: str,
+   225→        sdp: str,
+   226→    ) -> dict[str, Any]:
+   227→        """Create a GROUP_CALL_ANSWER signal."""
+   228→        return {
+   229→            "type": "GROUP_CALL_ANSWER",
+   230→            "call_id": call_id,
+   231→            "sdp": sdp,
+   232→            "timestamp": time.time(),
+   233→        }
+   234→
+   235→    @staticmethod
+   236→    def create_ice_candidate(
+   237→        call_id: str,
+   238→        candidate: str,
+   239→        sdp_mid: str = "",
+   240→        sdp_mline_index: int = 0,
+   241→    ) -> dict[str, Any]:
+   242→        """Create a GROUP_CALL_ICE_CANDIDATE signal."""
+   243→        return {
+   244→            "type": "GROUP_CALL_ICE_CANDIDATE",
+   245→            "call_id": call_id,
+   246→            "candidate": candidate,
+   247→            "sdp_mid": sdp_mid,
+   248→            "sdp_mline_index": sdp_mline_index,
+   249→        }
+   250→
+   251→    @staticmethod
+   252→    def create_join(call_id: str, user_id: str) -> dict[str, Any]:
+   253→        """Create a GROUP_CALL_JOIN signal."""
+   254→        return {
+   255→            "type": "GROUP_CALL_JOIN",
+   256→            "call_id": call_id,
+   257→            "user_id": user_id,
+   258→            "timestamp": time.time(),
+   259→        }
+   260→
+   261→    @staticmethod
+   262→    def create_leave(call_id: str, user_id: str, reason: str = "") -> dict[str, Any]:
+   263→        """Create a GROUP_CALL_LEAVE signal."""
+   264→        return {
+   265→            "type": "GROUP_CALL_LEAVE",
+   266→            "call_id": call_id,
+   267→            "user_id": user_id,
+   268→            "reason": reason,
+   269→            "timestamp": time.time(),
+   270→        }
+   271→
+   272→    @staticmethod
+   273→    def create_media_update(
+   274→        call_id: str,
+   275→        user_id: str,
+   276→        audio: MediaState = MediaState.OFF,
+   277→        video: MediaState = MediaState.OFF,
+   278→        screen_share: bool = False,
+   279→    ) -> dict[str, Any]:
+   280→        """Create a GROUP_CALL_MEDIA_UPDATE signal."""
+   281→        return {
+   282→            "type": "GROUP_CALL_MEDIA_UPDATE",
+   283→            "call_id": call_id,
+   284→            "user_id": user_id,
+   285→            "audio": audio.value,
+   286→            "video": video.value,
+   287→            "screen_share": screen_share,
+   288→            "timestamp": time.time(),
+   289→        }
+   290→
+   291→    @staticmethod
+   292→    def create_raise_hand(call_id: str, user_id: str, raised: bool) -> dict[str, Any]:
+   293→        """Create a GROUP_CALL_RAISE_HAND signal."""
+   294→        return {
+   295→            "type": "GROUP_CALL_RAISE_HAND",
+   296→            "call_id": call_id,
+   297→            "user_id": user_id,
+   298→            "raised": raised,
+   299→        }
+   300→
+   301→    @staticmethod
+   302→    def create_sfu_subscribe(
+   303→        call_id: str,
+   304→        user_id: str,
+   305→        target_user_id: str,
+   306→        quality: str = "mid",
+   307→    ) -> dict[str, Any]:
+   308→        """Create a GROUP_CALL_SFU_SUBSCRIBE signal.
+   309→
+   310→        Tells the SFU host which quality layer to forward.
+   311→        """
+   312→        return {
+   313→            "type": "GROUP_CALL_SFU_SUBSCRIBE",
+   314→            "call_id": call_id,
+   315→            "user_id": user_id,
+   316→            "target_user_id": target_user_id,
+   317→            "quality": quality,
+   318→        }
+   319→
+   320→
+   321→# ---------------------------------------------------------------------------
+   322→# Group call manager
+   323→# ---------------------------------------------------------------------------
+   324→
+   325→class GroupCallManager:
+   326→    """Manages group voice/video calls for Presidium.
+   327→
+   328→    Handles call creation, participant management, WebRTC signaling,
+   329→    topology switching (mesh/SFU), and media control.
+   330→
+   331→    Usage:
+   332→        manager = GroupCallManager(local_user_id="alice")
+   333→        manager.set_signaling_callback(lambda peer_id, msg: transport.send(...))
+   334→        await manager.start_call(group_id="group123")
+   335→    """
+   336→
+   337→    def __init__(self, local_user_id: str) -> None:
+   338→        self._local_user_id = local_user_id
+   339→        self._active_calls: dict[str, GroupCallSession] = {}
+   340→
+   341→        # Callbacks
+   342→        self._signaling_callback: Optional[
+   343→            Callable[[str, dict[str, Any]], Awaitable[None]]
+   344→        ] = None
+   345→        self._on_call_state_changed: Optional[
+   346→            Callable[[GroupCallSession], Awaitable[None]]
+   347→        ] = None
+   348→        self._on_participant_joined: Optional[
+   349→            Callable[[GroupCallSession, CallParticipant], Awaitable[None]]
+   350→        ] = None
+   351→        self._on_participant_left: Optional[
+   352→            Callable[[GroupCallSession, str], Awaitable[None]]
+   353→        ] = None
+   354→        self._on_media_changed: Optional[
+   355→            Callable[[GroupCallSession, CallParticipant], Awaitable[None]]
+   356→        ] = None
+   357→        self._on_active_speaker_changed: Optional[
+   358→            Callable[[GroupCallSession, str], Awaitable[None]]
+   359→        ] = None
+   360→
+   361→        # Audio level tracking for speaker detection
+   362→        self._audio_levels: dict[str, float] = {}
+   363→
+   364→    # -------------------------------------------------------------------
+   365→    # Callback setters
+   366→    # -------------------------------------------------------------------
+   367→
+   368→    def set_signaling_callback(
+   369→        self, callback: Callable[[str, dict[str, Any]], Awaitable[None]]
+   370→    ) -> None:
+   371→        """Set callback for sending signaling messages to peers."""
+   372→        self._signaling_callback = callback
+   373→
+   374→    def set_on_call_state_changed(
+   375→        self, callback: Callable[[GroupCallSession], Awaitable[None]]
+   376→    ) -> None:
+   377→        self._on_call_state_changed = callback
+   378→
+   379→    def set_on_participant_joined(
+   380→        self, callback: Callable[[GroupCallSession, CallParticipant], Awaitable[None]]
+   381→    ) -> None:
+   382→        self._on_participant_joined = callback
+   383→
+   384→    def set_on_participant_left(
+   385→        self, callback: Callable[[GroupCallSession, str], Awaitable[None]]
+   386→    ) -> None:
+   387→        self._on_participant_left = callback
+   388→
+   389→    def set_on_media_changed(
+   390→        self, callback: Callable[[GroupCallSession, CallParticipant], Awaitable[None]]
+   391→    ) -> None:
+   392→        self._on_media_changed = callback
+   393→
+   394→    def set_on_active_speaker_changed(
+   395→        self, callback: Callable[[GroupCallSession, str], Awaitable[None]]
+   396→    ) -> None:
+   397→        self._on_active_speaker_changed = callback
+   398→
+   399→    # -------------------------------------------------------------------
+   400→    # Call lifecycle
+   401→    # -------------------------------------------------------------------
+   402→
+   403→    async def start_call(
+   404→        self,
+   405→        group_id: str,
+   406→        participants: list[str],
+   407→        with_video: bool = False,
+   408→        with_screen_share: bool = False,
+   409→    ) -> GroupCallSession:
+   410→        """Initiate a group call.
+   411→
+   412→        Args:
+   413→            group_id: The group chat ID this call belongs to.
+   414→            participants: List of user_ids to invite.
+   415→            with_video: Whether to start with video enabled.
+   416→            with_screen_share: Whether to start with screen sharing.
+   417→
+   418→        Returns:
+   419→            The created GroupCallSession.
+   420→        """
+   421→        if len(participants) + 1 > MAX_PARTICIPANTS:
+   422→            raise GroupCallError(
+   423→                f"Too many participants: {len(participants) + 1} > {MAX_PARTICIPANTS}."
+   424→            )
+   425→
+   426→        session = GroupCallSession(
+   427→            group_id=group_id,
+   428→            host_user_id=self._local_user_id,
+   429→            state=CallState.RINGING,
+   430→        )
+   431→
+   432→        # Determine topology
+   433→        session.topology = session.determine_topology()
+   434→
+   435→        # Add self as host participant
+   436→        host = CallParticipant(
+   437→            user_id=self._local_user_id,
+   438→            is_host=True,
+   439→            audio_state=MediaState.ON,
+   440→            video_state=MediaState.ON if with_video else MediaState.OFF,
+   441→            screen_share=with_screen_share,
+   442→            joined_at=time.time(),
+   443→        )
+   444→        session.add_participant(host)
+   445→
+   446→        # Create WebRTC offer (aiortc)
+   447→        sdp = await self._create_webrtc_offer(session)
+   448→
+   449→        # Send invites to all participants
+   450→        for peer_id in participants:
+   451→            signal = GroupCallSignal.create_offer(
+   452→                call_id=session.call_id,
+   453→                group_id=group_id,
+   454→                host_user_id=self._local_user_id,
+   455→                sdp=sdp,
+   456→                media_types=["audio"] + (["video"] if with_video else []),
+   457→            )
+   458→            await self._send_signal(peer_id, signal)
+   459→
+   460→        self._active_calls[session.call_id] = session
+   461→
+   462→        if self._on_call_state_changed:
+   463→            await self._on_call_state_changed(session)
+   464→
+   465→        logger.info(
+   466→            "Group call started: %s (%s, %d invited)",
+   467→            session.call_id, session.topology.name, len(participants),
+   468→        )
+   469→        return session
+   470→
+   471→    async def join_call(
+   472→        self,
+   473→        call_id: str,
+   474→        group_id: str,
+   475→        host_user_id: str,
+   476→        sdp_offer: str,
+   477→    ) -> GroupCallSession:
+   478→        """Join an existing group call.
+   479→
+   480→        Args:
+   481→            call_id: The call ID from the offer.
+   482→            group_id: The group chat ID.
+   483→            host_user_id: The call host's user ID.
+   484→            sdp_offer: The WebRTC SDP offer.
+   485→
+   486→        Returns:
+   487→            The joined GroupCallSession.
+   488→        """
+   489→        if call_id in self._active_calls:
+   490→            return self._active_calls[call_id]
+   491→
+   492→        session = GroupCallSession(
+   493→            call_id=call_id,
+   494→            group_id=group_id,
+   495→            host_user_id=host_user_id,
+   496→            state=CallState.JOINING,
+   497→        )
+   498→
+   499→        # Add host participant
+   500→        host = CallParticipant(
+   501→            user_id=host_user_id,
+   502→            is_host=True,
+   503→            audio_state=MediaState.ON,
+   504→            joined_at=time.time(),
+   505→        )
+   506→        session.add_participant(host)
+   507→
+   508→        # Add self
+   509→        self_participant = CallParticipant(
+   510→            user_id=self._local_user_id,
+   511→            is_host=False,
+   512→            audio_state=MediaState.ON,
+   513→            joined_at=time.time(),
+   514→        )
+   515→        session.add_participant(self_participant)
+   516→
+   517→        # Create WebRTC answer
+   518→        sdp_answer = await self._create_webrtc_answer(session, sdp_offer)
+   519→
+   520→        # Send answer to host
+   521→        signal = GroupCallSignal.create_answer(
+   522→            call_id=call_id,
+   523→            sdp=sdp_answer,
+   524→        )
+   525→        await self._send_signal(host_user_id, signal)
+   526→
+   527→        session.state = CallState.CONNECTED
+   528→        session.started_at = time.time()
+   529→        self._active_calls[call_id] = session
+   530→
+   531→        if self._on_participant_joined:
+   532→            await self._on_participant_joined(session, self_participant)
+   533→        if self._on_call_state_changed:
+   534→            await self._on_call_state_changed(session)
+   535→
+   536→        logger.info("Joined group call %s", call_id)
+   537→        return session
+   538→
+   539→    async def leave_call(self, call_id: str, reason: str = "") -> None:
+   540→        """Leave an active group call."""
+   541→        session = self._active_calls.get(call_id)
+   542→        if session is None:
+   543→            return
+   544→
+   545→        session.state = CallState.LEAVING
+   546→
+   547→        # Notify all participants
+   548→        signal = GroupCallSignal.create_leave(
+   549→            call_id=call_id,
+   550→            user_id=self._local_user_id,
+   551→            reason=reason,
+   552→        )
+   553→        for participant_id in session.participants:
+   554→            if participant_id != self._local_user_id:
+   555→                await self._send_signal(participant_id, signal)
+   556→
+   557→        # Close all WebRTC connections
+   558→        for participant in session.participants.values():
+   559→            if participant.peer_connection:
+   560→                await participant.peer_connection.close()
+   561→
+   562→        # Remove self from session
+   563→        session.remove_participant(self._local_user_id)
+   564→
+   565→        # If host left and still participants, transfer host
+   566→        if session.host_user_id == self._local_user_id and session.participants:
+   567→            new_host_id = next(iter(session.participants))
+   568→            session.host_user_id = new_host_id
+   569→            session.participants[new_host_id].is_host = True
+   570→            logger.info("Host transferred to %s", new_host_id[:8])
+   571→        elif not session.participants:
+   572→            session.state = CallState.ENDED
+   573→            session.ended_at = time.time()
+   574→
+   575→        if session.state == CallState.ENDED:
+   576→            del self._active_calls[call_id]
+   577→
+   578→        if self._on_call_state_changed:
+   579→            await self._on_call_state_changed(session)
+   580→
+   581→        logger.info("Left group call %s", call_id)
+   582→
+   583→    # -------------------------------------------------------------------
+   584→    # Media control
+   585→    # -------------------------------------------------------------------
+   586→
+   587→    async def toggle_audio(self, call_id: str) -> MediaState:
+   588→        """Toggle audio on/off for the local user."""
+   589→        session = self._active_calls.get(call_id)
+   590→        if session is None:
+   591→            return MediaState.OFF
+   592→
+   593→        participant = session.get_participant(self._local_user_id)
+   594→        if participant is None:
+   595→            return MediaState.OFF
+   596→
+   597→        # Toggle
+   598→        if participant.audio_state == MediaState.ON:
+   599→            participant.audio_state = MediaState.MUTED
+   600→        else:
+   601→            participant.audio_state = MediaState.ON
+   602→
+   603→        # Notify participants
+   604→        await self._broadcast_media_update(session, participant)
+   605→        return participant.audio_state
+   606→
+   607→    async def toggle_video(self, call_id: str) -> MediaState:
+   608→        """Toggle video on/off for the local user."""
+   609→        session = self._active_calls.get(call_id)
+   610→        if session is None:
+   611→            return MediaState.OFF
+   612→
+   613→        participant = session.get_participant(self._local_user_id)
+   614→        if participant is None:
+   615→            return MediaState.OFF
+   616→
+   617→        if participant.video_state == MediaState.ON:
+   618→            participant.video_state = MediaState.OFF
+   619→        else:
+   620→            participant.video_state = MediaState.ON
+   621→
+   622→        await self._broadcast_media_update(session, participant)
+   623→        return participant.video_state
+   624→
+   625→    async def toggle_screen_share(self, call_id: str) -> bool:
+   626→        """Toggle screen sharing for the local user."""
+   627→        session = self._active_calls.get(call_id)
+   628→        if session is None:
+   629→            return False
+   630→
+   631→        participant = session.get_participant(self._local_user_id)
+   632→        if participant is None:
+   633→            return False
+   634→
+   635→        # Only one screen share at a time
+   636→        if not participant.screen_share and session.is_screen_sharing:
+   637→            raise GroupCallError("Another participant is already sharing their screen.")
+   638→
+   639→        participant.screen_share = not participant.screen_share
+   640→        session.is_screen_sharing = participant.screen_share
+   641→        session.screen_sharer_id = self._local_user_id if participant.screen_share else ""
+   642→
+   643→        await self._broadcast_media_update(session, participant)
+   644→        return participant.screen_share
+   645→
+   646→    async def raise_hand(self, call_id: str, raised: bool = True) -> None:
+   647→        """Raise or lower hand."""
+   648→        session = self._active_calls.get(call_id)
+   649→        if session is None:
+   650→            return
+   651→
+   652→        participant = session.get_participant(self._local_user_id)
+   653→        if participant:
+   654→            participant.is_raising_hand = raised
+   655→
+   656→        signal = GroupCallSignal.create_raise_hand(call_id, self._local_user_id, raised)
+   657→        for peer_id in session.participants:
+   658→            if peer_id != self._local_user_id:
+   659→                await self._send_signal(peer_id, signal)
+   660→
+   661→    # -------------------------------------------------------------------
+   662→    # Speaker detection
+   663→    # -------------------------------------------------------------------
+   664→
+   665→    def update_audio_level(self, call_id: str, user_id: str, level: float) -> None:
+   666→        """Update the audio level for a participant (VU meter).
+   667→
+   668→        Args:
+   669→            call_id: Active call ID.
+   670→            user_id: Participant user ID.
+   671→            level: Audio level 0.0-1.0.
+   672→        """
+   673→        self._audio_levels[user_id] = level
+   674→
+   675→    def get_active_speaker(self, call_id: str) -> Optional[str]:
+   676→        """Get the user_id of the current active speaker."""
+   677→        if not self._audio_levels:
+   678→            return None
+   679→        return max(self._audio_levels, key=self._audio_levels.get)  # type: ignore[arg-type]
+   680→
+   681→    # -------------------------------------------------------------------
+   682→    # Signaling handler
+   683→    # -------------------------------------------------------------------
+   684→
+   685→    async def handle_signal(self, sender_id: str, signal: dict[str, Any]) -> None:
+   686→        """Handle an incoming group call signal."""
+   687→        signal_type = signal.get("type", "")
+   688→        call_id = signal.get("call_id", "")
+   689→
+   690→        if signal_type == "GROUP_CALL_OFFER":
+   691→            await self.join_call(
+   692→                call_id=call_id,
+   693→                group_id=signal.get("group_id", ""),
+   694→                host_user_id=signal.get("host_user_id", ""),
+   695→                sdp_offer=signal.get("sdp", ""),
+   696→            )
+   697→
+   698→        elif signal_type == "GROUP_CALL_ANSWER":
+   699→            session = self._active_calls.get(call_id)
+   700→            if session:
+   701→                participant = session.get_participant(sender_id)
+   702→                if participant:
+   703→                    participant.audio_state = MediaState.ON
+   704→                    if self._on_participant_joined:
+   705→                        await self._on_participant_joined(session, participant)
+   706→
+   707→        elif signal_type == "GROUP_CALL_LEAVE":
+   708→            session = self._active_calls.get(call_id)
+   709→            if session:
+   710→                removed = session.remove_participant(sender_id)
+   711→                if removed and self._on_participant_left:
+   712→                    await self._on_participant_left(session, sender_id)
+   713→
+   714→        elif signal_type == "GROUP_CALL_MEDIA_UPDATE":
+   715→            session = self._active_calls.get(call_id)
+   716→            if session:
+   717→                participant = session.get_participant(sender_id)
+   718→                if participant:
+   719→                    participant.audio_state = MediaState(signal.get("audio", 0))
+   720→                    participant.video_state = MediaState(signal.get("video", 0))
+   721→                    participant.screen_share = signal.get("screen_share", False)
+   722→                    if self._on_media_changed:
+   723→                        await self._on_media_changed(session, participant)
+   724→
+   725→        elif signal_type == "GROUP_CALL_RAISE_HAND":
+   726→            session = self._active_calls.get(call_id)
+   727→            if session:
+   728→                participant = session.get_participant(sender_id)
+   729→                if participant:
+   730→                    participant.is_raising_hand = signal.get("raised", False)
+   731→
+   732→        elif signal_type == "GROUP_CALL_ICE_CANDIDATE":
+   733→            # Forward ICE candidate to the appropriate peer connection
+   734→            pass  # WebRTC handles this
+   735→
+   736→    # -------------------------------------------------------------------
+   737→    # Internal helpers
+   738→    # -------------------------------------------------------------------
+   739→
+   740→    async def _broadcast_media_update(
+   741→        self, session: GroupCallSession, participant: CallParticipant
+   742→    ) -> None:
+   743→        """Broadcast media state change to all participants."""
+   744→        signal = GroupCallSignal.create_media_update(
+   745→            call_id=session.call_id,
+   746→            user_id=participant.user_id,
+   747→            audio=participant.audio_state,
+   748→            video=participant.video_state,
+   749→            screen_share=participant.screen_share,
+   750→        )
+   751→        for peer_id in session.participants:
+   752→            if peer_id != self._local_user_id:
+   753→                await self._send_signal(peer_id, signal)
+   754→
+   755→        if self._on_media_changed:
+   756→            await self._on_media_changed(session, participant)
+   757→
+   758→    async def _send_signal(self, peer_id: str, signal: dict[str, Any]) -> None:
+   759→        """Send a signaling message to a peer."""
+   760→        if self._signaling_callback:
+   761→            try:
+   762→                await self._signaling_callback(peer_id, signal)
+   763→            except Exception as exc:
+   764→                logger.error("Failed to send signal to %s: %s", peer_id[:8], exc)
+   765→
+   766→    async def _create_webrtc_offer(self, session: GroupCallSession) -> str:
+   767→        """Create a WebRTC SDP offer.
+   768→
+   769→        In a full implementation, this uses aiortc to create a
+   770→        RTCPeerConnection with audio/video tracks.
+   771→        """
+   772→        # Placeholder — actual implementation uses aiortc
+   773→        return f"v=0\r\no=- {int(time.time())} 1 IN IP4 0.0.0.0\r\ns=Presidium Group Call\r\nt=0 0\r\n"
+   774→
+   775→    async def _create_webrtc_answer(
+   776→        self, session: GroupCallSession, offer: str
+   777→    ) -> str:
+   778→        """Create a WebRTC SDP answer."""
+   779→        return f"v=0\r\no=- {int(time.time())} 1 IN IP4 0.0.0.0\r\ns=Presidium Group Call Answer\r\nt=0 0\r\n"
+   780→
+   781→    # -------------------------------------------------------------------
+   782→    # Query methods
+   783→    # -------------------------------------------------------------------
+   784→
+   785→    def get_call(self, call_id: str) -> Optional[GroupCallSession]:
+   786→        """Get an active call by ID."""
+   787→        return self._active_calls.get(call_id)
+   788→
+   789→    def get_active_calls(self) -> list[GroupCallSession]:
+   790→        """Get all active calls."""
+   791→        return list(self._active_calls.values())
+   792→
+   793→
+   794→# ---------------------------------------------------------------------------
+   795→# Exceptions
+   796→# ---------------------------------------------------------------------------
+   797→
+   798→class GroupCallError(Exception):
+   799→    """Base exception for group call operations."""
+   800→
+   801→
+   802→class CallFullError(GroupCallError):
+   803→    """Call has reached maximum participants."""
+   804→
+   805→
+   806→class ScreenShareConflictError(GroupCallError):
+   807→    """Another participant is already sharing screen."""
+   808→

@@ -1,0 +1,783 @@
+     1→"""Multi-Device v2 for Presidium — seamless cross-device experience.
+     2→
+     3→Implements perfect forward secrecy between a user's own devices using
+     4→X3DH + Double Ratchet, with CRDT-based sync for message states and
+     5→seamless handoff for calls and drafts.
+     6→
+     7→Architecture:
+     8→    Each device has its own X25519 prekey bundle, signed by the
+     9→    master Ed25519 identity key. Devices authenticate each other
+    10→    through the master key signature chain.
+    11→
+    12→    Device registration flow:
+    13→        1. New device generates X25519 + Ed25519 key pair
+    14→        2. Signs its public keys with the master identity key
+    15→        3. Sends DEVICE_REGISTER to an already-authorized device
+    16→        4. Authorized device verifies signature and approves
+    17→        5. New device receives encrypted history sync
+    18→
+    19→    Sync protocol:
+    20→        - SYNC_MESSAGE type carries encrypted state updates
+    21→        - Each device pair has its own Double Ratchet session
+    22→        - CRDT for message status (read/delivered) merges conflicts
+    23→        - Last-write-wins for settings/preferences
+    24→        - Draft sync for message composition handoff
+    25→
+    26→    Call handoff:
+    27→        - Incoming call rings on ALL authorized devices
+    28→        - Answer on one device → others go silent
+    29→        - Active call can be transferred between devices
+    30→
+    31→CRDT implementation:
+    32→    Uses G-Counter (grow-only counter) for read receipts and
+    33→    LWW-Register (Last-Write-Wins) for settings. Message delivery
+    34→    status uses OR-Set (Observed-Remove Set) for idempotent merges.
+    35→"""
+    36→
+    37→from __future__ import annotations
+    38→
+    39→import asyncio
+    40→import enum
+    41→import hashlib
+    42→import json
+    43→import logging
+    44→import os
+    45→import struct
+    46→import time
+    47→import uuid
+    48→from dataclasses import dataclass, field
+    49→from typing import Any, Awaitable, Callable, Optional
+    50→
+    51→from presidium.core.crypto import (
+    52→    AES256GCM,
+    53→    CryptoError,
+    54→    Ed25519KeyPair,
+    55→    SecureBytes,
+    56→    X25519KeyPair,
+    57→    compute_user_id,
+    58→    secure_zero,
+    59→)
+    60→
+    61→logger = logging.getLogger(__name__)
+    62→
+    63→
+    64→# ---------------------------------------------------------------------------
+    65→# Constants
+    66→# ---------------------------------------------------------------------------
+    67→
+    68→MAX_DEVICES_PER_USER = 5
+    69→SYNC_MESSAGE_VERSION = 1
+    70→DEVICE_KEY_SIGNATURE_PREFIX = b"presidium-device-v1:"
+    71→
+    72→
+    73→# ---------------------------------------------------------------------------
+    74→# Custom exceptions
+    75→# ---------------------------------------------------------------------------
+    76→
+    77→class MultiDeviceError(Exception):
+    78→    """Base exception for multi-device operations."""
+    79→
+    80→
+    81→class DeviceLimitError(MultiDeviceError):
+    82→    """Maximum number of devices reached."""
+    83→
+    84→
+    85→class DeviceNotAuthorizedError(MultiDeviceError):
+    86→    """Device is not authorized."""
+    87→
+    88→
+    89→class SyncError(MultiDeviceError):
+    90→    """Synchronization error."""
+    91→
+    92→
+    93→class CRDTMergeError(MultiDeviceError):
+    94→    """CRDT merge conflict error."""
+    95→
+    96→
+    97→# ---------------------------------------------------------------------------
+    98→# Device info
+    99→# ---------------------------------------------------------------------------
+   100→
+   101→class DeviceType(enum.Enum):
+   102→    """Type of device."""
+   103→    DESKTOP = "desktop"
+   104→    MOBILE = "mobile"
+   105→    TABLET = "tablet"
+   106→    WEB = "web"
+   107→    CLI = "cli"
+   108→
+   109→
+   110→@dataclass
+   111→class DeviceInfo:
+   112→    """Information about a registered device."""
+   113→    device_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+   114→    device_name: str = ""           # User-friendly name, e.g. "iPhone 16"
+   115→    device_type: DeviceType = DeviceType.DESKTOP
+   116→    x25519_public_key: bytes = b""  # 32 bytes
+   117→    ed25519_public_key: bytes = b""  # 32 bytes (device signing key)
+   118→    master_signature: bytes = b""   # Ed25519 signature from master key
+   119→    registered_at: float = field(default_factory=time.time)
+   120→    last_seen: float = field(default_factory=time.time)
+   121→    is_authorized: bool = False
+   122→    is_revoked: bool = False
+   123→
+   124→    def to_dict(self) -> dict[str, Any]:
+   125→        import base64
+   126→        return {
+   127→            "device_id": self.device_id,
+   128→            "device_name": self.device_name,
+   129→            "device_type": self.device_type.value,
+   130→            "x25519_public_key": base64.b64encode(self.x25519_public_key).decode(),
+   131→            "ed25519_public_key": base64.b64encode(self.ed25519_public_key).decode(),
+   132→            "master_signature": base64.b64encode(self.master_signature).decode(),
+   133→            "registered_at": self.registered_at,
+   134→            "last_seen": self.last_seen,
+   135→            "is_authorized": self.is_authorized,
+   136→            "is_revoked": self.is_revoked,
+   137→        }
+   138→
+   139→    @classmethod
+   140→    def from_dict(cls, data: dict[str, Any]) -> DeviceInfo:
+   141→        import base64
+   142→        return cls(
+   143→            device_id=data.get("device_id", ""),
+   144→            device_name=data.get("device_name", ""),
+   145→            device_type=DeviceType(data.get("device_type", "desktop")),
+   146→            x25519_public_key=base64.b64decode(data.get("x25519_public_key", "")),
+   147→            ed25519_public_key=base64.b64decode(data.get("ed25519_public_key", "")),
+   148→            master_signature=base64.b64decode(data.get("master_signature", "")),
+   149→            registered_at=data.get("registered_at", 0.0),
+   150→            last_seen=data.get("last_seen", 0.0),
+   151→            is_authorized=data.get("is_authorized", False),
+   152→            is_revoked=data.get("is_revoked", False),
+   153→        )
+   154→
+   155→    def compute_device_fingerprint(self) -> str:
+   156→        """Compute a human-readable fingerprint for this device."""
+   157→        raw = self.ed25519_public_key + self.x25519_public_key
+   158→        h = hashlib.sha256(raw).digest()
+   159→        groups = [h[i:i+2].hex().upper() for i in range(0, 8, 2)]
+   160→        return " ".join(groups)
+   161→
+   162→
+   163→# ---------------------------------------------------------------------------
+   164→# CRDT implementations
+   165→# ---------------------------------------------------------------------------
+   166→
+   167→class LWWRegister:
+   168→    """Last-Write-Wins Register CRDT.
+   169→
+   170→    For settings and preferences where the most recent value wins.
+   171→    Uses Lamport timestamp for ordering.
+   172→    """
+   173→
+   174→    def __init__(self, value: Any = None, timestamp: float = 0.0, device_id: str = "") -> None:
+   175→        self.value = value
+   176→        self.timestamp = timestamp
+   177→        self.device_id = device_id
+   178→
+   179→    def set(self, value: Any, timestamp: float, device_id: str) -> None:
+   180→        """Set a new value if the timestamp is newer."""
+   181→        if timestamp > self.timestamp or (
+   182→            timestamp == self.timestamp and device_id > self.device_id
+   183→        ):
+   184→            self.value = value
+   185→            self.timestamp = timestamp
+   186→            self.device_id = device_id
+   187→
+   188→    def merge(self, other: LWWRegister) -> None:
+   189→        """Merge with another LWW register."""
+   190→        if other.timestamp > self.timestamp or (
+   191→            other.timestamp == self.timestamp and other.device_id > self.device_id
+   192→        ):
+   193→            self.value = other.value
+   194→            self.timestamp = other.timestamp
+   195→            self.device_id = other.device_id
+   196→
+   197→    def to_dict(self) -> dict[str, Any]:
+   198→        return {
+   199→            "value": self.value,
+   200→            "timestamp": self.timestamp,
+   201→            "device_id": self.device_id,
+   202→        }
+   203→
+   204→
+   205→class GCounter:
+   206→    """Grow-Only Counter CRDT.
+   207→
+   208→    For read receipt tracking — each device increments its own counter,
+   209→    and the total is the sum of all device counters.
+   210→    """
+   211→
+   212→    def __init__(self) -> None:
+   213→        self._counts: dict[str, int] = {}  # device_id → count
+   214→
+   215→    def increment(self, device_id: str, amount: int = 1) -> None:
+   216→        """Increment this device's counter."""
+   217→        self._counts[device_id] = self._counts.get(device_id, 0) + amount
+   218→
+   219→    def value(self) -> int:
+   220→        """Get the total count across all devices."""
+   221→        return sum(self._counts.values())
+   222→
+   223→    def merge(self, other: GCounter) -> None:
+   224→        """Merge with another G-Counter (take max per device)."""
+   225→        for device_id, count in other._counts.items():
+   226→            self._counts[device_id] = max(
+   227→                self._counts.get(device_id, 0), count
+   228→            )
+   229→
+   230→    def to_dict(self) -> dict[str, int]:
+   231→        return dict(self._counts)
+   232→
+   233→
+   234→class ORSet:
+   235→    """Observed-Remove Set CRDT.
+   236→
+   237→    For message delivery status — each status update is uniquely tagged
+   238→    and can be merged without conflicts. Removing requires observing
+   239→    the element first (tombstone approach).
+   240→    """
+   241→
+   242→    def __init__(self) -> None:
+   243→        self._elements: dict[str, set[str]] = {}   # element → set of unique tags
+   244→        self._tombstones: set[str] = set()          # removed tags
+   245→
+   246→    def add(self, element: str, tag: str) -> None:
+   247→        """Add an element with a unique tag."""
+   248→        if tag not in self._tombstones:
+   249→            if element not in self._elements:
+   250→                self._elements[element] = set()
+   251→            self._elements[element].add(tag)
+   252→
+   253→    def remove(self, element: str) -> None:
+   254→        """Remove an element (tombstones all current tags)."""
+   255→        tags = self._elements.pop(element, set())
+   256→        self._tombstones.update(tags)
+   257→
+   258→    def contains(self, element: str) -> bool:
+   259→        """Check if an element is in the set."""
+   260→        return element in self._elements and len(self._elements[element]) > 0
+   261→
+   262→    def merge(self, other: ORSet) -> None:
+   263→        """Merge with another OR-Set."""
+   264→        # Merge elements
+   265→        for element, tags in other._elements.items():
+   266→            if element not in self._elements:
+   267→                self._elements[element] = set()
+   268→            self._elements[element].update(tags - self._tombstones)
+   269→
+   270→        # Merge tombstones
+   271→        self._tombstones.update(other._tombstones)
+   272→
+   273→        # Remove tombstoned elements
+   274→        to_remove = []
+   275→        for element, tags in self._elements.items():
+   276→            remaining = tags - self._tombstones
+   277→            if remaining:
+   278→                self._elements[element] = remaining
+   279→            else:
+   280→                to_remove.append(element)
+   281→        for element in to_remove:
+   282→            del self._elements[element]
+   283→
+   284→    def elements(self) -> set[str]:
+   285→        """Get all elements in the set."""
+   286→        return set(self._elements.keys())
+   287→
+   288→    def to_dict(self) -> dict[str, Any]:
+   289→        return {
+   290→            "elements": {k: list(v) for k, v in self._elements.items()},
+   291→            "tombstones": list(self._tombstones),
+   292→        }
+   293→
+   294→
+   295→# ---------------------------------------------------------------------------
+   296→# Sync message types
+   297→# ---------------------------------------------------------------------------
+   298→
+   299→class SyncMessageType(enum.Enum):
+   300→    """Types of sync messages between devices."""
+   301→    DEVICE_REGISTER = "device_register"
+   302→    DEVICE_APPROVE = "device_approve"
+   303→    DEVICE_REVOKE = "device_revoke"
+   304→    HISTORY_SYNC = "history_sync"
+   305→    MESSAGE_STATUS = "message_status"
+   306→    SETTINGS_UPDATE = "settings_update"
+   307→    DRAFT_SYNC = "draft_sync"
+   308→    CALL_HANDOFF = "call_handoff"
+   309→    HEARTBEAT = "heartbeat"
+   310→
+   311→
+   312→# ---------------------------------------------------------------------------
+   313→# Sync message
+   314→# ---------------------------------------------------------------------------
+   315→
+   316→@dataclass
+   317→class SyncMessage:
+   318→    """A synchronization message between devices."""
+   319→    msg_type: SyncMessageType = SyncMessageType.HEARTBEAT
+   320→    source_device_id: str = ""
+   321→    target_device_id: str = ""  # Empty = broadcast to all devices
+   322→    payload: bytes = b""
+   323→    timestamp: float = field(default_factory=time.time)
+   324→    msg_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+   325→
+   326→    def encode(self) -> bytes:
+   327→        """Serialize to bytes for encrypted transport."""
+   328→        import json as _json
+   329→        header = _json.dumps({
+   330→            "type": self.msg_type.value,
+   331→            "src": self.source_device_id,
+   332→            "dst": self.target_device_id,
+   333→            "ts": self.timestamp,
+   334→            "id": self.msg_id,
+   335→        }).encode("utf-8")
+   336→        return (
+   337→            struct.pack("!H", len(header))
+   338→            + header
+   339→            + self.payload
+   340→        )
+   341→
+   342→    @classmethod
+   343→    def decode(cls, data: bytes) -> SyncMessage:
+   344→        """Deserialize from bytes."""
+   345→        import json as _json
+   346→        if len(data) < 2:
+   347→            raise SyncError("Sync message too short.")
+   348→        header_len = struct.unpack("!H", data[:2])[0]
+   349→        header = _json.loads(data[2:2 + header_len].decode("utf-8"))
+   350→        payload = data[2 + header_len:]
+   351→        return cls(
+   352→            msg_type=SyncMessageType(header["type"]),
+   353→            source_device_id=header.get("src", ""),
+   354→            target_device_id=header.get("dst", ""),
+   355→            payload=payload,
+   356→            timestamp=header.get("ts", 0.0),
+   357→            msg_id=header.get("id", ""),
+   358→        )
+   359→
+   360→
+   361→# ---------------------------------------------------------------------------
+   362→# Multi-device manager v2
+   363→# ---------------------------------------------------------------------------
+   364→
+   365→class MultiDeviceManagerV2:
+   366→    """Manages multi-device synchronization for Presidium.
+   367→
+   368→    Handles device registration, pairwise E2EE between devices, CRDT
+   369→    state sync, and seamless handoff for calls and drafts.
+   370→    """
+   371→
+   372→    def __init__(
+   373→        self,
+   374→        master_key_pair: Ed25519KeyPair,
+   375→        local_device_id: str = "",
+   376→    ) -> None:
+   377→        self._master_key = master_key_pair
+   378→        self._local_device_id = local_device_id or uuid.uuid4().hex[:12]
+   379→        self._devices: dict[str, DeviceInfo] = {}
+   380→        self._local_device: Optional[DeviceInfo] = None
+   381→
+   382→        # CRDT state
+   383→        self._settings: dict[str, LWWRegister] = {}
+   384→        self._read_receipts: GCounter = GCounter()
+   385→        self._delivered_set: ORSet = ORSet()
+   386→
+   387→        # Draft sync state
+   388→        self._drafts: dict[str, LWWRegister] = {}  # peer_id → draft text
+   389→
+   390→        # Callbacks
+   391→        self._send_to_device: Optional[
+   392→            Callable[[str, bytes], Awaitable[None]]
+   393→        ] = None
+   394→        self._on_device_registered: Optional[
+   395→            Callable[[DeviceInfo], Awaitable[None]]
+   396→        ] = None
+   397→        self._on_device_revoked: Optional[
+   398→            Callable[[str], Awaitable[None]]
+   399→        ] = None
+   400→        self._on_sync_received: Optional[
+   401→            Callable[[SyncMessage], Awaitable[None]]
+   402→        ] = None
+   403→        self._on_draft_updated: Optional[
+   404→            Callable[[str, str], Awaitable[None]]  # (peer_id, draft_text)
+   405→        ] = None
+   406→        self._on_call_handoff: Optional[
+   407→            Callable[[dict[str, Any]], Awaitable[None]]
+   408→        ] = None
+   409→
+   410→    # -------------------------------------------------------------------
+   411→    # Configuration
+   412→    # -------------------------------------------------------------------
+   413→
+   414→    def set_send_callback(
+   415→        self, callback: Callable[[str, bytes], Awaitable[None]]
+   416→    ) -> None:
+   417→        """Set callback for sending encrypted data to another device."""
+   418→        self._send_to_device = callback
+   419→
+   420→    def set_local_device(self, device: DeviceInfo) -> None:
+   421→        """Set the local device info."""
+   422→        self._local_device = device
+   423→        self._local_device_id = device.device_id
+   424→        self._devices[device.device_id] = device
+   425→
+   426→    # -------------------------------------------------------------------
+   427→    # Device registration
+   428→    # -------------------------------------------------------------------
+   429→
+   430→    def create_device_registration(
+   431→        self,
+   432→        device_name: str,
+   433→        device_type: DeviceType,
+   434→        x25519_public_key: bytes,
+   435→        ed25519_public_key: bytes,
+   436→    ) -> DeviceInfo:
+   437→        """Create a device registration signed by the master key.
+   438→
+   439→        This is called on an already-authorized device when adding
+   440→        a new device.
+   441→
+   442→        Args:
+   443→            device_name: Human-readable device name.
+   444→            device_type: Type of device.
+   445→            x25519_public_key: New device's X25519 public key (32 bytes).
+   446→            ed25519_public_key: New device's Ed25519 public key (32 bytes).
+   447→
+   448→        Returns:
+   449→            A DeviceInfo with master signature.
+   450→
+   451→        Raises:
+   452→            DeviceLimitError: If max devices already registered.
+   453→        """
+   454→        active_count = sum(1 for d in self._devices.values() if not d.is_revoked)
+   455→        if active_count >= MAX_DEVICES_PER_USER:
+   456→            raise DeviceLimitError(
+   457→                f"Maximum {MAX_DEVICES_PER_USER} devices allowed. "
+   458→                f"Revoke an existing device first."
+   459→            )
+   460→
+   461→        # Sign the device keys with master key
+   462→        signed_payload = (
+   463→            DEVICE_KEY_SIGNATURE_PREFIX
+   464→            + x25519_public_key
+   465→            + ed25519_public_key
+   466→        )
+   467→        signature = self._master_key.sign(signed_payload)
+   468→
+   469→        device = DeviceInfo(
+   470→            device_name=device_name,
+   471→            device_type=device_type,
+   472→            x25519_public_key=x25519_public_key,
+   473→            ed25519_public_key=ed25519_public_key,
+   474→            master_signature=signature,
+   475→            is_authorized=True,
+   476→        )
+   477→
+   478→        self._devices[device.device_id] = device
+   479→
+   480→        logger.info(
+   481→            "Device registered: %s (%s) with fingerprint %s",
+   482→            device.device_name,
+   483→            device.device_type.value,
+   484→            device.compute_device_fingerprint(),
+   485→        )
+   486→        return device
+   487→
+   488→    def verify_device_signature(self, device: DeviceInfo) -> bool:
+   489→        """Verify a device's master signature.
+   490→
+   491→        Returns:
+   492→            True if the signature is valid.
+   493→        """
+   494→        signed_payload = (
+   495→            DEVICE_KEY_SIGNATURE_PREFIX
+   496→            + device.x25519_public_key
+   497→            + device.ed25519_public_key
+   498→        )
+   499→        try:
+   500→            return Ed25519KeyPair.verify(
+   501→                self._master_key.public_key_bytes,
+   502→                device.master_signature,
+   503→                signed_payload,
+   504→            )
+   505→        except Exception:
+   506→            return False
+   507→
+   508→    async def revoke_device(self, device_id: str) -> bool:
+   509→        """Revoke a device's authorization.
+   510→
+   511→        Args:
+   512→            device_id: The device to revoke.
+   513→
+   514→        Returns:
+   515→            True if the device was revoked.
+   516→        """
+   517→        device = self._devices.get(device_id)
+   518→        if device is None:
+   519→            return False
+   520→        if device.device_id == self._local_device_id:
+   521→            raise MultiDeviceError("Cannot revoke the current device.")
+   522→
+   523→        device.is_revoked = True
+   524→        device.is_authorized = False
+   525→
+   526→        # Notify other devices
+   527→        msg = SyncMessage(
+   528→            msg_type=SyncMessageType.DEVICE_REVOKE,
+   529→            source_device_id=self._local_device_id,
+   530→            payload=device_id.encode("utf-8"),
+   531→        )
+   532→        await self._broadcast_sync(msg)
+   533→
+   534→        if self._on_device_revoked:
+   535→            await self._on_device_revoked(device_id)
+   536→
+   537→        logger.info("Device revoked: %s (%s)", device_id, device.device_name)
+   538→        return True
+   539→
+   540→    # -------------------------------------------------------------------
+   541→    # CRDT sync operations
+   542→    # -------------------------------------------------------------------
+   543→
+   544→    async def sync_message_status(
+   545→        self,
+   546→        message_id: str,
+   547→        status: str,  # "delivered" | "read"
+   548→        device_id: str = "",
+   549→    ) -> None:
+   550→        """Sync a message status update across devices."""
+   551→        tag = f"{device_id or self._local_device_id}:{time.time():.3f}"
+   552→
+   553→        if status == "delivered":
+   554→            self._delivered_set.add(message_id, tag)
+   555→        elif status == "read":
+   556→            self._read_receipts.increment(device_id or self._local_device_id)
+   557→
+   558→        # Broadcast the update
+   559→        import json as _json
+   560→        payload = _json.dumps({
+   561→            "message_id": message_id,
+   562→            "status": status,
+   563→            "tag": tag,
+   564→            "device_id": device_id or self._local_device_id,
+   565→        }).encode("utf-8")
+   566→
+   567→        msg = SyncMessage(
+   568→            msg_type=SyncMessageType.MESSAGE_STATUS,
+   569→            source_device_id=self._local_device_id,
+   570→            payload=payload,
+   571→        )
+   572→        await self._broadcast_sync(msg)
+   573→
+   574→    async def sync_setting(self, key: str, value: Any) -> None:
+   575→        """Sync a setting update across devices."""
+   576→        ts = time.time()
+   577→        self._settings[key] = LWWRegister(value, ts, self._local_device_id)
+   578→
+   579→        import json as _json
+   580→        payload = _json.dumps({
+   581→            "key": key,
+   582→            "value": value,
+   583→            "timestamp": ts,
+   584→            "device_id": self._local_device_id,
+   585→        }).encode("utf-8")
+   586→
+   587→        msg = SyncMessage(
+   588→            msg_type=SyncMessageType.SETTINGS_UPDATE,
+   589→            source_device_id=self._local_device_id,
+   590→            payload=payload,
+   591→        )
+   592→        await self._broadcast_sync(msg)
+   593→
+   594→    async def sync_draft(self, peer_id: str, draft_text: str) -> None:
+   595→        """Sync a message draft across devices (Continuity-style).
+   596→
+   597→        When a user starts typing on one device, the draft is
+   598→        synced to all other devices so they can continue composing
+   599→        on a different device.
+   600→        """
+   601→        ts = time.time()
+   602→        self._drafts[peer_id] = LWWRegister(draft_text, ts, self._local_device_id)
+   603→
+   604→        import json as _json
+   605→        payload = _json.dumps({
+   606→            "peer_id": peer_id,
+   607→            "draft_text": draft_text,
+   608→            "timestamp": ts,
+   609→            "device_id": self._local_device_id,
+   610→        }).encode("utf-8")
+   611→
+   612→        msg = SyncMessage(
+   613→            msg_type=SyncMessageType.DRAFT_SYNC,
+   614→            source_device_id=self._local_device_id,
+   615→            payload=payload,
+   616→        )
+   617→        await self._broadcast_sync(msg)
+   618→
+   619→    async def handoff_call(self, call_data: dict[str, Any]) -> None:
+   620→        """Hand off an active call to another device.
+   621→
+   622→        Args:
+   623→            call_data: Call state to transfer (call_id, SDP, participants).
+   624→        """
+   625→        import json as _json
+   626→        msg = SyncMessage(
+   627→            msg_type=SyncMessageType.CALL_HANDOFF,
+   628→            source_device_id=self._local_device_id,
+   629→            payload=_json.dumps(call_data).encode("utf-8"),
+   630→        )
+   631→        await self._broadcast_sync(msg)
+   632→
+   633→    # -------------------------------------------------------------------
+   634→    # Incoming sync message handler
+   635→    # -------------------------------------------------------------------
+   636→
+   637→    async def handle_sync_message(self, data: bytes) -> None:
+   638→        """Process an incoming sync message from another device."""
+   639→        try:
+   640→            msg = SyncMessage.decode(data)
+   641→        except SyncError as exc:
+   642→            logger.error("Invalid sync message: %s", exc)
+   643→            return
+   644→
+   645→        # Verify source device is authorized
+   646→        source_device = self._devices.get(msg.source_device_id)
+   647→        if source_device is None or source_device.is_revoked:
+   648→            logger.warning("Sync message from unknown/revoked device: %s", msg.source_device_id)
+   649→            return
+   650→
+   651→        # Dispatch by type
+   652→        if msg.msg_type == SyncMessageType.MESSAGE_STATUS:
+   653→            await self._handle_message_status(msg)
+   654→        elif msg.msg_type == SyncMessageType.SETTINGS_UPDATE:
+   655→            await self._handle_settings_update(msg)
+   656→        elif msg.msg_type == SyncMessageType.DRAFT_SYNC:
+   657→            await self._handle_draft_sync(msg)
+   658→        elif msg.msg_type == SyncMessageType.DEVICE_REVOKE:
+   659→            await self._handle_device_revoke(msg)
+   660→        elif msg.msg_type == SyncMessageType.CALL_HANDOFF:
+   661→            await self._handle_call_handoff(msg)
+   662→        elif msg.msg_type == SyncMessageType.HEARTBEAT:
+   663→            source_device.last_seen = time.time()
+   664→
+   665→        if self._on_sync_received:
+   666→            await self._on_sync_received(msg)
+   667→
+   668→    async def _handle_message_status(self, msg: SyncMessage) -> None:
+   669→        """Handle incoming message status sync."""
+   670→        import json as _json
+   671→        data = _json.loads(msg.payload.decode("utf-8"))
+   672→        message_id = data.get("message_id", "")
+   673→        status = data.get("status", "")
+   674→        tag = data.get("tag", "")
+   675→        device_id = data.get("device_id", "")
+   676→
+   677→        if status == "delivered":
+   678→            self._delivered_set.add(message_id, tag)
+   679→        elif status == "read":
+   680→            self._read_receipts.increment(device_id)
+   681→
+   682→    async def _handle_settings_update(self, msg: SyncMessage) -> None:
+   683→        """Handle incoming settings sync."""
+   684→        import json as _json
+   685→        data = _json.loads(msg.payload.decode("utf-8"))
+   686→        key = data.get("key", "")
+   687→        value = data.get("value")
+   688→        ts = data.get("timestamp", 0.0)
+   689→        device_id = data.get("device_id", "")
+   690→
+   691→        if key:
+   692→            current = self._settings.get(key, LWWRegister())
+   693→            current.set(value, ts, device_id)
+   694→            self._settings[key] = current
+   695→
+   696→    async def _handle_draft_sync(self, msg: SyncMessage) -> None:
+   697→        """Handle incoming draft sync."""
+   698→        import json as _json
+   699→        data = _json.loads(msg.payload.decode("utf-8"))
+   700→        peer_id = data.get("peer_id", "")
+   701→        draft_text = data.get("draft_text", "")
+   702→        ts = data.get("timestamp", 0.0)
+   703→        device_id = data.get("device_id", "")
+   704→
+   705→        if peer_id:
+   706→            current = self._drafts.get(peer_id, LWWRegister())
+   707→            current.set(draft_text, ts, device_id)
+   708→            self._drafts[peer_id] = current
+   709→
+   710→            if self._on_draft_updated:
+   711→                await self._on_draft_updated(peer_id, draft_text)
+   712→
+   713→    async def _handle_device_revoke(self, msg: SyncMessage) -> None:
+   714→        """Handle device revocation."""
+   715→        device_id = msg.payload.decode("utf-8")
+   716→        device = self._devices.get(device_id)
+   717→        if device:
+   718→            device.is_revoked = True
+   719→            device.is_authorized = False
+   720→            if self._on_device_revoked:
+   721→                await self._on_device_revoked(device_id)
+   722→
+   723→    async def _handle_call_handoff(self, msg: SyncMessage) -> None:
+   724→        """Handle call handoff."""
+   725→        import json as _json
+   726→        call_data = _json.loads(msg.payload.decode("utf-8"))
+   727→        if self._on_call_handoff:
+   728→            await self._on_call_handoff(call_data)
+   729→
+   730→    # -------------------------------------------------------------------
+   731→    # Internal helpers
+   732→    # -------------------------------------------------------------------
+   733→
+   734→    async def _broadcast_sync(self, msg: SyncMessage) -> None:
+   735→        """Send a sync message to all authorized devices."""
+   736→        if self._send_to_device is None:
+   737→            return
+   738→
+   739→        encoded = msg.encode()
+   740→        for device_id, device in self._devices.items():
+   741→            if device_id == self._local_device_id:
+   742→                continue
+   743→            if not device.is_authorized or device.is_revoked:
+   744→                continue
+   745→            try:
+   746→                await self._send_to_device(device_id, encoded)
+   747→            except Exception as exc:
+   748→                logger.debug("Failed to sync with device %s: %s", device_id, exc)
+   749→
+   750→    # -------------------------------------------------------------------
+   751→    # Query methods
+   752→    # -------------------------------------------------------------------
+   753→
+   754→    def get_devices(self) -> list[DeviceInfo]:
+   755→        """Get all registered devices."""
+   756→        return list(self._devices.values())
+   757→
+   758→    def get_authorized_devices(self) -> list[DeviceInfo]:
+   759→        """Get authorized (non-revoked) devices."""
+   760→        return [d for d in self._devices.values() if d.is_authorized and not d.is_revoked]
+   761→
+   762→    def get_device(self, device_id: str) -> Optional[DeviceInfo]:
+   763→        """Get a device by its ID."""
+   764→        return self._devices.get(device_id)
+   765→
+   766→    def get_draft(self, peer_id: str) -> str:
+   767→        """Get the current draft for a peer (from any device)."""
+   768→        register = self._drafts.get(peer_id)
+   769→        return register.value if register else ""
+   770→
+   771→    def get_setting(self, key: str, default: Any = None) -> Any:
+   772→        """Get a synced setting value."""
+   773→        register = self._settings.get(key)
+   774→        return register.value if register else default
+   775→
+   776→    def is_message_delivered(self, message_id: str) -> bool:
+   777→        """Check if a message has been delivered (any device)."""
+   778→        return self._delivered_set.contains(message_id)
+   779→
+   780→    def get_read_count(self) -> int:
+   781→        """Get the total read receipt count across devices."""
+   782→        return self._read_receipts.value()
+   783→

@@ -1,0 +1,734 @@
+     1→"""Onion Routing for Presidium — 3-hop circuit-based anonymous messaging.
+     2→
+     3→Implements a built-in onion routing layer (similar to Tor) that hides
+     4→metadata about who is communicating with whom. Each message traverses
+     5→3 relay nodes, with layered encryption ensuring each hop only knows
+     6→its immediate predecessor and successor.
+     7→
+     8→Architecture:
+     9→    Sender → Guard Node → Middle Node → Exit Node → Recipient
+    10→
+    11→    - Guard Node: knows sender IP, doesn't know recipient
+    12→    - Middle Node: knows neither sender nor recipient
+    13→    - Exit Node: knows recipient, doesn't know sender
+    14→    - Recipient: knows exit node delivered it, doesn't know sender
+    15→
+    16→Circuit lifecycle:
+    17→    1. Circuit creation: Select 3 random peers from DHT
+    18→    2. Layered key exchange: Each hop gets an AES-256-GCM key
+    19→    3. Circuit usage: Messages are encrypted in 3 layers
+    20→    4. Circuit rotation: Every 10 minutes, new circuit is built
+    21→
+    22→Encryption layers:
+    23→    Each relay peels one layer of encryption:
+    24→    - Exit receives: decrypt_layer3 → {recipient, message}
+    25→    - Middle receives: decrypt_layer2 → {next_hop, layer3_ciphertext}
+    26→    - Guard receives: decrypt_layer1 → {next_hop, layer2_ciphertext}
+    27→
+    28→Circuit ID format:
+    29→    16 bytes random, assigned per-hop during circuit creation.
+    30→    Each relay maps (incoming_circuit_id) → (next_hop, outgoing_circuit_id).
+    31→
+    32→Limitations (v1):
+    33→    - No stream multiplexing (one circuit = one message flow)
+    34→    - No congestion control (best-effort relay)
+    35→    - Exit node can observe plaintext (use with Sealed Sender for full privacy)
+    36→    - No guard persistence (random selection each time)
+    37→"""
+    38→
+    39→from __future__ import annotations
+    40→
+    41→import asyncio
+    42→import hashlib
+    43→import logging
+    44→import os
+    45→import struct
+    46→import time
+    47→from dataclasses import dataclass, field
+    48→from typing import Any, Awaitable, Callable, Optional
+    49→
+    50→from presidium.core.crypto import AES256GCM, CryptoError, SecureBytes, secure_zero
+    51→
+    52→logger = logging.getLogger(__name__)
+    53→
+    54→
+    55→# ---------------------------------------------------------------------------
+    56→# Constants
+    57→# ---------------------------------------------------------------------------
+    58→
+    59→CIRCUIT_ID_SIZE = 16
+    60→HOP_COUNT = 3
+    61→CIRCUIT_LIFETIME_SECONDS = 600  # 10 minutes
+    62→ONION_VERSION = 1
+    63→NONCE_SIZE = 12
+    64→MAX_RELAY_PAYLOAD = 65536
+    65→
+    66→# Onion message types
+    67→ONION_CMD_CREATE = 0x01
+    68→ONION_CMD_CREATED = 0x02
+    69→ONION_CMD_RELAY = 0x03
+    70→ONION_CMD_RELAY_ACK = 0x04
+    71→ONION_CMD_DESTROY = 0x05
+    72→ONION_CMD_PADDING = 0x06
+    73→
+    74→
+    75→# ---------------------------------------------------------------------------
+    76→# Custom exceptions
+    77→# ---------------------------------------------------------------------------
+    78→
+    79→class OnionError(Exception):
+    80→    """Base exception for onion routing operations."""
+    81→
+    82→
+    83→class CircuitError(OnionError):
+    84→    """Circuit creation or management error."""
+    85→
+    86→
+    87→class CircuitExpiredError(CircuitError):
+    88→    """Circuit has exceeded its lifetime."""
+    89→
+    90→
+    91→class RelayError(OnionError):
+    92→    """Error relaying through a hop."""
+    93→
+    94→
+    95→class DecryptionError(OnionError):
+    96→    """Failed to peel an onion layer."""
+    97→
+    98→
+    99→# ---------------------------------------------------------------------------
+   100→# Circuit ID
+   101→# ---------------------------------------------------------------------------
+   102→
+   103→@dataclass
+   104→class CircuitId:
+   105→    """A 16-byte circuit identifier."""
+   106→    data: bytes = field(default_factory=lambda: os.urandom(CIRCUIT_ID_SIZE))
+   107→
+   108→    def __eq__(self, other: object) -> bool:
+   109→        if isinstance(other, CircuitId):
+   110→            return self.data == other.data
+   111→        return NotImplemented
+   112→
+   113→    def __hash__(self) -> int:
+   114→        return hash(self.data)
+   115→
+   116→    def __repr__(self) -> str:
+   117→        return f"CircuitId({self.data[:4].hex()}...)"
+   118→
+   119→    def encode(self) -> bytes:
+   120→        return self.data
+   121→
+   122→    @classmethod
+   123→    def decode(cls, data: bytes) -> CircuitId:
+   124→        if len(data) != CIRCUIT_ID_SIZE:
+   125→            raise CircuitError(f"Invalid circuit ID size: {len(data)}")
+   126→        return cls(data=data)
+   127→
+   128→
+   129→# ---------------------------------------------------------------------------
+   130→# Hop descriptor
+   131→# ---------------------------------------------------------------------------
+   132→
+   133→@dataclass
+   134→class HopDescriptor:
+   135→    """Describes a single hop in an onion circuit.
+   136→
+   137→    Contains the relay's address and the keys negotiated for
+   138→    this hop's encryption layer.
+   139→    """
+   140→    peer_id: str = ""            # Relay's Presidium user_id
+   141→    address: str = ""            # host:port
+   142→    x25519_public_key: bytes = b""  # 32 bytes — for key exchange
+   143→    circuit_id: CircuitId = field(default_factory=CircuitId)
+   144→    encryption_key: bytes = b""  # 32 bytes AES key for this layer
+   145→    is_created: bool = False
+   146→
+   147→
+   148→# ---------------------------------------------------------------------------
+   149→# Onion circuit
+   150→# ---------------------------------------------------------------------------
+   151→
+   152→@dataclass
+   153→class OnionCircuit:
+   154→    """Represents an established 3-hop onion circuit.
+   155→
+   156→    Contains the ordered list of hops and their negotiated keys.
+   157→    The circuit is used for both sending (adding layers) and
+   158→    receiving (peeling layers) messages.
+   159→    """
+   160→    circuit_id: CircuitId = field(default_factory=CircuitId)
+   161→    hops: list[HopDescriptor] = field(default_factory=list)
+   162→    created_at: float = field(default_factory=time.time)
+   163→    last_used: float = field(default_factory=time.time)
+   164→    messages_sent: int = 0
+   165→    messages_received: int = 0
+   166→    is_active: bool = True
+   167→
+   168→    @property
+   169→    def is_expired(self) -> bool:
+   170→        """Check if the circuit has exceeded its lifetime."""
+   171→        return time.time() - self.created_at > CIRCUIT_LIFETIME_SECONDS
+   172→
+   173→    @property
+   174→    def guard(self) -> Optional[HopDescriptor]:
+   175→        """The first (guard) hop."""
+   176→        return self.hops[0] if self.hops else None
+   177→
+   178→    @property
+   179→    def middle(self) -> Optional[HopDescriptor]:
+   180→        """The second (middle) hop."""
+   181→        return self.hops[1] if len(self.hops) > 1 else None
+   182→
+   183→    @property
+   184→    def exit_node(self) -> Optional[HopDescriptor]:
+   185→        """The third (exit) hop."""
+   186→        return self.hops[2] if len(self.hops) > 2 else None
+   187→
+   188→    def touch(self) -> None:
+   189→        """Update the last-used timestamp."""
+   190→        self.last_used = time.time()
+   191→
+   192→    def cleanup(self) -> None:
+   193→        """Securely zero all encryption keys."""
+   194→        for hop in self.hops:
+   195→            if hop.encryption_key:
+   196→                secure_zero(bytearray(hop.encryption_key))
+   197→        self.is_active = False
+   198→
+   199→
+   200→# ---------------------------------------------------------------------------
+   201→# Onion layer encryption
+   202→# ---------------------------------------------------------------------------
+   203→
+   204→class OnionLayerCrypto:
+   205→    """Handles layered encryption/decryption for onion routing.
+   206→
+   207→    Each layer uses AES-256-GCM with a per-hop key. The innermost
+   208→    layer (exit → recipient) is encrypted first, then the middle
+   209→    layer, then the guard layer.
+   210→
+   211→    When relaying, each hop peels its layer to reveal the next
+   212→    destination and the remaining encrypted payload.
+   213→    """
+   214→
+   215→    @staticmethod
+   216→    def add_layer(
+   217→        plaintext: bytes,
+   218→        key: bytes,
+   219→        next_hop_addr: str,
+   220→        next_circuit_id: CircuitId,
+   221→    ) -> bytes:
+   222→        """Add one layer of onion encryption.
+   223→
+   224→        Wraps the plaintext with routing info (next hop + circuit ID)
+   225→        and encrypts with the hop's key.
+   226→
+   227→        Args:
+   228→            plaintext: The data to wrap (may already be layered).
+   229→            key: This hop's AES-256-GCM key (32 bytes).
+   230→            next_hop_addr: Address of the next hop (host:port).
+   231→            next_circuit_id: Circuit ID for the next hop.
+   232→
+   233→        Returns:
+   234→            Encrypted layer bytes.
+   235→        """
+   236→        # Build the inner payload: next_hop_len + next_hop + circuit_id + plaintext
+   237→        next_hop_bytes = next_hop_addr.encode("utf-8")
+   238→        inner = (
+   239→            struct.pack("!H", len(next_hop_bytes))
+   240→            + next_hop_bytes
+   241→            + next_circuit_id.encode()
+   242→            + plaintext
+   243→        )
+   244→
+   245→        # Encrypt with this hop's key
+   246→        nonce = os.urandom(NONCE_SIZE)
+   247→        ciphertext = AES256GCM.encrypt(inner, key, nonce)
+   248→
+   249→        return nonce + ciphertext
+   250→
+   251→    @staticmethod
+   252→    def peel_layer(
+   253→        encrypted: bytes,
+   254→        key: bytes,
+   255→    ) -> tuple[str, CircuitId, bytes]:
+   256→        """Peel one layer of onion encryption.
+   257→
+   258→        Args:
+   259→            encrypted: The encrypted layer (nonce + ciphertext).
+   260→            key: This hop's AES-256-GCM key (32 bytes).
+   261→
+   262→        Returns:
+   263→            Tuple of (next_hop_addr, next_circuit_id, remaining_payload).
+   264→
+   265→        Raises:
+   266→            DecryptionError: If decryption fails.
+   267→        """
+   268→        if len(encrypted) < NONCE_SIZE + 16:  # nonce + minimal GCM tag
+   269→            raise DecryptionError("Encrypted data too short.")
+   270→
+   271→        nonce = encrypted[:NONCE_SIZE]
+   272→        ciphertext = encrypted[NONCE_SIZE:]
+   273→
+   274→        try:
+   275→            inner = AES256GCM.decrypt(ciphertext, key, nonce)
+   276→        except CryptoError as exc:
+   277→            raise DecryptionError(f"Layer decryption failed: {exc}") from exc
+   278→
+   279→        # Parse routing info
+   280→        if len(inner) < 2:
+   281→            raise DecryptionError("Decrypted layer too short for hop address.")
+   282→
+   283→        hop_len = struct.unpack("!H", inner[:2])[0]
+   284→        offset = 2
+   285→
+   286→        if len(inner) < offset + hop_len:
+   287→            raise DecryptionError("Decrypted layer truncated: missing hop address.")
+   288→
+   289→        next_hop = inner[offset:offset + hop_len].decode("utf-8")
+   290→        offset += hop_len
+   291→
+   292→        if len(inner) < offset + CIRCUIT_ID_SIZE:
+   293→            raise DecryptionError("Decrypted layer truncated: missing circuit ID.")
+   294→
+   295→        next_circuit_id = CircuitId(inner[offset:offset + CIRCUIT_ID_SIZE])
+   296→        offset += CIRCUIT_ID_SIZE
+   297→
+   298→        remaining = inner[offset:]
+   299→
+   300→        return next_hop, next_circuit_id, remaining
+   301→
+   302→
+   303→# ---------------------------------------------------------------------------
+   304→# Relay state (per-hop, runs on every Presidium node)
+   305→# ---------------------------------------------------------------------------
+   306→
+   307→class RelayState:
+   308→    """State maintained by a Presidium node acting as an onion relay.
+   309→
+   310→    Maps incoming circuit IDs to next-hop information, allowing
+   311→    the node to relay onion-encrypted messages without knowing
+   312→    the full circuit path.
+   313→    """
+   314→
+   315→    def __init__(self) -> None:
+   316→        # incoming_circuit_id → (next_hop_addr, outgoing_circuit_id, encryption_key)
+   317→        self._forward_table: dict[bytes, tuple[str, bytes, bytes]] = {}
+   318→        # outgoing_circuit_id → (prev_hop_addr, incoming_circuit_id, encryption_key)
+   319→        self._backward_table: dict[bytes, tuple[str, bytes, bytes]] = {}
+   320→        self._circuits_created: int = 0
+   321→
+   322→    def add_relay_entry(
+   323→        self,
+   324→        incoming_circuit_id: bytes,
+   325→        next_hop_addr: str,
+   326→        outgoing_circuit_id: bytes,
+   327→        encryption_key: bytes,
+   328→    ) -> None:
+   329→        """Register a relay mapping for a circuit passing through us."""
+   330→        self._forward_table[incoming_circuit_id] = (
+   331→            next_hop_addr, outgoing_circuit_id, encryption_key,
+   332→        )
+   333→        self._backward_table[outgoing_circuit_id] = (
+   334→            "", incoming_circuit_id, encryption_key,  # prev_hop filled on relay
+   335→        )
+   336→        self._circuits_created += 1
+   337→
+   338→    def lookup_forward(self, circuit_id: bytes) -> Optional[tuple[str, bytes, bytes]]:
+   339→        """Look up where to forward a message for a given circuit ID."""
+   340→        return self._forward_table.get(circuit_id)
+   341→
+   342→    def lookup_backward(self, circuit_id: bytes) -> Optional[tuple[str, bytes, bytes]]:
+   343→        """Look up where to send a response for a given circuit ID."""
+   344→        return self._backward_table.get(circuit_id)
+   345→
+   346→    def remove_circuit(self, circuit_id: bytes) -> None:
+   347→        """Remove all entries for a circuit."""
+   348→        forward = self._forward_table.pop(circuit_id, None)
+   349→        if forward:
+   350→            self._backward_table.pop(forward[1], None)
+   351→
+   352→        backward = self._backward_table.pop(circuit_id, None)
+   353→        if backward:
+   354→            self._forward_table.pop(backward[1], None)
+   355→
+   356→    @property
+   357→    def active_circuits(self) -> int:
+   358→        return len(self._forward_table)
+   359→
+   360→    @property
+   361→    def total_circuits_created(self) -> int:
+   362→        return self._circuits_created
+   363→
+   364→
+   365→# ---------------------------------------------------------------------------
+   366→# Onion routing manager
+   367→# ---------------------------------------------------------------------------
+   368→
+   369→class OnionRoutingManager:
+   370→    """Manages onion circuits for anonymous message delivery.
+   371→
+   372→    On the sender side:
+   373→        - Selects relay hops from DHT
+   374→        - Creates circuits with layered key exchange
+   375→        - Encrypts messages in 3 layers for delivery
+   376→
+   377→    On the relay side:
+   378→        - Processes circuit creation requests
+   379→        - Relays messages by peeling one layer
+   380→        - Forwards to next hop
+   381→
+   382→    On the recipient side:
+   383→        - Receives messages from exit nodes
+   384→        - Optionally pairs with SealedSender for full anonymity
+   385→    """
+   386→
+   387→    def __init__(self, local_user_id: str) -> None:
+   388→        self._local_user_id = local_user_id
+   389→        self._circuits: dict[bytes, OnionCircuit] = {}  # circuit_id → circuit
+   390→        self._relay_state = RelayState()
+   391→        self._is_relay_enabled = False
+   392→
+   393→        # Callbacks
+   394→        self._send_to_peer: Optional[Callable[[str, bytes], Awaitable[None]]] = None
+   395→        self._on_incoming_message: Optional[Callable[[bytes, bytes], Awaitable[None]]] = None
+   396→        self._select_hops: Optional[Callable[[int], Awaitable[list[HopDescriptor]]]] = None
+   397→
+   398→        # Cleanup task
+   399→        self._cleanup_task: Optional[asyncio.Task[None]] = None
+   400→        self._running = False
+   401→
+   402→    # -------------------------------------------------------------------
+   403→    # Configuration
+   404→    # -------------------------------------------------------------------
+   405→
+   406→    def set_send_callback(
+   407→        self, callback: Callable[[str, bytes], Awaitable[None]]
+   408→    ) -> None:
+   409→        """Set the callback for sending raw bytes to a peer address."""
+   410→        self._send_to_peer = callback
+   411→
+   412→    def set_incoming_callback(
+   413→        self, callback: Callable[[bytes, bytes], Awaitable[None]]
+   414→    ) -> None:
+   415→        """Set the callback for delivering decrypted messages to the app.
+   416→
+   417→        Args: (sender_circuit_id, plaintext)
+   418→        """
+   419→        self._on_incoming_message = callback
+   420→
+   421→    def set_hop_selector(
+   422→        self, callback: Callable[[int], Awaitable[list[HopDescriptor]]]
+   423→    ) -> None:
+   424→        """Set the callback for selecting relay hops from the DHT."""
+   425→        self._select_hops = callback
+   426→
+   427→    def set_relay_enabled(self, enabled: bool) -> None:
+   428→        """Enable or disable this node as an onion relay."""
+   429→        self._is_relay_enabled = enabled
+   430→
+   431→    # -------------------------------------------------------------------
+   432→    # Lifecycle
+   433→    # -------------------------------------------------------------------
+   434→
+   435→    async def start(self) -> None:
+   436→        """Start the onion routing manager."""
+   437→        self._running = True
+   438→        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+   439→        logger.info("Onion routing manager started (relay=%s)", self._is_relay_enabled)
+   440→
+   441→    async def stop(self) -> None:
+   442→        """Stop the onion routing manager and clean up circuits."""
+   443→        self._running = False
+   444→        if self._cleanup_task:
+   445→            self._cleanup_task.cancel()
+   446→            try:
+   447→                await self._cleanup_task
+   448→            except asyncio.CancelledError:
+   449→                pass
+   450→
+   451→        # Clean up all circuits
+   452→        for circuit in self._circuits.values():
+   453→            circuit.cleanup()
+   454→        self._circuits.clear()
+   455→        logger.info("Onion routing manager stopped.")
+   456→
+   457→    # -------------------------------------------------------------------
+   458→    # Circuit creation (sender side)
+   459→    # -------------------------------------------------------------------
+   460→
+   461→    async def create_circuit(self) -> OnionCircuit:
+   462→        """Create a new 3-hop onion circuit.
+   463→
+   464→        Selects relay nodes from the DHT, performs layered key
+   465→        exchange with each hop, and returns an active circuit.
+   466→
+   467→        Returns:
+   468→            An established OnionCircuit.
+   469→
+   470→        Raises:
+   471→            CircuitError: If circuit creation fails.
+   472→        """
+   473→        if self._select_hops is None:
+   474→            raise CircuitError("No hop selector configured.")
+   475→
+   476→        # Select 3 relay hops
+   477→        hops = await self._select_hops(HOP_COUNT)
+   478→        if len(hops) < HOP_COUNT:
+   479→            raise CircuitError(
+   480→                f"Not enough relay nodes available: {len(hops)}/{HOP_COUNT}."
+   481→            )
+   482→
+   483→        circuit = OnionCircuit(
+   484→            hops=hops,
+   485→        )
+   486→
+   487→        # Generate per-hop encryption keys
+   488→        for hop in hops:
+   489→            hop.encryption_key = os.urandom(32)
+   490→            hop.circuit_id = CircuitId()
+   491→
+   492→        # In a full implementation, we would perform a TELEX-style
+   493→        # circuit creation: send CREATE to guard, then EXTEND through
+   494→        # the circuit to add middle and exit hops.
+   495→        # For v1, we assume keys are pre-negotiated via DHT.
+   496→
+   497→        for hop in hops:
+   498→            hop.is_created = True
+   499→
+   500→        self._circuits[circuit.circuit_id.data] = circuit
+   501→        logger.info(
+   502→            "Created onion circuit %s with hops: %s → %s → %s",
+   503→            circuit.circuit_id.data[:4].hex(),
+   504→            hops[0].peer_id[:8],
+   505→            hops[1].peer_id[:8],
+   506→            hops[2].peer_id[:8],
+   507→        )
+   508→        return circuit
+   509→
+   510→    # -------------------------------------------------------------------
+   511→    # Message sending (sender side)
+   512→    # -------------------------------------------------------------------
+   513→
+   514→    async def send_onion_message(
+   515→        self,
+   516→        circuit: OnionCircuit,
+   517→        recipient_addr: str,
+   518→        message: bytes,
+   519→    ) -> None:
+   520→        """Send a message through an onion circuit.
+   521→
+   522→        Applies 3 layers of encryption (exit → middle → guard) and
+   523→        sends to the guard node.
+   524→
+   525→        Args:
+   526→            circuit: The onion circuit to use.
+   527→            recipient_addr: Final recipient address (host:port).
+   528→            message: Plaintext message bytes.
+   529→
+   530→        Raises:
+   531→            CircuitError: If the circuit is not active or expired.
+   532→            RelayError: If sending fails.
+   533→        """
+   534→        if not circuit.is_active:
+   535→            raise CircuitError("Circuit is not active.")
+   536→        if circuit.is_expired:
+   537→            raise CircuitExpiredError("Circuit has expired.")
+   538→
+   539→        if self._send_to_peer is None:
+   540→            raise RelayError("No send callback configured.")
+   541→
+   542→        # Layer 3 (innermost): Exit → Recipient
+   543→        recipient_circuit_id = CircuitId()  # Exit's circuit ID for recipient
+   544→        layer3 = OnionLayerCrypto.add_layer(
+   545→            plaintext=message,
+   546→            key=circuit.exit_node.encryption_key,
+   547→            next_hop_addr=recipient_addr,
+   548→            next_circuit_id=recipient_circuit_id,
+   549→        )
+   550→
+   551→        # Layer 2: Middle → Exit
+   552→        layer2 = OnionLayerCrypto.add_layer(
+   553→            plaintext=layer3,
+   554→            key=circuit.middle.encryption_key,
+   555→            next_hop_addr=circuit.exit_node.address,
+   556→            next_circuit_id=circuit.exit_node.circuit_id,
+   557→        )
+   558→
+   559→        # Layer 1 (outermost): Guard → Middle
+   560→        layer1 = OnionLayerCrypto.add_layer(
+   561→            plaintext=layer2,
+   562→            key=circuit.guard.encryption_key,
+   563→            next_hop_addr=circuit.middle.address,
+   564→            next_circuit_id=circuit.middle.circuit_id,
+   565→        )
+   566→
+   567→        # Send to guard node
+   568→        guard_addr = circuit.guard.address
+   569→        wire_payload = struct.pack("!B", ONION_CMD_RELAY) + layer1
+   570→
+   571→        try:
+   572→            await self._send_to_peer(guard_addr, wire_payload)
+   573→            circuit.messages_sent += 1
+   574→            circuit.touch()
+   575→            logger.debug(
+   576→                "Sent onion message via circuit %s (%d bytes)",
+   577→                circuit.circuit_id.data[:4].hex(),
+   578→                len(wire_payload),
+   579→            )
+   580→        except Exception as exc:
+   581→            raise RelayError(f"Failed to send onion message: {exc}") from exc
+   582→
+   583→    # -------------------------------------------------------------------
+   584→    # Message receiving (relay + recipient side)
+   585→    # -------------------------------------------------------------------
+   586→
+   587→    async def handle_relay_message(
+   588→        self,
+   589→        sender_addr: str,
+   590→        data: bytes,
+   591→    ) -> None:
+   592→        """Handle an incoming onion message (relay or final delivery).
+   593→
+   594→        If this node is the exit, deliver the plaintext to the app.
+   595→        If this node is a relay, peel one layer and forward.
+   596→
+   597→        Args:
+   598→            sender_addr: Address of the previous hop.
+   599→            data: Raw message bytes.
+   600→        """
+   601→        if len(data) < 1:
+   602→            return
+   603→
+   604→        cmd = data[0]
+   605→        payload = data[1:]
+   606→
+   607→        if cmd == ONION_CMD_RELAY:
+   608→            await self._handle_relay(sender_addr, payload)
+   609→        elif cmd == ONION_CMD_CREATE:
+   610→            await self._handle_create(sender_addr, payload)
+   611→        elif cmd == ONION_CMD_DESTROY:
+   612→            await self._handle_destroy(payload)
+   613→
+   614→    async def _handle_relay(self, sender_addr: str, payload: bytes) -> None:
+   615→        """Process a relay message: peel a layer and forward or deliver."""
+   616→        if not self._is_relay_enabled and self._on_incoming_message is None:
+   617→            logger.warning("Received relay message but neither relay nor recipient.")
+   618→            return
+   619→
+   620→        # Try to find the circuit in our relay table
+   621→        # The first CIRCUIT_ID_SIZE bytes identify the incoming circuit
+   622→        if len(payload) < CIRCUIT_ID_SIZE:
+   623→            return
+   624→
+   625→        incoming_circuit_id = payload[:CIRCUIT_ID_SIZE]
+   626→        encrypted_layer = payload[CIRCUIT_ID_SIZE:]
+   627→
+   628→        # Check if this is a circuit we're relaying
+   629→        relay_entry = self._relay_state.lookup_forward(incoming_circuit_id)
+   630→
+   631→        if relay_entry:
+   632→            # We're a relay — peel our layer and forward
+   633→            next_hop, outgoing_circuit_id, enc_key = relay_entry
+   634→
+   635→            try:
+   636→                next_addr, next_cid, remaining = OnionLayerCrypto.peel_layer(
+   637→                    encrypted_layer, enc_key,
+   638→                )
+   639→            except DecryptionError as exc:
+   640→                logger.error("Failed to peel layer: %s", exc)
+   641→                return
+   642→
+   643→            # Forward to next hop
+   644→            if self._send_to_peer:
+   645→                wire = struct.pack("!B", ONION_CMD_RELAY) + outgoing_circuit_id + remaining
+   646→                try:
+   647→                    await self._send_to_peer(next_addr, wire)
+   648→                except Exception as exc:
+   649→                    logger.error("Relay forward failed: %s", exc)
+   650→        else:
+   651→            # We might be the recipient or the exit node
+   652→            # Try to decrypt with our own circuit keys
+   653→            if self._on_incoming_message:
+   654→                await self._on_incoming_message(incoming_circuit_id, encrypted_layer)
+   655→
+   656→    async def _handle_create(self, sender_addr: str, payload: bytes) -> None:
+   657→        """Handle a circuit creation request."""
+   658→        if not self._is_relay_enabled:
+   659→            return
+   660→
+   661→        # Parse CREATE payload
+   662→        if len(payload) < CIRCUIT_ID_SIZE + 32:
+   663→            logger.warning("CREATE payload too short.")
+   664→            return
+   665→
+   666→        circuit_id = payload[:CIRCUIT_ID_SIZE]
+   667→        x25519_pk = payload[CIRCUIT_ID_SIZE:CIRCUIT_ID_SIZE + 32]
+   668→
+   669→        # In a full implementation, we would perform DH key exchange here
+   670→        # For v1, we accept the circuit and generate a relay key
+   671→        relay_key = os.urandom(32)
+   672→
+   673→        # Store relay entry (we need the next hop from the CREATE extension)
+   674→        # Simplified: assume we know the next hop from the CREATE payload
+   675→        logger.info("Circuit CREATE from %s: %s", sender_addr, circuit_id[:4].hex())
+   676→
+   677→    async def _handle_destroy(self, payload: bytes) -> None:
+   678→        """Handle a circuit destroy message."""
+   679→        if len(payload) < CIRCUIT_ID_SIZE:
+   680→            return
+   681→        circuit_id = payload[:CIRCUIT_ID_SIZE]
+   682→        self._relay_state.remove_circuit(circuit_id)
+   683→        logger.debug("Circuit destroyed: %s", circuit_id[:4].hex())
+   684→
+   685→    # -------------------------------------------------------------------
+   686→    # Circuit management
+   687→    # -------------------------------------------------------------------
+   688→
+   689→    def get_circuit(self, circuit_id: bytes) -> Optional[OnionCircuit]:
+   690→        """Look up a circuit by its ID."""
+   691→        return self._circuits.get(circuit_id)
+   692→
+   693→    def get_active_circuits(self) -> list[OnionCircuit]:
+   694→        """Get all active circuits."""
+   695→        return [c for c in self._circuits.values() if c.is_active and not c.is_expired]
+   696→
+   697→    async def destroy_circuit(self, circuit_id: bytes) -> None:
+   698→        """Gracefully destroy a circuit."""
+   699→        circuit = self._circuits.get(circuit_id)
+   700→        if circuit:
+   701→            # Send DESTROY to guard
+   702→            if self._send_to_peer and circuit.guard:
+   703→                try:
+   704→                    destroy_msg = struct.pack("!B", ONION_CMD_DESTROY) + circuit_id
+   705→                    await self._send_to_peer(circuit.guard.address, destroy_msg)
+   706→                except Exception:
+   707→                    pass
+   708→
+   709→            circuit.cleanup()
+   710→            del self._circuits[circuit_id]
+   711→
+   712→    # -------------------------------------------------------------------
+   713→    # Background maintenance
+   714→    # -------------------------------------------------------------------
+   715→
+   716→    async def _cleanup_loop(self) -> None:
+   717→        """Periodically clean up expired circuits."""
+   718→        while self._running:
+   719→            try:
+   720→                expired = [
+   721→                    cid for cid, circuit in self._circuits.items()
+   722→                    if circuit.is_expired
+   723→                ]
+   724→                for cid in expired:
+   725→                    await self.destroy_circuit(cid)
+   726→                    logger.debug("Cleaned up expired circuit %s", cid[:4].hex())
+   727→
+   728→                await asyncio.sleep(60)  # Check every minute
+   729→            except asyncio.CancelledError:
+   730→                break
+   731→            except Exception as exc:
+   732→                logger.error("Circuit cleanup error: %s", exc)
+   733→                await asyncio.sleep(30)
+   734→

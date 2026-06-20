@@ -1,10 +1,86 @@
-# Presidium v1.0 Release Announcement
+# Presidium v1.5 "Prime" Release Announcement
 
 ## 🔒 Presidium — Fully Decentralized E2EE P2P Messenger
 
 > **Your messages. Your keys. No servers. No compromises.**
 
 Presidium is a privacy-first, fully decentralized peer-to-peer messenger built with pure Python. No central servers, no phone numbers, no metadata leaks. Every message is end-to-end encrypted using the Double Ratchet protocol — the same algorithm used by Signal — but without any server dependency.
+
+---
+
+## 🆕 What's New in v1.5 "Prime"
+
+### Zero-Knowledge Push Notifications
+- **Self-hosted Push Relay (aiohttp)**: Delivers only encrypted blobs — no plaintext ever touches the relay. Recipients poll by pseudorandom blob IDs computed from their own public key, so the relay can't even tell which IDs belong to whom.
+- **Blind Fetch**: Recipients compute `SHA-256(public_key || timestamp_bucket)[:16]` to derive expected blob IDs. The relay returns matching encrypted blobs without knowing the recipient's identity.
+- **FCM/APNS Fallback**: Sends only a 16-byte encrypted_payload_id via push providers. The client then performs a blind fetch to retrieve the actual E2EE payload.
+- **Rate Limiting**: 100 pushes/hour/IP, 600 pulls/hour/IP with sliding window enforcement.
+
+### Voice Messages
+- **OPUS-encoded recording**: Configurable bitrate (6-32 kbps), max 5-minute duration. Waveform extraction for visual preview with 64 amplitude bars.
+- **Streaming Playback**: Start listening before the full download completes. Speed control (0.5x - 2.0x) with position scrubbing.
+- **Waveform Widget**: Interactive PySide6 widget showing amplitude bars with playback progress. Click to seek.
+
+### Location Sharing
+- **Precision Control**: Four levels — Exact, Building (~100m), Neighborhood (~1km), City (~10km). Precision reduction is applied CLIENT-SIDE before encryption.
+- **Live Location**: Periodic updates at configurable intervals (15min, 30min, 1hr, 8hr, 24hr durations). Automatic expiry.
+- **Point of Interest**: Share named locations with labels.
+
+### Polls & Voting
+- **End-to-End Encrypted Polls**: Poll definitions encrypted with Sender Keys (group), votes encrypted with creator's public key. Only the creator sees individual votes.
+- **Anonymous Mode**: Even the poll creator cannot link votes to voters.
+- **Secret Ballot**: Commit-reveal scheme using SHA-256 hash commitments.
+- **Single/Multiple Choice**: Configurable poll types with vote change option.
+
+### Internationalization (15+ Languages)
+- **Full i18n Framework**: `_()` translation function with interpolation and plural forms. CLDR plural rules for English, Russian, Chinese, Japanese, Korean, German, French, Spanish, Portuguese, Arabic, Hindi, Turkish, Farsi, Ukrainian.
+- **RTL Support**: Right-to-left layout for Arabic, Farsi, and Hebrew. Bidirectional text markers for mixed content.
+- **Lazy Locale Loading**: JSON locale files loaded on demand. English and Russian translations included.
+
+### Accessibility
+- **Screen Reader Support**: Qt Accessibility integration with `setAccessibleName()` on all interactive widgets. Rich descriptions for chat bubbles, contacts, and voice messages.
+- **High Contrast Modes**: Dark and Light high contrast themes with customizable focus indicators.
+- **Font Scaling**: 75% to 200% font size scaling. Color blind palette transformations (Protanopia, Deuteranopia, Tritanopia).
+- **Reduced Motion**: Three levels — Full, Reduced (shorter durations), None (all animations disabled).
+- **Keyboard Navigation**: Enhanced focus chains with configurable shortcuts.
+
+### Semantic Search
+- **AI-Powered Message Search**: Natural language queries using sentence-transformers embeddings (all-MiniLM-L6-v2, 384 dimensions). Falls back to character n-gram embeddings without ML dependencies.
+- **FAISS Index**: Fast similarity search with incremental background indexing. Hybrid search combining semantic similarity with FTS5 keyword matching.
+- **Cross-Lingual**: Query in one language, find messages in another.
+
+### Smart Folders
+- **Automatic Message Categorization**: Virtual folders with compound filter rules (keyword, peer, group, time period, read status, message type, tags).
+- **Built-in Folders**: Unread, Groups, Mentions, Files, Today.
+- **Custom Folders**: Create with AND/OR rule logic. Pin to sidebar.
+
+### Contact Discovery v2
+- **Blind Signature Protocol**: RSA blind signatures for privacy-preserving contact matching. The server signs blinded contact tokens without seeing plaintext contact info.
+- **Privacy**: Server never learns which contacts you're checking. Only mutual contacts produce matching signatures.
+
+### Data Import
+- **Signal Import**: Parse Signal JSON exports with full conversation history and attachments.
+- **WhatsApp Import**: Parse `_chat.txt` exports with US/EU date formats and multi-line messages.
+- **Telegram Import**: Parse `result.json` with stickers, animations, and voice messages.
+- **Validation Pipeline**: HTML sanitization, control character stripping, length limits, timestamp validation.
+
+### White-Label SDK
+- **Simple API**: `PresidiumSDK` class with `initialize()`, `send_message()`, `receive_messages()`, `create_group()`, `get_contacts()`.
+- **Thread-Safe**: Async wrappers with sync convenience methods. Event bus for handler registration.
+- **Configurable**: App name, relay URL, timeout, reconnection, encryption settings.
+
+### Virtualized Lists
+- **Efficient Rendering**: Only visible items + buffer are rendered. Widget recycling with free-list. Variable-height support.
+- **Smooth Scrolling**: QPropertyAnimation-based smooth scroll with `scroll_to_bottom()` for chat views.
+
+### Onboarding v2
+- **5-Step Setup Wizard**: Welcome → Create Identity → Recovery Phrase (12-word BIP39-like) → Profile Setup → Ready.
+- **Password Strength Indicator**: Real-time validation with visual feedback.
+- **Recovery Phrase**: Crypto-secure word selection with save confirmation gate.
+
+### E2E Test Suite v1.5
+- **15 Test Classes**: Crypto, Double Ratchet, DHT, Discovery v2, Push Relay, Voice Messages, Location, Polls, i18n, a11y, Search, Import, SDK, Virtual Lists, Welcome v2.
+- **100+ Test Cases**: Covering all Phase 6 features with pytest-asyncio.
 
 ---
 
@@ -176,7 +252,8 @@ make build-all
 | Phase 3 | ~15,000 | 65 | WebRTC, Connection Pool, Sharded DB, Audit |
 | Phase 4 | ~10,900 | 30 | Bridges, Mobile UI, Plugins, Formal Verif. |
 | Phase 5 | ~12,000 | 14 | Sealed Sender, Onion, PQ Crypto, AI, Relay |
-| **Total** | **~58,000** | **~188** | **Full platform** |
+| Phase 6 | ~14,000 | 20 | Push, Voice Msg, Location, Polls, i18n, a11y, Search, Import, SDK |
+| **Total** | **~72,000** | **~208** | **Full platform** |
 
 ---
 

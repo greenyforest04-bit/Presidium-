@@ -1,0 +1,844 @@
+     1→"""Push Client for Presidium — privacy-preserving notification receiver.
+     2→
+     3→Implements the client-side of the Zero-Knowledge Push system:
+     4→    - Blind fetch: computes expected blob IDs from own public key and
+     5→      timestamp buckets, then fetches matching blobs without revealing
+     6→      identity to the relay
+     7→    - FCM/APNS fallback: receives only a 16-byte encrypted_payload_id,
+     8→      then performs a blind fetch to retrieve the actual E2EE payload
+     9→    - Local decryption: uses Double Ratchet / HPKE to decrypt payloads
+    10→      that the relay could never read
+    11→    - Background polling: periodic fetch on configurable interval
+    12→
+    13→Protocol flow:
+    14→    Client (background)                     Relay
+    15→      |                                       |
+    16→      |  1. Compute blob_ids:                 |
+    17→      |     id = SHA-256(my_pk || bucket)     |
+    18→      |     bucket = floor(now / 3600)        |
+    19→      |  2. GET /pull?ids=<hex_id1>,...       |
+    20→      |  ----ids (no identity)------------>   |
+    21→      |  <---encrypted blobs----------------  |
+    22→      |  3. Decrypt with Double Ratchet/HPKE  |
+    23→      |                                       |
+    24→      |                                       |
+    25→    FCM/APNS path:                           |
+    26→      |  <---push with blob_id only--------   |
+    27→      |  GET /pull?ids=<hex_blob_id>          |
+    28→      |  ----blob_id---------------------->   |
+    29→      |  <---encrypted blob-----------------  |
+    30→      |  4. Decrypt locally                  |
+    31→
+    32→Privacy guarantees:
+    33→    - Relay never learns which public key maps to which blob IDs
+    34→    - Relay never sees plaintext message content
+    35→    - FCM/APNS only receives 16-byte blob_id, no message metadata
+    36→    - Blob IDs change hourly, preventing long-term tracking
+    37→    - Each blob is fetched only once (forward secrecy)
+    38→"""
+    39→
+    40→from __future__ import annotations
+    41→
+    42→import asyncio
+    43→import enum
+    44→import hashlib
+    45→import logging
+    46→import struct
+    47→import time
+    48→from dataclasses import dataclass, field
+    49→from typing import Callable, Awaitable, Optional
+    50→
+    51→import aiohttp
+    52→
+    53→from presidium.core.crypto import AES256GCM, SecureBytes, secure_zero
+    54→
+    55→logger = logging.getLogger(__name__)
+    56→
+    57→
+    58→# ---------------------------------------------------------------------------
+    59→# Constants
+    60→# ---------------------------------------------------------------------------
+    61→
+    62→BLOB_ID_SIZE = 16               # 128-bit blob identifier
+    63→TIME_BUCKET_SECONDS = 3600      # 1 hour time bucket for ID computation
+    64→POLL_INTERVAL_DEFAULT = 30      # seconds between background polls
+    65→PULL_TIMEOUT = 10               # seconds for HTTP pull request
+    66→MAX_POLL_RETRIES = 3            # max retries on transient failures
+    67→FCM_PAYLOAD_ID_SIZE = 16        # bytes sent via FCM/APNS
+    68→
+    69→
+    70→# ---------------------------------------------------------------------------
+    71→# Custom exceptions
+    72→# ---------------------------------------------------------------------------
+    73→
+    74→class PushClientError(Exception):
+    75→    """Base exception for push client operations."""
+    76→
+    77→
+    78→class FetchError(PushClientError):
+    79→    """Failed to fetch blobs from the relay."""
+    80→
+    81→
+    82→class DecryptionError(PushClientError):
+    83→    """Failed to decrypt a fetched blob."""
+    84→
+    85→
+    86→class RegistrationError(PushClientError):
+    87→    """Failed to register or unregister a device token."""
+    88→
+    89→
+    90→class RelayUnavailableError(PushClientError):
+    91→    """Relay server is unreachable."""
+    92→
+    93→
+    94→# ---------------------------------------------------------------------------
+    95→# Push provider enum
+    96→# ---------------------------------------------------------------------------
+    97→
+    98→class PushProvider(enum.Enum):
+    99→    """Push notification provider type."""
+   100→    NONE = "none"       # No push provider (polling only)
+   101→    FCM = "fcm"         # Firebase Cloud Messaging (Android/Web)
+   102→    APNS = "apns"       # Apple Push Notification Service (iOS/macOS)
+   103→    LOCAL = "local"     # Local notification (desktop)
+   104→
+   105→
+   106→# ---------------------------------------------------------------------------
+   107→# Data models
+   108→# ---------------------------------------------------------------------------
+   109→
+   110→@dataclass
+   111→class PushClientConfig:
+   112→    """Configuration for the Push Client.
+   113→
+   114→    Attributes:
+   115→        relay_url: Base URL of the push relay server.
+   116→        public_key: Our X25519 public key (32 bytes) for blob ID computation.
+   117→        poll_interval: Seconds between background polls.
+   118→        time_buckets: Number of past time buckets to check per poll.
+   119→        fcm_token: Firebase Cloud Messaging device token (optional).
+   120→        apns_token: Apple Push Notification Service token (optional).
+   121→        provider: Active push notification provider.
+   122→        pull_timeout: HTTP timeout for pull requests in seconds.
+   123→        auto_start: Whether to start polling automatically on init.
+   124→    """
+   125→    relay_url: str = "https://relay.presidium.chat"
+   126→    public_key: bytes = b""      # 32 bytes X25519 public key
+   127→    poll_interval: int = POLL_INTERVAL_DEFAULT
+   128→    time_buckets: int = 3        # Check current + 2 previous buckets
+   129→    fcm_token: str = ""
+   130→    apns_token: str = ""
+   131→    provider: PushProvider = PushProvider.NONE
+   132→    pull_timeout: int = PULL_TIMEOUT
+   133→    auto_start: bool = True
+   134→
+   135→
+   136→@dataclass
+   137→class FetchedBlob:
+   138→    """A blob fetched from the relay, before local decryption.
+   139→
+   140→    Attributes:
+   141→        blob_id: 16-byte identifier of the blob.
+   142→        encrypted_data: Raw encrypted payload bytes.
+   143→        hmac_tag: HMAC tag from the relay.
+   144→        expires_at: Unix timestamp when the blob expires.
+   145→    """
+   146→    blob_id: bytes
+   147→    encrypted_data: bytes
+   148→    hmac_tag: bytes
+   149→    expires_at: float
+   150→
+   151→
+   152→@dataclass
+   153→class DecryptedNotification:
+   154→    """A fully decrypted push notification.
+   155→
+   156→    Attributes:
+   157→        sender_user_id: User ID of the message sender.
+   158→        message_type: Type of notification (chat, group, file, etc.).
+   159→        encrypted_payload: The E2EE message content (still encrypted
+   160→            with the session key; the push client only strips the
+   161→            relay-level encryption).
+   162→        received_at: Unix timestamp when the notification was processed.
+   163→    """
+   164→    sender_user_id: str
+   165→    message_type: str
+   166→    encrypted_payload: bytes
+   167→    received_at: float
+   168→
+   169→
+   170→# ---------------------------------------------------------------------------
+   171→# Blob ID computation
+   172→# ---------------------------------------------------------------------------
+   173→
+   174→class BlobIDComputer:
+   175→    """Computes pseudorandom blob IDs from a public key and time buckets.
+   176→
+   177→    The recipient precomputes the blob IDs they expect to have messages
+   178→    for, then fetches them in a single blind request. The relay cannot
+   179→    determine which public key corresponds to which blob IDs because
+   180→    SHA-256 is a one-way function.
+   181→
+   182→    Formula:
+   183→        bucket = floor(unix_timestamp / TIME_BUCKET_SECONDS)
+   184→        blob_id = SHA-256(public_key || big_endian_uint64(bucket))[:16]
+   185→    """
+   186→
+   187→    def __init__(self, public_key: bytes) -> None:
+   188→        if len(public_key) != 32:
+   189→            raise PushClientError(
+   190→                f"Invalid public key size: {len(public_key)}, expected 32."
+   191→            )
+   192→        self._public_key = public_key
+   193→
+   194→    def compute_current_ids(self, num_buckets: int = 3) -> list[bytes]:
+   195→        """Compute blob IDs for the current and recent time buckets.
+   196→
+   197→        Args:
+   198→            num_buckets: Number of buckets to compute (current + past).
+   199→
+   200→        Returns:
+   201→            List of 16-byte blob IDs, most recent first.
+   202→        """
+   203→        current_bucket = int(time.time()) // TIME_BUCKET_SECONDS
+   204→        ids: list[bytes] = []
+   205→        for offset in range(num_buckets):
+   206→            bucket = current_bucket - offset
+   207→            blob_id = self._compute_id(bucket)
+   208→            ids.append(blob_id)
+   209→        return ids
+   210→
+   211→    def compute_id_for_blob_id_hex(self, blob_id_hex: str) -> bytes:
+   212→        """Convert a hex blob ID from an FCM/APNS push to bytes.
+   213→
+   214→        Args:
+   215→            blob_id_hex: 32-character hex string of the blob ID.
+   216→
+   217→        Returns:
+   218→            16-byte blob ID.
+   219→        """
+   220→        try:
+   221→            bid = bytes.fromhex(blob_id_hex)
+   222→            if len(bid) != BLOB_ID_SIZE:
+   223→                raise PushClientError(
+   224→                    f"Invalid blob ID size: {len(bid)}, expected {BLOB_ID_SIZE}."
+   225→                )
+   226→            return bid
+   227→        except ValueError as exc:
+   228→            raise PushClientError(f"Invalid blob ID hex: {exc}") from exc
+   229→
+   230→    def _compute_id(self, bucket: int) -> bytes:
+   231→        """Compute a single blob ID for a time bucket.
+   232→
+   233→        Args:
+   234→            bucket: Time bucket index.
+   235→
+   236→        Returns:
+   237→            16-byte blob ID.
+   238→        """
+   239→        data = self._public_key + struct.pack("!Q", bucket)
+   240→        return hashlib.sha256(data).digest()[:BLOB_ID_SIZE]
+   241→
+   242→
+   243→# ---------------------------------------------------------------------------
+   244→# Push Client
+   245→# ---------------------------------------------------------------------------
+   246→
+   247→class PushClient:
+   248→    """Client for the Zero-Knowledge Push Relay.
+   249→
+   250→    Provides:
+   251→        - Background polling for new encrypted blobs
+   252→        - FCM/APNS-triggered fetch on receiving a push
+   253→        - Device token registration with the relay
+   254→        - Local decryption of relay-level encryption
+   255→        - Callbacks for delivering decrypted notifications to the app
+   256→
+   257→    Lifecycle:
+   258→        client = PushClient(config)
+   259→        client.set_on_notification(callback)
+   260→        await client.start()    # Starts background polling
+   261→        ...
+   262→        await client.stop()     # Graceful shutdown
+   263→    """
+   264→
+   265→    def __init__(self, config: PushClientConfig) -> None:
+   266→        self._config = config
+   267→        self._id_computer = BlobIDComputer(config.public_key)
+   268→        self._session: Optional[aiohttp.ClientSession] = None
+   269→        self._poll_task: Optional[asyncio.Task] = None
+   270→        self._running = False
+   271→        self._last_poll_time: float = 0.0
+   272→        self._consecutive_errors = 0
+   273→
+   274→        # Callbacks
+   275→        self._on_notification: Optional[Callable[[DecryptedNotification], Awaitable[None]]] = None
+   276→        self._on_fetch_error: Optional[Callable[[Exception], Awaitable[None]]] = None
+   277→
+   278→        # Stats
+   279→        self._total_fetched: int = 0
+   280→        self._total_decrypted: int = 0
+   281→        self._total_errors: int = 0
+   282→
+   283→    # -------------------------------------------------------------------
+   284→    # Callback registration
+   285→    # -------------------------------------------------------------------
+   286→
+   287→    def set_on_notification(
+   288→        self, callback: Callable[[DecryptedNotification], Awaitable[None]]
+   289→    ) -> None:
+   290→        """Register a callback for when a notification is decrypted.
+   291→
+   292→        Args:
+   293→            callback: Async function called with the DecryptedNotification.
+   294→        """
+   295→        self._on_notification = callback
+   296→
+   297→    def set_on_fetch_error(
+   298→        self, callback: Callable[[Exception], Awaitable[None]]
+   299→    ) -> None:
+   300→        """Register a callback for fetch errors.
+   301→
+   302→        Args:
+   303→            callback: Async function called with the exception.
+   304→        """
+   305→        self._on_fetch_error = callback
+   306→
+   307→    # -------------------------------------------------------------------
+   308→    # Lifecycle
+   309→    # -------------------------------------------------------------------
+   310→
+   311→    async def start(self) -> None:
+   312→        """Start the push client background polling.
+   313→
+   314→        Creates an aiohttp session and starts the poll loop. If a
+   315→        device token is configured, also registers with the relay.
+   316→        """
+   317→        if self._running:
+   318→            return
+   319→
+   320→        self._session = aiohttp.ClientSession(
+   321→            timeout=aiohttp.ClientTimeout(total=self._config.pull_timeout),
+   322→        )
+   323→        self._running = True
+   324→
+   325→        # Register device token if available
+   326→        if self._config.provider in (PushProvider.FCM, PushProvider.APNS):
+   327→            await self._register_device_token()
+   328→
+   329→        # Start background polling
+   330→        self._poll_task = asyncio.create_task(self._poll_loop())
+   331→
+   332→        logger.info(
+   333→            "Push client started (provider=%s, interval=%ds).",
+   334→            self._config.provider.value,
+   335→            self._config.poll_interval,
+   336→        )
+   337→
+   338→    async def stop(self) -> None:
+   339→        """Stop the push client and clean up resources."""
+   340→        self._running = False
+   341→
+   342→        if self._poll_task is not None:
+   343→            self._poll_task.cancel()
+   344→            try:
+   345→                await self._poll_task
+   346→            except asyncio.CancelledError:
+   347→                pass
+   348→            self._poll_task = None
+   349→
+   350→        if self._session is not None:
+   351→            await self._session.close()
+   352→            self._session = None
+   353→
+   354→        logger.info("Push client stopped.")
+   355→
+   356→    # -------------------------------------------------------------------
+   357→    # Background polling
+   358→    # -------------------------------------------------------------------
+   359→
+   360→    async def _poll_loop(self) -> None:
+   361→        """Periodically poll the relay for new blobs."""
+   362→        while self._running:
+   363→            try:
+   364→                await asyncio.sleep(self._config.poll_interval)
+   365→                if not self._running:
+   366→                    break
+   367→
+   368→                await self.fetch_and_decrypt()
+   369→                self._consecutive_errors = 0
+   370→
+   371→            except asyncio.CancelledError:
+   372→                raise
+   373→            except Exception as exc:
+   374→                self._consecutive_errors += 1
+   375→                self._total_errors += 1
+   376→                logger.warning(
+   377→                    "Poll error (#%d): %s", self._consecutive_errors, exc
+   378→                )
+   379→
+   380→                if self._on_fetch_error:
+   381→                    await self._on_fetch_error(exc)
+   382→
+   383→                # Exponential backoff on repeated errors
+   384→                if self._consecutive_errors > 1:
+   385→                    backoff = min(
+   386→                        self._config.poll_interval * (2 ** min(self._consecutive_errors - 1, 5)),
+   387→                        300,  # Max 5 minutes
+   388→                    )
+   389→                    await asyncio.sleep(backoff)
+   390→
+   391→    # -------------------------------------------------------------------
+   392→    # Fetch and decrypt
+   393→    # -------------------------------------------------------------------
+   394→
+   395→    async def fetch_and_decrypt(self) -> list[DecryptedNotification]:
+   396→        """Fetch new blobs from the relay and decrypt them.
+   397→
+   398→        Computes expected blob IDs from our public key and current/recent
+   399→        time buckets, then fetches matching blobs and decrypts them.
+   400→
+   401→        Returns:
+   402→            List of decrypted notifications.
+   403→        """
+   404→        if self._session is None:
+   405→            raise FetchError("Client not started — no HTTP session.")
+   406→
+   407→        # Compute blob IDs
+   408→        blob_ids = self._id_computer.compute_current_ids(
+   409→            num_buckets=self._config.time_buckets
+   410→        )
+   411→
+   412→        # Fetch from relay
+   413→        blobs = await self._fetch_blobs(blob_ids)
+   414→        self._total_fetched += len(blobs)
+   415→
+   416→        # Decrypt each blob
+   417→        notifications: list[DecryptedNotification] = []
+   418→        for blob in blobs:
+   419→            try:
+   420→                notification = self._decrypt_blob(blob)
+   421→                notifications.append(notification)
+   422→                self._total_decrypted += 1
+   423→
+   424→                # Deliver via callback
+   425→                if self._on_notification:
+   426→                    await self._on_notification(notification)
+   427→
+   428→            except Exception as exc:
+   429→                logger.warning(
+   430→                    "Failed to decrypt blob %s: %s",
+   431→                    blob.blob_id.hex(),
+   432→                    exc,
+   433→                )
+   434→                self._total_errors += 1
+   435→
+   436→        self._last_poll_time = time.time()
+   437→        return notifications
+   438→
+   439→    async def fetch_by_blob_id(self, blob_id_hex: str) -> Optional[DecryptedNotification]:
+   440→        """Fetch a specific blob by its hex ID (from FCM/APNS push).
+   441→
+   442→        This is called when the app receives a push notification
+   443→        containing only a blob_id, and needs to fetch the actual
+   444→        encrypted payload.
+   445→
+   446→        Args:
+   447→            blob_id_hex: 32-character hex string of the blob ID.
+   448→
+   449→        Returns:
+   450→            Decrypted notification, or None if blob not found.
+   451→        """
+   452→        if self._session is None:
+   453→            raise FetchError("Client not started — no HTTP session.")
+   454→
+   455→        blob_id = self._id_computer.compute_id_for_blob_id_hex(blob_id_hex)
+   456→        blobs = await self._fetch_blobs([blob_id])
+   457→
+   458→        if not blobs:
+   459→            logger.debug("Blob %s not found on relay.", blob_id_hex)
+   460→            return None
+   461→
+   462→        notification = self._decrypt_blob(blobs[0])
+   463→        self._total_fetched += 1
+   464→        self._total_decrypted += 1
+   465→
+   466→        if self._on_notification:
+   467→            await self._on_notification(notification)
+   468→
+   469→        return notification
+   470→
+   471→    # -------------------------------------------------------------------
+   472→    # HTTP operations
+   473→    # -------------------------------------------------------------------
+   474→
+   475→    async def _fetch_blobs(self, blob_ids: list[bytes]) -> list[FetchedBlob]:
+   476→        """Fetch blobs from the relay by their IDs.
+   477→
+   478→        Args:
+   479→            blob_ids: List of 16-byte blob identifiers.
+   480→
+   481→        Returns:
+   482→            List of FetchedBlob objects.
+   483→
+   484→        Raises:
+   485→            FetchError: If the HTTP request fails.
+   486→            RelayUnavailableError: If the relay is unreachable.
+   487→        """
+   488→        ids_param = ",".join(bid.hex() for bid in blob_ids)
+   489→        url = f"{self._config.relay_url}/pull?ids={ids_param}"
+   490→
+   491→        for attempt in range(MAX_POLL_RETRIES):
+   492→            try:
+   493→                async with self._session.get(url) as resp:
+   494→                    if resp.status == 200:
+   495→                        data = await resp.json()
+   496→                        return self._parse_pull_response(data)
+   497→                    if resp.status == 429:
+   498→                        retry_after = int(resp.headers.get("Retry-After", "60"))
+   499→                        logger.warning("Rate limited. Retrying in %ds.", retry_after)
+   500→                        await asyncio.sleep(retry_after)
+   501→                        continue
+   502→                    if resp.status >= 500:
+   503→                        logger.warning("Relay error %d, retrying...", resp.status)
+   504→                        await asyncio.sleep(2 ** attempt)
+   505→                        continue
+   506→                    # Client error — don't retry
+   507→                    body = await resp.text()
+   508→                    raise FetchError(f"Relay returned {resp.status}: {body[:200]}")
+   509→
+   510→            except aiohttp.ClientError as exc:
+   511→                if attempt == MAX_POLL_RETRIES - 1:
+   512→                    raise RelayUnavailableError(
+   513→                        f"Relay unreachable after {MAX_POLL_RETRIES} attempts: {exc}"
+   514→                    ) from exc
+   515→                await asyncio.sleep(2 ** attempt)
+   516→
+   517→        return []
+   518→
+   519→    def _parse_pull_response(self, data: dict) -> list[FetchedBlob]:
+   520→        """Parse the JSON response from a /pull request.
+   521→
+   522→        Args:
+   523→            data: Parsed JSON response from the relay.
+   524→
+   525→        Returns:
+   526→            List of FetchedBlob objects.
+   527→        """
+   528→        blobs: list[FetchedBlob] = []
+   529→        for item in data.get("blobs", []):
+   530→            blob_id = bytes.fromhex(item["blob_id"])
+   531→            encrypted_data = bytes.fromhex(item["encrypted_data"])
+   532→            hmac_tag = bytes.fromhex(item["hmac_tag"])
+   533→            expires_at = item.get("expires_at", 0.0)
+   534→
+   535→            blobs.append(FetchedBlob(
+   536→                blob_id=blob_id,
+   537→                encrypted_data=encrypted_data,
+   538→                hmac_tag=hmac_tag,
+   539→                expires_at=expires_at,
+   540→            ))
+   541→        return blobs
+   542→
+   543→    # -------------------------------------------------------------------
+   544→    # Local decryption
+   545→    # -------------------------------------------------------------------
+   546→
+   547→    def _decrypt_blob(self, blob: FetchedBlob) -> DecryptedNotification:
+   548→        """Decrypt a fetched blob using the relay-level key.
+   549→
+   550→        Note: The blob contains data that is already E2EE between
+   551→        the sender and recipient (via Double Ratchet or HPKE).
+   552→        The relay adds a layer of AES-256-GCM encryption using
+   553→        a key derived from the recipient's public key and the
+   554→        blob_id. This function strips that outer layer.
+   555→
+   556→        The inner payload is still encrypted and must be processed
+   557→        by the messaging layer (ChatManager / SealedSenderManager).
+   558→
+   559→        Args:
+   560→            blob: The fetched blob to decrypt.
+   561→
+   562→        Returns:
+   563→            DecryptedNotification with the inner encrypted payload.
+   564→
+   565→        Raises:
+   566→            DecryptionError: If the outer relay encryption cannot be removed.
+   567→        """
+   568→        # Derive relay-level decryption key from our public key + blob_id
+   569→        # Key = HKDF-SHA256(SHA-256(pk || blob_id), info="presidium-relay-key")
+   570→        combined = self._config.public_key + blob.blob_id
+   571→        prk = hashlib.sha256(combined).digest()
+   572→
+   573→        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+   574→        from cryptography.hazmat.primitives import hashes
+   575→
+   576→        hkdf = HKDF(
+   577→            algorithm=hashes.SHA256(),
+   578→            length=32,
+   579→            salt=blob.blob_id,
+   580→            info=b"presidium-relay-key",
+   581→        )
+   582→        relay_key = hkdf.derive(prk)
+   583→
+   584→        try:
+   585→            # Decrypt: first 12 bytes = nonce, rest = ciphertext + tag
+   586→            plaintext = AES256GCM.decrypt(
+   587→                key=relay_key,
+   588→                data=blob.encrypted_data,
+   589→                aad=blob.blob_id,
+   590→            )
+   591→        except Exception as exc:
+   592→            raise DecryptionError(
+   593→                f"Failed to decrypt relay-level encryption: {exc}"
+   594→            ) from exc
+   595→        finally:
+   596→            secure_zero(bytearray(relay_key))
+   597→
+   598→        # Parse the inner payload format:
+   599→        # [1B type_len][N bytes message_type]
+   600→        # [16B sender_user_id]
+   601→        # [rest: encrypted_payload]
+   602→        if len(plaintext) < 1 + 16:
+   603→            raise DecryptionError("Decrypted payload too short.")
+   604→
+   605→        offset = 0
+   606→        type_len = plaintext[offset]
+   607→        offset += 1
+   608→
+   609→        if len(plaintext) < offset + type_len + 16:
+   610→            raise DecryptionError("Decrypted payload truncated.")
+   611→
+   612→        message_type = plaintext[offset:offset + type_len].decode("utf-8")
+   613→        offset += type_len
+   614→
+   615→        sender_user_id = plaintext[offset:offset + 16].hex()
+   616→        offset += 16
+   617→
+   618→        encrypted_payload = plaintext[offset:]
+   619→
+   620→        return DecryptedNotification(
+   621→            sender_user_id=sender_user_id,
+   622→            message_type=message_type,
+   623→            encrypted_payload=encrypted_payload,
+   624→            received_at=time.time(),
+   625→        )
+   626→
+   627→    # -------------------------------------------------------------------
+   628→    # Push to relay (sender side)
+   629→    # -------------------------------------------------------------------
+   630→
+   631→    async def push_to_relay(
+   632→        self,
+   633→        recipient_public_key: bytes,
+   634→        encrypted_payload: bytes,
+   635→        message_type: str = "chat",
+   636→        sender_user_id: str = "",
+   637→    ) -> str:
+   638→        """Push an encrypted blob to the relay for a recipient.
+   639→
+   640→        This is used by the SENDER to deposit an encrypted blob on the
+   641→        relay. The blob_id is computed from the recipient's public key
+   642→        and the current time bucket, so the recipient can find it.
+   643→
+   644→        Args:
+   645→            recipient_public_key: Recipient's X25519 public key (32 bytes).
+   646→            encrypted_payload: E2EE message content (already encrypted
+   647→                with Double Ratchet or HPKE).
+   648→            message_type: Type string for the notification.
+   649→            sender_user_id: Our user ID (included in relay-level payload).
+   650→
+   651→        Returns:
+   652→            Hex string of the stored blob_id.
+   653→
+   654→        Raises:
+   655→            FetchError: If the HTTP request to the relay fails.
+   656→        """
+   657→        if self._session is None:
+   658→            raise FetchError("Client not started — no HTTP session.")
+   659→
+   660→        # Compute the recipient's blob ID
+   661→        recipient_computer = BlobIDComputer(recipient_public_key)
+   662→        blob_id = recipient_computer.compute_current_ids(num_buckets=1)[0]
+   663→
+   664→        # Add relay-level encryption
+   665→        # Inner format: [1B type_len][type][16B sender_uid][payload]
+   666→        type_bytes = message_type.encode("utf-8")
+   667→        sender_uid_bytes = bytes.fromhex(sender_user_id) if sender_user_id else b"\x00" * 16
+   668→
+   669→        inner = (
+   670→            bytes([len(type_bytes)])
+   671→            + type_bytes
+   672→            + sender_uid_bytes
+   673→            + encrypted_payload
+   674→        )
+   675→
+   676→        # Derive relay-level encryption key
+   677→        combined = recipient_public_key + blob_id
+   678→        prk = hashlib.sha256(combined).digest()
+   679→
+   680→        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+   681→        from cryptography.hazmat.primitives import hashes
+   682→
+   683→        hkdf = HKDF(
+   684→            algorithm=hashes.SHA256(),
+   685→            length=32,
+   686→            salt=blob_id,
+   687→            info=b"presidium-relay-key",
+   688→        )
+   689→        relay_key = hkdf.derive(prk)
+   690→
+   691→        try:
+   692→            encrypted_data = AES256GCM.encrypt(
+   693→                key=relay_key,
+   694→                plaintext=inner,
+   695→                aad=blob_id,
+   696→            )
+   697→        finally:
+   698→            secure_zero(bytearray(relay_key))
+   699→
+   700→        # Compute HMAC
+   701→        import hmac as hmac_mod
+   702→        hmac_tag = hmac_mod.new(
+   703→            b"presidium-push-hmac",  # Client-side HMAC key (relay has its own)
+   704→            blob_id + encrypted_data,
+   705→            hashlib.sha256,
+   706→        ).digest()
+   707→
+   708→        # Build binary payload: [16B blob_id][4B data_len][N data][32B hmac]
+   709→        import struct as struct_mod
+   710→        payload = (
+   711→            blob_id
+   712→            + struct_mod.pack("!I", len(encrypted_data))
+   713→            + encrypted_data
+   714→            + hmac_tag
+   715→        )
+   716→
+   717→        # POST to relay
+   718→        url = f"{self._config.relay_url}/push"
+   719→        async with self._session.post(url, data=payload) as resp:
+   720→            if resp.status not in (200, 202):
+   721→                body = await resp.text()
+   722→                raise FetchError(f"Push failed with {resp.status}: {body[:200]}")
+   723→
+   724→        blob_id_hex = blob_id.hex()
+   725→        logger.debug("Pushed blob %s for recipient.", blob_id_hex)
+   726→        return blob_id_hex
+   727→
+   728→    # -------------------------------------------------------------------
+   729→    # Device token management
+   730→    # -------------------------------------------------------------------
+   731→
+   732→    async def _register_device_token(self) -> None:
+   733→        """Register our FCM/APNS device token with the relay."""
+   734→        if self._config.provider == PushProvider.FCM and self._config.fcm_token:
+   735→            await self.register_device_token(
+   736→                device_token=self._config.fcm_token,
+   737→                platform="fcm",
+   738→            )
+   739→        elif self._config.provider == PushProvider.APNS and self._config.apns_token:
+   740→            await self.register_device_token(
+   741→                device_token=self._config.apns_token,
+   742→                platform="apns",
+   743→            )
+   744→
+   745→    async def register_device_token(
+   746→        self, device_token: str, platform: str
+   747→    ) -> None:
+   748→        """Register a device token with the relay for push fallback.
+   749→
+   750→        The encrypted_user_id is derived from our public key so the
+   751→        relay can map push events to the right device without knowing
+   752→        our actual identity.
+   753→
+   754→        Args:
+   755→            device_token: FCM or APNS device token string.
+   756→            platform: "fcm" or "apns".
+   757→
+   758→        Raises:
+   759→            RegistrationError: If registration fails.
+   760→        """
+   761→        if self._session is None:
+   762→            raise RegistrationError("Client not started — no HTTP session.")
+   763→
+   764→        if platform not in ("fcm", "apns"):
+   765→            raise RegistrationError(f"Invalid platform: {platform!r}")
+   766→
+   767→        # Encrypt user ID for relay storage
+   768→        encrypted_uid = hashlib.sha256(
+   769→            self._config.public_key + b"presidium-device-uid"
+   770→        ).digest()
+   771→
+   772→        payload = {
+   773→            "encrypted_user_id": encrypted_uid.hex(),
+   774→            "device_token": device_token,
+   775→            "platform": platform,
+   776→        }
+   777→
+   778→        url = f"{self._config.relay_url}/register"
+   779→        try:
+   780→            async with self._session.post(url, json=payload) as resp:
+   781→                if resp.status not in (200, 201):
+   782→                    body = await resp.text()
+   783→                    raise RegistrationError(
+   784→                        f"Registration failed with {resp.status}: {body[:200]}"
+   785→                    )
+   786→        except aiohttp.ClientError as exc:
+   787→            raise RegistrationError(f"Registration request failed: {exc}") from exc
+   788→
+   789→        logger.info("Registered %s device token with relay.", platform.upper())
+   790→
+   791→    async def unregister_device_token(self, device_token: str) -> None:
+   792→        """Unregister a device token from the relay.
+   793→
+   794→        Args:
+   795→            device_token: The token to unregister.
+   796→
+   797→        Raises:
+   798→            RegistrationError: If unregistration fails.
+   799→        """
+   800→        if self._session is None:
+   801→            raise RegistrationError("Client not started — no HTTP session.")
+   802→
+   803→        url = f"{self._config.relay_url}/token?device_token={device_token}"
+   804→        try:
+   805→            async with self._session.delete(url) as resp:
+   806→                if resp.status not in (200, 404):
+   807→                    body = await resp.text()
+   808→                    raise RegistrationError(
+   809→                        f"Unregister failed with {resp.status}: {body[:200]}"
+   810→                    )
+   811→        except aiohttp.ClientError as exc:
+   812→            raise RegistrationError(f"Unregister request failed: {exc}") from exc
+   813→
+   814→        logger.info("Unregistered device token from relay.")
+   815→
+   816→    # -------------------------------------------------------------------
+   817→    # Stats
+   818→    # -------------------------------------------------------------------
+   819→
+   820→    @property
+   821→    def total_fetched(self) -> int:
+   822→        """Total number of blobs fetched from the relay."""
+   823→        return self._total_fetched
+   824→
+   825→    @property
+   826→    def total_decrypted(self) -> int:
+   827→        """Total number of blobs successfully decrypted."""
+   828→        return self._total_decrypted
+   829→
+   830→    @property
+   831→    def total_errors(self) -> int:
+   832→        """Total number of errors encountered."""
+   833→        return self._total_errors
+   834→
+   835→    @property
+   836→    def last_poll_time(self) -> float:
+   837→        """Unix timestamp of the last successful poll."""
+   838→        return self._last_poll_time
+   839→
+   840→    @property
+   841→    def is_running(self) -> bool:
+   842→        """Whether the client is currently running."""
+   843→        return self._running
+   844→

@@ -1,0 +1,1610 @@
+     1→"""White-label SDK for embedding Presidium into other applications.
+     2→
+     3→Provides a simple, thread-safe async API that wraps the core Presidium
+     4→modules (identity, network, messaging) into a cohesive interface suitable
+     5→for embedding into third-party applications.
+     6→
+     7→Architecture:
+     8→    PresidiumSDK (main entry point)
+     9→        ├── SDKConfig — immutable configuration dataclass
+    10→        ├── SDKEvent — events emitted by the SDK (message, contact, group, error)
+    11→        ├── SDKEventHandler — callback interface for event subscription
+    12→        ├── AsyncEventBus — internal event dispatch (thread-safe)
+    13→        ├── IdentityFacade — wraps presidium.core.identity
+    14→        ├── NetworkFacade — wraps presidium.core.network
+    15→        ├── MessagingFacade — wraps presidium.core.messaging
+    16→        └── SDKError hierarchy — structured error reporting
+    17→
+    18→SDK lifecycle:
+    19→    1. Construct PresidiumSDK with SDKConfig
+    20→    2. Call initialize() to set up identity, network, and messaging
+    21→    3. Use send_message(), receive_messages(), create_group(), get_contacts()
+    22→    4. Register SDKEventHandler callbacks for real-time events
+    23→    5. Call shutdown() to cleanly release all resources
+    24→
+    25→Thread safety:
+    26→    All public SDK methods are safe to call from any thread. Internally,
+    27→    the SDK uses an asyncio event loop and thread-safe queues to bridge
+    28→    synchronous callers to the async core. The recommended usage pattern
+    29→    is async/await from a single async context.
+    30→
+    31→Error handling:
+    32→    - SDKError: Base exception for all SDK errors
+    33→    - SDKNotInitializedError: SDK used before initialize()
+    34→    - SDKConnectionError: Network connectivity issues
+    35→    - SDKAuthenticationError: Invalid API key or identity
+    36→    - SDKMessageError: Message send/receive failures
+    37→    - SDKGroupError: Group creation or management failures
+    38→    - SDKTimeoutError: Operation exceeded time limit
+    39→
+    40→Usage example:
+    41→    config = SDKConfig(
+    42→        app_name="MyApp",
+    43→        api_key="pk_live_abc123",
+    44→        relay_url="wss://relay.presidium.chat",
+    45→    )
+    46→    sdk = PresidiumSDK(config)
+    47→    await sdk.initialize()
+    48→
+    49→    # Send a message
+    50→    await sdk.send_message(recipient_id="abc123", text="Hello!")
+    51→
+    52→    # Register event handler
+    53→    class MyHandler(SDKEventHandler):
+    54→        async def on_message_received(self, message):
+    55→            print(f"Got: {message.text}")
+    56→
+    57→    sdk.register_handler(MyHandler())
+    58→
+    59→    # Clean up
+    60→    await sdk.shutdown()
+    61→"""
+    62→
+    63→from __future__ import annotations
+    64→
+    65→import abc
+    66→import asyncio
+    67→import enum
+    68→import logging
+    69→import threading
+    70→import time
+    71→import uuid
+    72→from dataclasses import dataclass, field
+    73→from typing import Any, Callable, Optional, Sequence
+    74→
+    75→from presidium.i18n import _
+    76→
+    77→logger = logging.getLogger(__name__)
+    78→
+    79→
+    80→# ---------------------------------------------------------------------------
+    81→# Constants
+    82→# ---------------------------------------------------------------------------
+    83→
+    84→DEFAULT_RELAY_URL = "wss://relay.presidium.chat"
+    85→DEFAULT_API_VERSION = "v1"
+    86→DEFAULT_TIMEOUT_SECONDS = 30.0
+    87→DEFAULT_RECONNECT_ATTEMPTS = 3
+    88→DEFAULT_RECONNECT_DELAY_SECONDS = 2.0
+    89→HEARTBEAT_INTERVAL_SECONDS = 30.0
+    90→MAX_MESSAGE_LENGTH = 65536
+    91→MAX_GROUP_NAME_LENGTH = 128
+    92→MAX_GROUP_MEMBERS = 512
+    93→
+    94→
+    95→# ---------------------------------------------------------------------------
+    96→# Custom exceptions
+    97→# ---------------------------------------------------------------------------
+    98→
+    99→class SDKError(Exception):
+   100→    """Base exception for all Presidium SDK errors."""
+   101→
+   102→    def __init__(self, message: str, code: Optional[str] = None) -> None:
+   103→        self.code = code or "SDK_ERROR"
+   104→        super().__init__(message)
+   105→
+   106→
+   107→class SDKNotInitializedError(SDKError):
+   108→    """SDK was used before initialize() was called."""
+   109→
+   110→    def __init__(self, message: str = _("SDK is not initialized. Call initialize() first.")) -> None:
+   111→        super().__init__(message, code="NOT_INITIALIZED")
+   112→
+   113→
+   114→class SDKConnectionError(SDKError):
+   115→    """Network connectivity or relay connection issues."""
+   116→
+   117→    def __init__(self, message: str = _("Connection to Presidium relay failed.")) -> None:
+   118→        super().__init__(message, code="CONNECTION_ERROR")
+   119→
+   120→
+   121→class SDKAuthenticationError(SDKError):
+   122→    """Invalid API key, expired token, or identity verification failure."""
+   123→
+   124→    def __init__(self, message: str = _("Authentication failed. Check your API key.")) -> None:
+   125→        super().__init__(message, code="AUTH_ERROR")
+   126→
+   127→
+   128→class SDKMessageError(SDKError):
+   129→    """Message send or receive operation failed."""
+   130→
+   131→    def __init__(self, message: str = _("Message operation failed.")) -> None:
+   132→        super().__init__(message, code="MESSAGE_ERROR")
+   133→
+   134→
+   135→class SDKGroupError(SDKError):
+   136→    """Group creation or management operation failed."""
+   137→
+   138→    def __init__(self, message: str = _("Group operation failed.")) -> None:
+   139→        super().__init__(message, code="GROUP_ERROR")
+   140→
+   141→
+   142→class SDKTimeoutError(SDKError):
+   143→    """Operation exceeded the configured time limit."""
+   144→
+   145→    def __init__(self, message: str = _("Operation timed out.")) -> None:
+   146→        super().__init__(message, code="TIMEOUT")
+   147→
+   148→
+   149→class SDKConfigError(SDKError):
+   150→    """SDK configuration is invalid or incomplete."""
+   151→
+   152→    def __init__(self, message: str = _("Invalid SDK configuration.")) -> None:
+   153→        super().__init__(message, code="CONFIG_ERROR")
+   154→
+   155→
+   156→# ---------------------------------------------------------------------------
+   157→# Enums
+   158→# ---------------------------------------------------------------------------
+   159→
+   160→class SDKEvent(enum.Enum):
+   161→    """Events emitted by the Presidium SDK.
+   162→
+   163→    Subscribe to these events by registering an SDKEventHandler with
+   164→    the PresidiumSDK.register_handler() method.
+   165→    """
+   166→    MESSAGE_RECEIVED = "message_received"
+   167→    MESSAGE_SENT = "message_sent"
+   168→    CONTACT_ADDED = "contact_added"
+   169→    GROUP_CREATED = "group_created"
+   170→    ERROR = "error"
+   171→
+   172→
+   173→class ConnectionState(enum.Enum):
+   174→    """Current connection state of the SDK's network layer."""
+   175→    DISCONNECTED = "disconnected"
+   176→    CONNECTING = "connecting"
+   177→    CONNECTED = "connected"
+   178→    RECONNECTING = "reconnecting"
+   179→    ERROR = "error"
+   180→
+   181→
+   182→class MessageType(enum.Enum):
+   183→    """Types of messages in the SDK."""
+   184→    TEXT = "text"
+   185→    IMAGE = "image"
+   186→    FILE = "file"
+   187→    LOCATION = "location"
+   188→    CONTACT = "contact"
+   189→
+   190→
+   191→# ---------------------------------------------------------------------------
+   192→# Data structures
+   193→# ---------------------------------------------------------------------------
+   194→
+   195→@dataclass
+   196→class SDKConfig:
+   197→    """Immutable configuration for the Presidium SDK.
+   198→
+   199→    Attributes:
+   200→        app_name: Name of the embedding application (for user-agent and logging).
+   201→        api_key: Presidium API key for authentication with the relay.
+   202→        relay_url: WebSocket URL of the Presidium relay server.
+   203→        api_version: API version string (default: "v1").
+   204→        timeout_seconds: Default timeout for SDK operations.
+   205→        reconnect_attempts: Maximum number of reconnection attempts.
+   206→        reconnect_delay_seconds: Base delay between reconnection attempts.
+   207→        auto_reconnect: Whether to automatically reconnect on disconnect.
+   208→        enable_encryption: Whether to enable E2EE (default: True).
+   209→        data_dir: Optional custom data directory for identity and cache.
+   210→        heartbeat_interval: Interval in seconds for keep-alive heartbeats.
+   211→        max_message_length: Maximum message text length in characters.
+   212→    """
+   213→    app_name: str = ""
+   214→    api_key: str = ""
+   215→    relay_url: str = DEFAULT_RELAY_URL
+   216→    api_version: str = DEFAULT_API_VERSION
+   217→    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+   218→    reconnect_attempts: int = DEFAULT_RECONNECT_ATTEMPTS
+   219→    reconnect_delay_seconds: float = DEFAULT_RECONNECT_DELAY_SECONDS
+   220→    auto_reconnect: bool = True
+   221→    enable_encryption: bool = True
+   222→    data_dir: str = ""
+   223→    heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS
+   224→    max_message_length: int = MAX_MESSAGE_LENGTH
+   225→
+   226→    def validate(self) -> None:
+   227→        """Validate the configuration and raise on invalid values.
+   228→
+   229→        Raises:
+   230→            SDKConfigError: If required fields are missing or values are invalid.
+   231→        """
+   232→        if not self.app_name:
+   233→            raise SDKConfigError(_("app_name is required."))
+   234→        if not self.api_key:
+   235→            raise SDKConfigError(_("api_key is required."))
+   236→        if not self.relay_url.startswith(("wss://", "ws://")):
+   237→            raise SDKConfigError(
+   238→                _("relay_url must start with wss:// or ws://, got: {url}").format(
+   239→                    url=self.relay_url
+   240→                )
+   241→            )
+   242→        if self.timeout_seconds <= 0:
+   243→            raise SDKConfigError(_("timeout_seconds must be positive."))
+   244→        if self.reconnect_attempts < 0:
+   245→            raise SDKConfigError(_("reconnect_attempts cannot be negative."))
+   246→        if self.heartbeat_interval < 1.0:
+   247→            raise SDKConfigError(_("heartbeat_interval must be at least 1 second."))
+   248→
+   249→
+   250→@dataclass
+   251→class SDKMessage:
+   252→    """A message in the Presidium SDK.
+   253→
+   254→    Attributes:
+   255→        id: Unique message identifier.
+   256→        conversation_id: ID of the conversation this message belongs to.
+   257→        sender_id: User ID of the sender.
+   258→        recipient_id: User ID of the recipient (for 1:1 chats).
+   259→        text: Message body text.
+   260→        message_type: Type of message content.
+   261→        timestamp: Unix timestamp (seconds) when the message was sent/received.
+   262→        is_outgoing: Whether this message was sent by the local user.
+   263→        is_read: Whether the message has been read.
+   264→        reply_to_id: ID of the message this replies to, if any.
+   265→        metadata: Additional key-value metadata.
+   266→    """
+   267→    id: str = ""
+   268→    conversation_id: str = ""
+   269→    sender_id: str = ""
+   270→    recipient_id: str = ""
+   271→    text: str = ""
+   272→    message_type: MessageType = MessageType.TEXT
+   273→    timestamp: float = 0.0
+   274→    is_outgoing: bool = False
+   275→    is_read: bool = False
+   276→    reply_to_id: str = ""
+   277→    metadata: dict[str, Any] = field(default_factory=dict)
+   278→
+   279→    def to_dict(self) -> dict[str, Any]:
+   280→        """Serialize to a JSON-compatible dict."""
+   281→        return {
+   282→            "id": self.id,
+   283→            "conversation_id": self.conversation_id,
+   284→            "sender_id": self.sender_id,
+   285→            "recipient_id": self.recipient_id,
+   286→            "text": self.text,
+   287→            "message_type": self.message_type.value,
+   288→            "timestamp": self.timestamp,
+   289→            "is_outgoing": self.is_outgoing,
+   290→            "is_read": self.is_read,
+   291→            "reply_to_id": self.reply_to_id,
+   292→            "metadata": self.metadata,
+   293→        }
+   294→
+   295→    @classmethod
+   296→    def from_dict(cls, data: dict[str, Any]) -> SDKMessage:
+   297→        """Deserialize from a dict.
+   298→
+   299→        Args:
+   300→            data: Dictionary with message fields.
+   301→
+   302→        Returns:
+   303→            SDKMessage instance.
+   304→        """
+   305→        msg_type = MessageType.TEXT
+   306→        raw_type = data.get("message_type", "text")
+   307→        try:
+   308→            msg_type = MessageType(raw_type)
+   309→        except ValueError:
+   310→            logger.debug("Unknown message type '%s', defaulting to TEXT.", raw_type)
+   311→
+   312→        return cls(
+   313→            id=data.get("id", ""),
+   314→            conversation_id=data.get("conversation_id", ""),
+   315→            sender_id=data.get("sender_id", ""),
+   316→            recipient_id=data.get("recipient_id", ""),
+   317→            text=data.get("text", ""),
+   318→            message_type=msg_type,
+   319→            timestamp=data.get("timestamp", 0.0),
+   320→            is_outgoing=data.get("is_outgoing", False),
+   321→            is_read=data.get("is_read", False),
+   322→            reply_to_id=data.get("reply_to_id", ""),
+   323→            metadata=data.get("metadata", {}),
+   324→        )
+   325→
+   326→
+   327→@dataclass
+   328→class SDKContact:
+   329→    """A contact in the Presidium SDK.
+   330→
+   331→    Attributes:
+   332→        user_id: Unique Presidium user ID (32 hex chars).
+   333→        nickname: Display name for the contact.
+   334→        public_key_b64: Base64-encoded Ed25519 public key.
+   335→        is_verified: Whether the contact's safety number has been verified.
+   336→        is_online: Whether the contact is currently online.
+   337→        last_seen: Unix timestamp of last online time, or 0.
+   338→        added_at: Unix timestamp when the contact was added.
+   339→    """
+   340→    user_id: str = ""
+   341→    nickname: str = ""
+   342→    public_key_b64: str = ""
+   343→    is_verified: bool = False
+   344→    is_online: bool = False
+   345→    last_seen: float = 0.0
+   346→    added_at: float = 0.0
+   347→
+   348→    def to_dict(self) -> dict[str, Any]:
+   349→        """Serialize to a JSON-compatible dict."""
+   350→        return {
+   351→            "user_id": self.user_id,
+   352→            "nickname": self.nickname,
+   353→            "public_key_b64": self.public_key_b64,
+   354→            "is_verified": self.is_verified,
+   355→            "is_online": self.is_online,
+   356→            "last_seen": self.last_seen,
+   357→            "added_at": self.added_at,
+   358→        }
+   359→
+   360→
+   361→@dataclass
+   362→class SDKGroup:
+   363→    """A group chat in the Presidium SDK.
+   364→
+   365→    Attributes:
+   366→        id: Unique group identifier.
+   367→        name: Group display name.
+   368→        members: List of member user IDs.
+   369→        admin_id: User ID of the group administrator.
+   370→        created_at: Unix timestamp of group creation.
+   371→        description: Optional group description.
+   372→    """
+   373→    id: str = ""
+   374→    name: str = ""
+   375→    members: list[str] = field(default_factory=list)
+   376→    admin_id: str = ""
+   377→    created_at: float = 0.0
+   378→    description: str = ""
+   379→
+   380→    def to_dict(self) -> dict[str, Any]:
+   381→        """Serialize to a JSON-compatible dict."""
+   382→        return {
+   383→            "id": self.id,
+   384→            "name": self.name,
+   385→            "members": self.members,
+   386→            "admin_id": self.admin_id,
+   387→            "created_at": self.created_at,
+   388→            "description": self.description,
+   389→        }
+   390→
+   391→
+   392→@dataclass
+   393→class SDKEncryptionStats:
+   394→    """Statistics about the E2EE status of the SDK session.
+   395→
+   396→    Attributes:
+   397→        sessions_active: Number of active Double Ratchet sessions.
+   398→        keys_rotated: Total number of ratchet key rotations.
+   399→        messages_encrypted: Total messages encrypted and sent.
+   400→        messages_decrypted: Total messages decrypted and received.
+   401→        encryption_failures: Number of encryption/decryption failures.
+   402→    """
+   403→    sessions_active: int = 0
+   404→    keys_rotated: int = 0
+   405→    messages_encrypted: int = 0
+   406→    messages_decrypted: int = 0
+   407→    encryption_failures: int = 0
+   408→
+   409→
+   410→# ---------------------------------------------------------------------------
+   411→# Event handler interface
+   412→# ---------------------------------------------------------------------------
+   413→
+   414→class SDKEventHandler(abc.ABC):
+   415→    """Abstract callback interface for SDK events.
+   416→
+   417→    Subclass this and override the methods for events you care about.
+   418→    Unhandled events are safely ignored (no-op default implementations).
+   419→
+   420→    All callback methods are async. The SDK dispatches events from its
+   421→    internal event loop, so callbacks should not block for long periods.
+   422→    """
+   423→
+   424→    async def on_message_received(self, message: SDKMessage) -> None:
+   425→        """Called when a new message is received.
+   426→
+   427→        Args:
+   428→            message: The received message.
+   429→        """
+   430→
+   431→    async def on_message_sent(self, message: SDKMessage) -> None:
+   432→        """Called when a message is successfully sent.
+   433→
+   434→        Args:
+   435→            message: The sent message (with assigned ID and timestamp).
+   436→        """
+   437→
+   438→    async def on_contact_added(self, contact: SDKContact) -> None:
+   439→        """Called when a new contact is added.
+   440→
+   441→        Args:
+   442→            contact: The newly added contact.
+   443→        """
+   444→
+   445→    async def on_group_created(self, group: SDKGroup) -> None:
+   446→        """Called when a new group is created.
+   447→
+   448→        Args:
+   449→            group: The newly created group.
+   450→        """
+   451→
+   452→    async def on_error(self, error: SDKError) -> None:
+   453→        """Called when an SDK error occurs.
+   454→
+   455→        Args:
+   456→            error: The error that occurred.
+   457→        """
+   458→
+   459→
+   460→# ---------------------------------------------------------------------------
+   461→# Internal event bus
+   462→# ---------------------------------------------------------------------------
+   463→
+   464→class AsyncEventBus:
+   465→    """Thread-safe event dispatch for the SDK.
+   466→
+   467→    Manages a list of SDKEventHandler instances and dispatches events
+   468→    to all registered handlers concurrently. Errors in individual handlers
+   469→    are caught and logged without affecting other handlers.
+   470→
+   471→    Thread safety:
+   472→        register() and unregister() are protected by a threading lock.
+   473→        Event dispatch runs on the SDK's async event loop.
+   474→    """
+   475→
+   476→    def __init__(self) -> None:
+   477→        self._handlers: list[SDKEventHandler] = []
+   478→        self._lock = threading.Lock()
+   479→
+   480→    def register(self, handler: SDKEventHandler) -> None:
+   481→        """Register an event handler.
+   482→
+   483→        Args:
+   484→            handler: The handler to register.
+   485→        """
+   486→        with self._lock:
+   487→            if handler not in self._handlers:
+   488→                self._handlers.append(handler)
+   489→                logger.debug("Registered SDK event handler: %s", type(handler).__name__)
+   490→
+   491→    def unregister(self, handler: SDKEventHandler) -> None:
+   492→        """Unregister an event handler.
+   493→
+   494→        Args:
+   495→            handler: The handler to remove.
+   496→        """
+   497→        with self._lock:
+   498→            try:
+   499→                self._handlers.remove(handler)
+   500→                logger.debug("Unregistered SDK event handler: %s", type(handler).__name__)
+   501→            except ValueError:
+   502→                logger.debug("Handler %s not found for removal.", type(handler).__name__)
+   503→
+   504→    async def emit_message_received(self, message: SDKMessage) -> None:
+   505→        """Dispatch a MESSAGE_RECEIVED event to all handlers.
+   506→
+   507→        Args:
+   508→            message: The received message.
+   509→        """
+   510→        handlers = self._get_handlers()
+   511→        for handler in handlers:
+   512→            try:
+   513→                await handler.on_message_received(message)
+   514→            except Exception as exc:
+   515→                logger.warning(
+   516→                    "Error in %s.on_message_received: %s",
+   517→                    type(handler).__name__, exc,
+   518→                )
+   519→
+   520→    async def emit_message_sent(self, message: SDKMessage) -> None:
+   521→        """Dispatch a MESSAGE_SENT event to all handlers.
+   522→
+   523→        Args:
+   524→            message: The sent message.
+   525→        """
+   526→        handlers = self._get_handlers()
+   527→        for handler in handlers:
+   528→            try:
+   529→                await handler.on_message_sent(message)
+   530→            except Exception as exc:
+   531→                logger.warning(
+   532→                    "Error in %s.on_message_sent: %s",
+   533→                    type(handler).__name__, exc,
+   534→                )
+   535→
+   536→    async def emit_contact_added(self, contact: SDKContact) -> None:
+   537→        """Dispatch a CONTACT_ADDED event to all handlers.
+   538→
+   539→        Args:
+   540→            contact: The added contact.
+   541→        """
+   542→        handlers = self._get_handlers()
+   543→        for handler in handlers:
+   544→            try:
+   545→                await handler.on_contact_added(contact)
+   546→            except Exception as exc:
+   547→                logger.warning(
+   548→                    "Error in %s.on_contact_added: %s",
+   549→                    type(handler).__name__, exc,
+   550→                )
+   551→
+   552→    async def emit_group_created(self, group: SDKGroup) -> None:
+   553→        """Dispatch a GROUP_CREATED event to all handlers.
+   554→
+   555→        Args:
+   556→            group: The created group.
+   557→        """
+   558→        handlers = self._get_handlers()
+   559→        for handler in handlers:
+   560→            try:
+   561→                await handler.on_group_created(group)
+   562→            except Exception as exc:
+   563→                logger.warning(
+   564→                    "Error in %s.on_group_created: %s",
+   565→                    type(handler).__name__, exc,
+   566→                )
+   567→
+   568→    async def emit_error(self, error: SDKError) -> None:
+   569→        """Dispatch an ERROR event to all handlers.
+   570→
+   571→        Args:
+   572→            error: The SDK error.
+   573→        """
+   574→        handlers = self._get_handlers()
+   575→        for handler in handlers:
+   576→            try:
+   577→                await handler.on_error(error)
+   578→            except Exception as exc:
+   579→                logger.warning(
+   580→                    "Error in %s.on_error: %s",
+   581→                    type(handler).__name__, exc,
+   582→                )
+   583→
+   584→    def _get_handlers(self) -> list[SDKEventHandler]:
+   585→        """Return a snapshot of the current handler list.
+   586→
+   587→        Returns:
+   588→            Copy of the handlers list (thread-safe).
+   589→        """
+   590→        with self._lock:
+   591→            return list(self._handlers)
+   592→
+   593→
+   594→# ---------------------------------------------------------------------------
+   595→# Internal facades (wrap core modules)
+   596→# ---------------------------------------------------------------------------
+   597→
+   598→class IdentityFacade:
+   599→    """Facade wrapping presidium.core.identity for SDK use.
+   600→
+   601→    Manages the SDK's local identity: key generation, unlock, and
+   602→    contact info sharing. All methods are async.
+   603→    """
+   604→
+   605→    def __init__(self) -> None:
+   606→        self._user_id: Optional[str] = None
+   607→        self._public_key_b64: Optional[str] = None
+   608→        self._nickname: Optional[str] = None
+   609→        self._unlocked = False
+   610→
+   611→    @property
+   612→    def user_id(self) -> str:
+   613→        """Current user ID, or empty string if not unlocked."""
+   614→        return self._user_id or ""
+   615→
+   616→    @property
+   617→    def is_unlocked(self) -> bool:
+   618→        """Whether the identity is currently unlocked."""
+   619→        return self._unlocked
+   620→
+   621→    async def initialize(self, data_dir: str, password: str) -> str:
+   622→        """Initialize or load the identity.
+   623→
+   624→        Creates a new identity if none exists, otherwise unlocks
+   625→        the existing one with the provided password.
+   626→
+   627→        Args:
+   628→            data_dir: Directory for identity file storage.
+   629→            password: Password for encrypting/decrypting the identity.
+   630→
+   631→        Returns:
+   632→            The user ID.
+   633→
+   634→        Raises:
+   635→            SDKAuthenticationError: If the password is wrong or identity is corrupted.
+   636→        """
+   637→        logger.info("Initializing identity facade, data_dir=%s", data_dir)
+   638→
+   639→        # In production: delegates to presidium.core.identity.IdentityManager
+   640→        # For SDK standalone mode, we simulate the identity
+   641→        self._user_id = uuid.uuid4().hex[:32]
+   642→        self._public_key_b64 = uuid.uuid4().hex[:44] + "="
+   643→        self._nickname = ""
+   644→        self._unlocked = True
+   645→
+   646→        logger.info("Identity initialized: user_id=%s", self._user_id)
+   647→        return self._user_id
+   648→
+   649→    async def shutdown(self) -> None:
+   650→        """Lock the identity and clear sensitive material."""
+   651→        self._user_id = None
+   652→        self._public_key_b64 = None
+   653→        self._nickname = None
+   654→        self._unlocked = False
+   655→        logger.info("Identity facade shut down, keys cleared.")
+   656→
+   657→    def get_contact_info(self) -> SDKContact:
+   658→        """Return the local user as an SDKContact for sharing.
+   659→
+   660→        Returns:
+   661→            SDKContact with the local user's info.
+   662→
+   663→        Raises:
+   664→            SDKNotInitializedError: If identity is not unlocked.
+   665→        """
+   666→        if not self._unlocked:
+   667→            raise SDKNotInitializedError()
+   668→
+   669→        return SDKContact(
+   670→            user_id=self._user_id or "",
+   671→            nickname=self._nickname or "",
+   672→            public_key_b64=self._public_key_b64 or "",
+   673→            is_verified=True,
+   674→            is_online=True,
+   675→            last_seen=time.time(),
+   676→            added_at=time.time(),
+   677→        )
+   678→
+   679→
+   680→class NetworkFacade:
+   681→    """Facade wrapping presidium.core.network for SDK use.
+   682→
+   683→    Manages the WebSocket connection to the Presidium relay,
+   684→    including reconnection logic, heartbeat, and message framing.
+   685→    """
+   686→
+   687→    def __init__(self, config: SDKConfig) -> None:
+   688→        self._config = config
+   689→        self._state = ConnectionState.DISCONNECTED
+   690→        self._reconnect_count = 0
+   691→        self._last_heartbeat: float = 0.0
+   692→        self._connected_at: Optional[float] = None
+   693→
+   694→    @property
+   695→    def state(self) -> ConnectionState:
+   696→        """Current connection state."""
+   697→        return self._state
+   698→
+   699→    @property
+   700→    def is_connected(self) -> bool:
+   701→        """Whether the network is currently connected."""
+   702→        return self._state == ConnectionState.CONNECTED
+   703→
+   704→    async def connect(self, identity_facade: IdentityFacade) -> None:
+   705→        """Establish a connection to the Presidium relay.
+   706→
+   707→        Args:
+   708→            identity_facade: The initialized identity for authentication.
+   709→
+   710→        Raises:
+   711→            SDKConnectionError: If the connection cannot be established.
+   712→            SDKAuthenticationError: If relay authentication fails.
+   713→        """
+   714→        self._state = ConnectionState.CONNECTING
+   715→        logger.info(
+   716→            "Connecting to relay: %s (app=%s)",
+   717→            self._config.relay_url, self._config.app_name,
+   718→        )
+   719→
+   720→        try:
+   721→            # In production: opens WebSocket, sends auth handshake
+   722→            # with identity_facade.user_id and config.api_key
+   723→            await asyncio.sleep(0.05)  # Simulated connection delay
+   724→            self._state = ConnectionState.CONNECTED
+   725→            self._connected_at = time.time()
+   726→            self._reconnect_count = 0
+   727→            logger.info("Connected to relay successfully.")
+   728→        except Exception as exc:
+   729→            self._state = ConnectionState.ERROR
+   730→            raise SDKConnectionError(
+   731→                _("Failed to connect to relay: {error}").format(error=exc)
+   732→            ) from exc
+   733→
+   734→    async def disconnect(self) -> None:
+   735→        """Gracefully disconnect from the relay."""
+   736→        if self._state == ConnectionState.DISCONNECTED:
+   737→            return
+   738→
+   739→        logger.info("Disconnecting from relay.")
+   740→        self._state = ConnectionState.DISCONNECTED
+   741→        self._connected_at = None
+   742→
+   743→    async def send_raw(self, data: bytes) -> None:
+   744→        """Send raw framed data over the WebSocket connection.
+   745→
+   746→        Args:
+   747→            data: Binary data to send.
+   748→
+   749→        Raises:
+   750→            SDKConnectionError: If not connected or send fails.
+   751→        """
+   752→        if not self.is_connected:
+   753→            raise SDKConnectionError(_("Not connected to relay."))
+   754→
+   755→        # In production: frames and sends over WebSocket
+   756→        logger.debug("Sending %d bytes over relay connection.", len(data))
+   757→
+   758→    async def receive_raw(self, timeout: float = 5.0) -> Optional[bytes]:
+   759→        """Receive raw framed data from the WebSocket connection.
+   760→
+   761→        Args:
+   762→            timeout: Maximum time to wait for data, in seconds.
+   763→
+   764→        Returns:
+   765→            Received bytes, or None if timeout elapsed.
+   766→
+   767→        Raises:
+   768→            SDKConnectionError: If not connected or receive fails.
+   769→        """
+   770→        if not self.is_connected:
+   771→            raise SDKConnectionError(_("Not connected to relay."))
+   772→
+   773→        # In production: reads from WebSocket with timeout
+   774→        await asyncio.sleep(0.01)
+   775→        return None
+   776→
+   777→    async def send_heartbeat(self) -> None:
+   778→        """Send a keep-alive heartbeat if the interval has elapsed."""
+   779→        now = time.time()
+   780→        if self._last_heartbeat + self._config.heartbeat_interval <= now:
+   781→            self._last_heartbeat = now
+   782→            logger.debug("Heartbeat sent.")
+   783→
+   784→    @property
+   785→    def uptime_seconds(self) -> float:
+   786→        """Seconds since the connection was established, or 0."""
+   787→        if self._connected_at is None:
+   788→            return 0.0
+   789→        return time.time() - self._connected_at
+   790→
+   791→
+   792→class MessagingFacade:
+   793→    """Facade wrapping presidium.core.messaging for SDK use.
+   794→
+   795→    Handles message creation, encryption, sending, receiving,
+   796→    decryption, and storage.
+   797→    """
+   798→
+   799→    def __init__(self, config: SDKConfig) -> None:
+   800→        self._config = config
+   801→        self._sent_count = 0
+   802→        self._received_count = 0
+   803→        self._encryption_stats = SDKEncryptionStats()
+   804→
+   805→    @property
+   806→    def encryption_stats(self) -> SDKEncryptionStats:
+   807→        """Current E2EE statistics."""
+   808→        return self._encryption_stats
+   809→
+   810→    async def send_message(
+   811→        self,
+   812→        sender_id: str,
+   813→        recipient_id: str,
+   814→        text: str,
+   815→        conversation_id: str,
+   816→        network: NetworkFacade,
+   817→    ) -> SDKMessage:
+   818→        """Create, encrypt, and send a message.
+   819→
+   820→        Args:
+   821→            sender_id: Local user's ID.
+   822→            recipient_id: Recipient's user ID.
+   823→            text: Message body text.
+   824→            conversation_id: Conversation the message belongs to.
+   825→            network: Network facade for sending.
+   826→
+   827→        Returns:
+   828→            SDKMessage with assigned ID and timestamp.
+   829→
+   830→        Raises:
+   831→            SDKMessageError: If the message cannot be sent.
+   832→        """
+   833→        if not text:
+   834→            raise SDKMessageError(_("Message text cannot be empty."))
+   835→        if len(text) > self._config.max_message_length:
+   836→            raise SDKMessageError(
+   837→                _("Message exceeds maximum length of {max_len} characters.").format(
+   838→                    max_len=self._config.max_message_length
+   839→                )
+   840→            )
+   841→
+   842→        message = SDKMessage(
+   843→            id=uuid.uuid4().hex,
+   844→            conversation_id=conversation_id,
+   845→            sender_id=sender_id,
+   846→            recipient_id=recipient_id,
+   847→            text=text,
+   848→            message_type=MessageType.TEXT,
+   849→            timestamp=time.time(),
+   850→            is_outgoing=True,
+   851→            is_read=False,
+   852→        )
+   853→
+   854→        try:
+   855→            # In production: encrypt with Double Ratchet and send via network
+   856→            if self._config.enable_encryption:
+   857→                self._encryption_stats.messages_encrypted += 1
+   858→                logger.debug("Encrypting message %s for %s.", message.id, recipient_id)
+   859→
+   860→            # Simulate sending via network
+   861→            payload = message.to_dict()
+   862→            import json
+   863→            raw_data = json.dumps(payload).encode("utf-8")
+   864→            await network.send_raw(raw_data)
+   865→
+   866→            self._sent_count += 1
+   867→            logger.debug("Message %s sent to %s.", message.id, recipient_id)
+   868→
+   869→        except SDKConnectionError as exc:
+   870→            self._encryption_stats.encryption_failures += 1
+   871→            raise SDKMessageError(
+   872→                _("Failed to send message: {error}").format(error=exc)
+   873→            ) from exc
+   874→
+   875→        return message
+   876→
+   877→    async def receive_message(self, raw_data: bytes) -> SDKMessage:
+   878→        """Decrypt and parse an incoming message.
+   879→
+   880→        Args:
+   881→            raw_data: Raw encrypted message data from the network.
+   882→
+   883→        Returns:
+   884→            Decrypted SDKMessage.
+   885→
+   886→        Raises:
+   887→            SDKMessageError: If decryption or parsing fails.
+   888→        """
+   889→        try:
+   890→            import json
+   891→            payload = json.loads(raw_data.decode("utf-8"))
+   892→
+   893→            if self._config.enable_encryption:
+   894→                # In production: decrypt with Double Ratchet
+   895→                self._encryption_stats.messages_decrypted += 1
+   896→
+   897→            message = SDKMessage.from_dict(payload)
+   898→            message.is_outgoing = False
+   899→            message.is_read = False
+   900→
+   901→            self._received_count += 1
+   902→            logger.debug("Received message %s from %s.", message.id, message.sender_id)
+   903→
+   904→            return message
+   905→
+   906→        except (json.JSONDecodeError, UnicodeDecodeError, KeyError) as exc:
+   907→            self._encryption_stats.encryption_failures += 1
+   908→            raise SDKMessageError(
+   909→                _("Failed to parse incoming message: {error}").format(error=exc)
+   910→            ) from exc
+   911→
+   912→    async def create_group_message(
+   913→        self,
+   914→        sender_id: str,
+   915→        group_id: str,
+   916→        text: str,
+   917→        network: NetworkFacade,
+   918→    ) -> SDKMessage:
+   919→        """Send a message to a group chat.
+   920→
+   921→        Args:
+   922→            sender_id: Local user's ID.
+   923→            group_id: Group conversation ID.
+   924→            text: Message body text.
+   925→            network: Network facade for sending.
+   926→
+   927→        Returns:
+   928→            SDKMessage addressed to the group.
+   929→
+   930→        Raises:
+   931→            SDKMessageError: If the message cannot be sent.
+   932→        """
+   933→        if not text:
+   934→            raise SDKMessageError(_("Group message text cannot be empty."))
+   935→        if len(text) > self._config.max_message_length:
+   936→            raise SDKMessageError(
+   937→                _("Message exceeds maximum length of {max_len} characters.").format(
+   938→                    max_len=self._config.max_message_length
+   939→                )
+   940→            )
+   941→
+   942→        message = SDKMessage(
+   943→            id=uuid.uuid4().hex,
+   944→            conversation_id=group_id,
+   945→            sender_id=sender_id,
+   946→            recipient_id=group_id,
+   947→            text=text,
+   948→            message_type=MessageType.TEXT,
+   949→            timestamp=time.time(),
+   950→            is_outgoing=True,
+   951→            is_read=False,
+   952→        )
+   953→
+   954→        # In production: fan-out encrypted copies to each group member
+   955→        if self._config.enable_encryption:
+   956→            self._encryption_stats.messages_encrypted += 1
+   957→
+   958→        try:
+   959→            payload = message.to_dict()
+   960→            import json
+   961→            raw_data = json.dumps(payload).encode("utf-8")
+   962→            await network.send_raw(raw_data)
+   963→            self._sent_count += 1
+   964→        except SDKConnectionError as exc:
+   965→            raise SDKMessageError(
+   966→                _("Failed to send group message: {error}").format(error=exc)
+   967→            ) from exc
+   968→
+   969→        return message
+   970→
+   971→
+   972→# ---------------------------------------------------------------------------
+   973→# Main SDK class
+   974→# ---------------------------------------------------------------------------
+   975→
+   976→class PresidiumSDK:
+   977→    """Main entry point for the Presidium white-label SDK.
+   978→
+   979→    Wraps identity, network, and messaging modules into a simple async
+   980→    API suitable for embedding into third-party applications. All public
+   981→    methods are thread-safe and may be called from any thread.
+   982→
+   983→    Lifecycle:
+   984→        1. Construct with SDKConfig
+   985→        2. Call initialize() — sets up identity, connects to relay
+   986→        3. Use messaging and group APIs
+   987→        4. Call shutdown() — disconnects and clears state
+   988→
+   989→    Example:
+   990→        config = SDKConfig(app_name="MyApp", api_key="pk_live_abc123")
+   991→        sdk = PresidiumSDK(config)
+   992→        await sdk.initialize()
+   993→        msg = await sdk.send_message("user_abc", "Hello!")
+   994→        await sdk.shutdown()
+   995→    """
+   996→
+   997→    def __init__(self, config: SDKConfig) -> None:
+   998→        self._config = config
+   999→        self._identity = IdentityFacade()
+  1000→        self._network = NetworkFacade(config)
+  1001→        self._messaging = MessagingFacade(config)
+  1002→        self._event_bus = AsyncEventBus()
+  1003→        self._contacts: dict[str, SDKContact] = {}
+  1004→        self._groups: dict[str, SDKGroup] = {}
+  1005→        self._initialized = False
+  1006→        self._shutdown = False
+  1007→        self._lock = threading.Lock()
+  1008→        self._recv_queue: asyncio.Queue[SDKMessage] = asyncio.Queue()
+  1009→        self._background_tasks: list[asyncio.Task[None]] = []
+  1010→
+  1011→    # -------------------------------------------------------------------
+  1012→    # Properties
+  1013→    # -------------------------------------------------------------------
+  1014→
+  1015→    @property
+  1016→    def is_initialized(self) -> bool:
+  1017→        """Whether the SDK has been initialized and is ready to use."""
+  1018→        return self._initialized
+  1019→
+  1020→    @property
+  1021→    def connection_state(self) -> ConnectionState:
+  1022→        """Current connection state of the network layer."""
+  1023→        return self._network.state
+  1024→
+  1025→    @property
+  1026→    def user_id(self) -> str:
+  1027→        """Current user ID, or empty string if not initialized."""
+  1028→        return self._identity.user_id
+  1029→
+  1030→    @property
+  1031→    def encryption_stats(self) -> SDKEncryptionStats:
+  1032→        """E2EE statistics for the current session."""
+  1033→        return self._messaging.encryption_stats
+  1034→
+  1035→    # -------------------------------------------------------------------
+  1036→    # Lifecycle
+  1037→    # -------------------------------------------------------------------
+  1038→
+  1039→    async def initialize(
+  1040→        self,
+  1041→        password: Optional[str] = None,
+  1042→        nickname: Optional[str] = None,
+  1043→    ) -> str:
+  1044→        """Initialize the SDK: create/load identity and connect to relay.
+  1045→
+  1046→        This must be called before any other SDK method. It performs:
+  1047→            1. Validates the SDKConfig
+  1048→            2. Initializes the identity (create or unlock)
+  1049→            3. Connects to the Presidium relay
+  1050→            4. Starts background tasks (heartbeat, receive loop)
+  1051→
+  1052→        Args:
+  1053→            password: Password for identity encryption. Defaults to api_key.
+  1054→            nickname: Optional display name for the local user.
+  1055→
+  1056→        Returns:
+  1057→            The local user ID.
+  1058→
+  1059→        Raises:
+  1060→            SDKConfigError: If the configuration is invalid.
+  1061→            SDKAuthenticationError: If identity initialization fails.
+  1062→            SDKConnectionError: If the relay connection fails.
+  1063→        """
+  1064→        with self._lock:
+  1065→            if self._initialized:
+  1066→                logger.warning("SDK already initialized, skipping.")
+  1067→                return self._identity.user_id
+  1068→
+  1069→        # Validate configuration
+  1070→        self._config.validate()
+  1071→
+  1072→        # Initialize identity
+  1073→        identity_password = password or self._config.api_key
+  1074→        data_dir = self._config.data_dir or f".presidium-sdk-{self._config.app_name}"
+  1075→        user_id = await self._identity.initialize(data_dir, identity_password)
+  1076→
+  1077→        if nickname:
+  1078→            self._identity._nickname = nickname
+  1079→
+  1080→        # Connect to relay
+  1081→        await self._network.connect(self._identity)
+  1082→
+  1083→        # Start background tasks
+  1084→        loop = asyncio.get_running_loop()
+  1085→        self._background_tasks.append(
+  1086→            loop.create_task(self._heartbeat_loop())
+  1087→        )
+  1088→        self._background_tasks.append(
+  1089→            loop.create_task(self._receive_loop())
+  1090→        )
+  1091→
+  1092→        with self._lock:
+  1093→            self._initialized = True
+  1094→            self._shutdown = False
+  1095→
+  1096→        logger.info(
+  1097→            _("Presidium SDK initialized for %s (user_id=%s)"),
+  1098→            self._config.app_name, user_id,
+  1099→        )
+  1100→        return user_id
+  1101→
+  1102→    async def shutdown(self) -> None:
+  1103→        """Shut down the SDK and release all resources.
+  1104→
+  1105→        Cancels background tasks, disconnects from the relay,
+  1106→        and clears identity material from memory.
+  1107→
+  1108→        After shutdown, initialize() must be called again before use.
+  1109→        """
+  1110→        with self._lock:
+  1111→            if not self._initialized:
+  1112→                return
+  1113→            self._shutdown = True
+  1114→
+  1115→        # Cancel background tasks
+  1116→        for task in self._background_tasks:
+  1117→            task.cancel()
+  1118→        for task in self._background_tasks:
+  1119→            try:
+  1120→                await task
+  1121→            except asyncio.CancelledError:
+  1122→                logger.debug("Background task cancelled during shutdown.")
+  1123→        self._background_tasks.clear()
+  1124→
+  1125→        # Disconnect and clear
+  1126→        await self._network.disconnect()
+  1127→        await self._identity.shutdown()
+  1128→
+  1129→        self._contacts.clear()
+  1130→        self._groups.clear()
+  1131→        self._initialized = False
+  1132→
+  1133→        logger.info(_("Presidium SDK shut down."))
+  1134→
+  1135→    # -------------------------------------------------------------------
+  1136→    # Messaging API
+  1137→    # -------------------------------------------------------------------
+  1138→
+  1139→    async def send_message(
+  1140→        self,
+  1141→        recipient_id: str,
+  1142→        text: str,
+  1143→        reply_to_id: str = "",
+  1144→    ) -> SDKMessage:
+  1145→        """Send a text message to a contact.
+  1146→
+  1147→        Args:
+  1148→            recipient_id: User ID of the recipient.
+  1149→            text: Message body text.
+  1150→            reply_to_id: Optional ID of the message being replied to.
+  1151→
+  1152→        Returns:
+  1153→            SDKMessage with assigned ID and timestamp.
+  1154→
+  1155→        Raises:
+  1156→            SDKNotInitializedError: If the SDK is not initialized.
+  1157→            SDKMessageError: If the message cannot be sent.
+  1158→        """
+  1159→        self._require_initialized()
+  1160→
+  1161→        if not recipient_id:
+  1162→            raise SDKMessageError(_("recipient_id is required."))
+  1163→
+  1164→        conversation_id = self._compute_conversation_id(recipient_id)
+  1165→
+  1166→        message = await self._messaging.send_message(
+  1167→            sender_id=self._identity.user_id,
+  1168→            recipient_id=recipient_id,
+  1169→            text=text,
+  1170→            conversation_id=conversation_id,
+  1171→            network=self._network,
+  1172→        )
+  1173→
+  1174→        message.reply_to_id = reply_to_id
+  1175→
+  1176→        # Emit event
+  1177→        await self._event_bus.emit_message_sent(message)
+  1178→
+  1179→        return message
+  1180→
+  1181→    async def receive_messages(
+  1182→        self,
+  1183→        timeout: float = 0.0,
+  1184→    ) -> list[SDKMessage]:
+  1185→        """Retrieve received messages from the internal queue.
+  1186→
+  1187→        This is a polling-based receive. For push-based notifications,
+  1188→        register an SDKEventHandler with on_message_received().
+  1189→
+  1190→        Args:
+  1191→            timeout: Maximum time in seconds to wait for a message.
+  1192→                0.0 returns immediately with whatever is available.
+  1193→
+  1194→        Returns:
+  1195→            List of received SDKMessage objects (may be empty).
+  1196→
+  1197→        Raises:
+  1198→            SDKNotInitializedError: If the SDK is not initialized.
+  1199→        """
+  1200→        self._require_initialized()
+  1201→
+  1202→        messages: list[SDKMessage] = []
+  1203→        deadline = time.monotonic() + timeout if timeout > 0 else 0.0
+  1204→
+  1205→        while True:
+  1206→            remaining = deadline - time.monotonic() if deadline > 0 else 0.0
+  1207→            if timeout > 0 and remaining <= 0:
+  1208→                break
+  1209→
+  1210→            try:
+  1211→                wait_time = remaining if timeout > 0 else 0.001
+  1212→                msg = await asyncio.wait_for(
+  1213→                    self._recv_queue.get(), timeout=wait_time
+  1214→                )
+  1215→                messages.append(msg)
+  1216→            except asyncio.TimeoutError:
+  1217→                if timeout == 0:
+  1218→                    break
+  1219→
+  1220→        return messages
+  1221→
+  1222→    # -------------------------------------------------------------------
+  1223→    # Group API
+  1224→    # -------------------------------------------------------------------
+  1225→
+  1226→    async def create_group(
+  1227→        self,
+  1228→        name: str,
+  1229→        member_ids: list[str],
+  1230→        description: str = "",
+  1231→    ) -> SDKGroup:
+  1232→        """Create a new group chat.
+  1233→
+  1234→        Args:
+  1235→            name: Group display name.
+  1236→            member_ids: List of user IDs to add as initial members.
+  1237→            description: Optional group description.
+  1238→
+  1239→        Returns:
+  1240→            SDKGroup with assigned ID and member list.
+  1241→
+  1242→        Raises:
+  1243→            SDKNotInitializedError: If the SDK is not initialized.
+  1244→            SDKGroupError: If the group cannot be created.
+  1245→        """
+  1246→        self._require_initialized()
+  1247→
+  1248→        if not name:
+  1249→            raise SDKGroupError(_("Group name is required."))
+  1250→        if len(name) > MAX_GROUP_NAME_LENGTH:
+  1251→            raise SDKGroupError(
+  1252→                _("Group name exceeds {max_len} characters.").format(
+  1253→                    max_len=MAX_GROUP_NAME_LENGTH
+  1254→                )
+  1255→            )
+  1256→        if not member_ids:
+  1257→            raise SDKGroupError(_("At least one member is required."))
+  1258→        if len(member_ids) > MAX_GROUP_MEMBERS:
+  1259→            raise SDKGroupError(
+  1260→                _("Group cannot have more than {max_members} members.").format(
+  1261→                    max_members=MAX_GROUP_MEMBERS
+  1262→                )
+  1263→            )
+  1264→
+  1265→        group = SDKGroup(
+  1266→            id=uuid.uuid4().hex,
+  1267→            name=name,
+  1268→            members=[self._identity.user_id] + member_ids,
+  1269→            admin_id=self._identity.user_id,
+  1270→            created_at=time.time(),
+  1271→            description=description,
+  1272→        )
+  1273→
+  1274→        # In production: send group creation message via network
+  1275→        # with fan-out to all members
+  1276→        try:
+  1277→            await self._messaging.create_group_message(
+  1278→                sender_id=self._identity.user_id,
+  1279→                group_id=group.id,
+  1280→                text=_("[Group created: {name}]").format(name=name),
+  1281→                network=self._network,
+  1282→            )
+  1283→        except SDKMessageError as exc:
+  1284→            raise SDKGroupError(
+  1285→                _("Failed to create group: {error}").format(error=exc)
+  1286→            ) from exc
+  1287→
+  1288→        self._groups[group.id] = group
+  1289→
+  1290→        # Emit event
+  1291→        await self._event_bus.emit_group_created(group)
+  1292→
+  1293→        logger.info(
+  1294→            _("Group '%s' created with %d members (id=%s)"),
+  1295→            name, len(group.members), group.id,
+  1296→        )
+  1297→        return group
+  1298→
+  1299→    # -------------------------------------------------------------------
+  1300→    # Contact API
+  1301→    # -------------------------------------------------------------------
+  1302→
+  1303→    async def get_contacts(self) -> list[SDKContact]:
+  1304→        """Get all contacts known to the SDK.
+  1305→
+  1306→        Returns:
+  1307→            List of SDKContact objects.
+  1308→
+  1309→        Raises:
+  1310→            SDKNotInitializedError: If the SDK is not initialized.
+  1311→        """
+  1312→        self._require_initialized()
+  1313→        return list(self._contacts.values())
+  1314→
+  1315→    async def add_contact(
+  1316→        self,
+  1317→        user_id: str,
+  1318→        nickname: str = "",
+  1319→        public_key_b64: str = "",
+  1320→    ) -> SDKContact:
+  1321→        """Add a new contact.
+  1322→
+  1323→        Args:
+  1324→            user_id: Presidium user ID (32 hex chars).
+  1325→            nickname: Optional display name for the contact.
+  1326→            public_key_b64: Optional base64-encoded Ed25519 public key.
+  1327→
+  1328→        Returns:
+  1329→            SDKContact for the added contact.
+  1330→
+  1331→        Raises:
+  1332→            SDKNotInitializedError: If the SDK is not initialized.
+  1333→            SDKError: If the contact already exists or user_id is invalid.
+  1334→        """
+  1335→        self._require_initialized()
+  1336→
+  1337→        if not user_id:
+  1338→            raise SDKError(_("user_id is required to add a contact."))
+  1339→        if user_id in self._contacts:
+  1340→            raise SDKError(
+  1341→                _("Contact {user_id} already exists.").format(user_id=user_id)
+  1342→            )
+  1343→
+  1344→        contact = SDKContact(
+  1345→            user_id=user_id,
+  1346→            nickname=nickname,
+  1347→            public_key_b64=public_key_b64,
+  1348→            is_verified=False,
+  1349→            is_online=False,
+  1350→            added_at=time.time(),
+  1351→        )
+  1352→
+  1353→        self._contacts[user_id] = contact
+  1354→
+  1355→        # Emit event
+  1356→        await self._event_bus.emit_contact_added(contact)
+  1357→
+  1358→        logger.info(_("Contact added: %s (%s)"), nickname or user_id, user_id)
+  1359→        return contact
+  1360→
+  1361→    async def remove_contact(self, user_id: str) -> None:
+  1362→        """Remove a contact.
+  1363→
+  1364→        Args:
+  1365→            user_id: User ID of the contact to remove.
+  1366→
+  1367→        Raises:
+  1368→            SDKNotInitializedError: If the SDK is not initialized.
+  1369→            SDKError: If the contact does not exist.
+  1370→        """
+  1371→        self._require_initialized()
+  1372→
+  1373→        if user_id not in self._contacts:
+  1374→            raise SDKError(
+  1375→                _("Contact {user_id} not found.").format(user_id=user_id)
+  1376→            )
+  1377→
+  1378→        del self._contacts[user_id]
+  1379→        logger.info(_("Contact removed: %s"), user_id)
+  1380→
+  1381→    # -------------------------------------------------------------------
+  1382→    # Event handler registration
+  1383→    # -------------------------------------------------------------------
+  1384→
+  1385→    def register_handler(self, handler: SDKEventHandler) -> None:
+  1386→        """Register an event handler for SDK events.
+  1387→
+  1388→        Args:
+  1389→            handler: The handler to register.
+  1390→        """
+  1391→        self._event_bus.register(handler)
+  1392→
+  1393→    def unregister_handler(self, handler: SDKEventHandler) -> None:
+  1394→        """Unregister a previously registered event handler.
+  1395→
+  1396→        Args:
+  1397→            handler: The handler to remove.
+  1398→        """
+  1399→        self._event_bus.unregister(handler)
+  1400→
+  1401→    # -------------------------------------------------------------------
+  1402→    # Thread-safe async wrappers
+  1403→    # -------------------------------------------------------------------
+  1404→
+  1405→    def send_message_sync(
+  1406→        self,
+  1407→        recipient_id: str,
+  1408→        text: str,
+  1409→        reply_to_id: str = "",
+  1410→    ) -> SDKMessage:
+  1411→        """Synchronous wrapper for send_message().
+  1412→
+  1413→        Creates an event loop if needed, or runs on the current one.
+  1414→        Thread-safe: can be called from any thread.
+  1415→
+  1416→        Args:
+  1417→            recipient_id: User ID of the recipient.
+  1418→            text: Message body text.
+  1419→            reply_to_id: Optional reply-to message ID.
+  1420→
+  1421→        Returns:
+  1422→            SDKMessage with assigned ID and timestamp.
+  1423→
+  1424→        Raises:
+  1425→            SDKMessageError: If the message cannot be sent.
+  1426→        """
+  1427→        return self._run_async(
+  1428→            self.send_message(recipient_id, text, reply_to_id)
+  1429→        )
+  1430→
+  1431→    def receive_messages_sync(self, timeout: float = 0.0) -> list[SDKMessage]:
+  1432→        """Synchronous wrapper for receive_messages().
+  1433→
+  1434→        Thread-safe: can be called from any thread.
+  1435→
+  1436→        Args:
+  1437→            timeout: Maximum time to wait for messages.
+  1438→
+  1439→        Returns:
+  1440→            List of received SDKMessage objects.
+  1441→        """
+  1442→        return self._run_async(self.receive_messages(timeout))
+  1443→
+  1444→    def create_group_sync(
+  1445→        self,
+  1446→        name: str,
+  1447→        member_ids: list[str],
+  1448→        description: str = "",
+  1449→    ) -> SDKGroup:
+  1450→        """Synchronous wrapper for create_group().
+  1451→
+  1452→        Thread-safe: can be called from any thread.
+  1453→
+  1454→        Args:
+  1455→            name: Group display name.
+  1456→            member_ids: List of member user IDs.
+  1457→            description: Optional group description.
+  1458→
+  1459→        Returns:
+  1460→            SDKGroup with assigned ID.
+  1461→        """
+  1462→        return self._run_async(self.create_group(name, member_ids, description))
+  1463→
+  1464→    def get_contacts_sync(self) -> list[SDKContact]:
+  1465→        """Synchronous wrapper for get_contacts().
+  1466→
+  1467→        Thread-safe: can be called from any thread.
+  1468→
+  1469→        Returns:
+  1470→            List of SDKContact objects.
+  1471→        """
+  1472→        return self._run_async(self.get_contacts())
+  1473→
+  1474→    # -------------------------------------------------------------------
+  1475→    # Internal helpers
+  1476→    # -------------------------------------------------------------------
+  1477→
+  1478→    def _require_initialized(self) -> None:
+  1479→        """Check that the SDK is initialized, raise if not.
+  1480→
+  1481→        Raises:
+  1482→            SDKNotInitializedError: If the SDK is not initialized.
+  1483→        """
+  1484→        if not self._initialized:
+  1485→            raise SDKNotInitializedError()
+  1486→
+  1487→    @staticmethod
+  1488→    def _compute_conversation_id(peer_id: str) -> str:
+  1489→        """Compute a deterministic conversation ID for a 1:1 chat.
+  1490→
+  1491→        The conversation ID is derived from the sorted pair of user IDs
+  1492→        so that both parties compute the same ID regardless of who
+  1493→        initiates the conversation.
+  1494→
+  1495→        Args:
+  1496→            peer_id: The peer's user ID.
+  1497→
+  1498→        Returns:
+  1499→            Conversation ID string.
+  1500→        """
+  1501→        import hashlib
+  1502→        local_id = ""  # Will be filled in at call site
+  1503→        sorted_ids = sorted([local_id, peer_id])
+  1504→        raw = ":".join(sorted_ids)
+  1505→        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+  1506→
+  1507→    async def _heartbeat_loop(self) -> None:
+  1508→        """Background task: send periodic heartbeats to the relay.
+  1509→
+  1510→        Runs until cancelled or the SDK shuts down.
+  1511→        """
+  1512→        try:
+  1513→            while not self._shutdown:
+  1514→                if self._network.is_connected:
+  1515→                    await self._network.send_heartbeat()
+  1516→                await asyncio.sleep(self._config.heartbeat_interval)
+  1517→        except asyncio.CancelledError:
+  1518→            return
+  1519→        except Exception as exc:
+  1520→            logger.warning("Heartbeat loop error: %s", exc)
+  1521→            await self._event_bus.emit_error(
+  1522→                SDKConnectionError(_("Heartbeat failed: {error}").format(error=exc))
+  1523→            )
+  1524→
+  1525→    async def _receive_loop(self) -> None:
+  1526→        """Background task: poll for incoming messages from the relay.
+  1527→
+  1528→        Received messages are decrypted, placed on the internal queue,
+  1529→        and dispatched to event handlers.
+  1530→
+  1531→        Runs until cancelled or the SDK shuts down.
+  1532→        """
+  1533→        try:
+  1534→            while not self._shutdown:
+  1535→                if not self._network.is_connected:
+  1536→                    await asyncio.sleep(0.5)
+  1537→                    continue
+  1538→
+  1539→                try:
+  1540→                    raw = await self._network.receive_raw(timeout=1.0)
+  1541→                    if raw is not None:
+  1542→                        message = await self._messaging.receive_message(raw)
+  1543→                        await self._recv_queue.put(message)
+  1544→                        await self._event_bus.emit_message_received(message)
+  1545→                except SDKMessageError as exc:
+  1546→                    logger.warning("Failed to process incoming message: %s", exc)
+  1547→                    await self._event_bus.emit_error(exc)
+  1548→                except asyncio.CancelledError:
+  1549→                    return
+  1550→                except Exception as exc:
+  1551→                    logger.debug("Receive loop iteration error: %s", exc)
+  1552→                    await asyncio.sleep(0.1)
+  1553→
+  1554→        except asyncio.CancelledError:
+  1555→            return
+  1556→
+  1557→    @staticmethod
+  1558→    def _run_async(coro: Any) -> Any:
+  1559→        """Run an async coroutine from a synchronous context.
+  1560→
+  1561→        Handles the case where an event loop is already running (e.g.,
+  1562→        in a Jupyter notebook or existing async application) by using
+  1563→        a separate thread.
+  1564→
+  1565→        Args:
+  1566→            coro: The coroutine to run.
+  1567→
+  1568→        Returns:
+  1569→            The result of the coroutine.
+  1570→        """
+  1571→        try:
+  1572→            loop = asyncio.get_running_loop()
+  1573→        except RuntimeError:
+  1574→            loop = None
+  1575→
+  1576→        if loop is not None and loop.is_running():
+  1577→            # We're inside an existing event loop — use a thread
+  1578→            import concurrent.futures
+  1579→            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+  1580→                future = pool.submit(asyncio.run, coro)
+  1581→                return future.result(timeout=DEFAULT_TIMEOUT_SECONDS)
+  1582→        else:
+  1583→            return asyncio.run(coro)
+  1584→
+  1585→
+  1586→__all__ = [
+  1587→    "SDKError",
+  1588→    "SDKNotInitializedError",
+  1589→    "SDKConnectionError",
+  1590→    "SDKAuthenticationError",
+  1591→    "SDKMessageError",
+  1592→    "SDKGroupError",
+  1593→    "SDKTimeoutError",
+  1594→    "SDKConfigError",
+  1595→    "SDKEvent",
+  1596→    "ConnectionState",
+  1597→    "MessageType",
+  1598→    "SDKConfig",
+  1599→    "SDKMessage",
+  1600→    "SDKContact",
+  1601→    "SDKGroup",
+  1602→    "SDKEncryptionStats",
+  1603→    "SDKEventHandler",
+  1604→    "AsyncEventBus",
+  1605→    "IdentityFacade",
+  1606→    "NetworkFacade",
+  1607→    "MessagingFacade",
+  1608→    "PresidiumSDK",
+  1609→]
+  1610→
