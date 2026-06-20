@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Presidium data
+*.db
+*.db-shm
+*.db-wal
+*.key
+identity.key
+presidium.db
+
+# Logs
+*.log
+
+# Secrets
+.env
+.env.*
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Build artifacts
+*.AppImage
+*.dmg
+*.exe
+*.msi
+
+# FAISS index files
+*.faiss
+
+# Model cache
+models/
+
+# Docker volumes
+/data/
