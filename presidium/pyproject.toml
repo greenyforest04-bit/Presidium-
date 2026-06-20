@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "presidium"
-version = "0.1.0"
+version = "0.3.0"
 description = "Decentralized end-to-end encrypted P2P messenger"
 authors = ["Presidium Contributors"]
 license = "MIT"
@@ -20,16 +20,34 @@ msgspec = "^0.18"
 pydantic = "^2.9"
 pydantic-settings = "^2.5"
 qasync = "^0.27"
+psutil = "^6.0"
+qrcode = {version = "^8.0", extras = ["pil"]}
+pyzbar = {version = "^0.1", optional = true}
+typer = {version = "^0.12", optional = true}
+rich = {version = "^13.0", optional = true}
+pytest-benchmark = {version = "^4.0", optional = true}
+hypothesis = {version = "^6.0", optional = true}
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3"
 pytest-asyncio = "^0.24"
 pytest-cov = "^5.0"
+pytest-timeout = "^2.3"
+pytest-benchmark = "^4.0"
+hypothesis = "^6.0"
 mypy = "^1.11"
 ruff = "^0.6"
+typer = "^0.12"
+rich = "^13.0"
 
 [tool.poetry.scripts]
 presidium = "presidium.main:main"
+presidium-admin = "presidium.cli:main"
+
+[tool.poetry.extras]
+qr-decode = ["pyzbar"]
+cli = ["typer", "rich"]
+bench = ["pytest-benchmark", "hypothesis"]
 
 [build-system]
 requires = ["poetry-core"]
@@ -53,3 +71,4 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+timeout = 30
