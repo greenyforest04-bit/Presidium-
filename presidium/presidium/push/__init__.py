@@ -1,14 +1,12 @@
-"""Push notifications for Presidium — privacy-preserving delivery.
+"""Push notification system for Presidium.
 
-Provides:
-    - Zero-Knowledge Push Relay: self-hosted aiohttp server
-    - Push Client: blind fetch + FCM/APNS fallback
-    - Local notification management
-
-Architecture:
-    Sender → encrypts push blob → Push Relay (stores by random ID)
-    Recipient → periodically fetches blobs by blind ID → decrypts
-
-The relay sees only encrypted blobs with pseudorandom IDs.
-It cannot determine sender, recipient, or content.
+Zero-knowledge push relay + FCM/APNS fallback.
 """
+
+from presidium.push.relay_server import PushRelayServer, PushRelayConfig
+from presidium.push.client import PushClient, PushProvider
+
+__all__ = [
+    "PushRelayServer", "PushRelayConfig",
+    "PushClient", "PushProvider",
+]
