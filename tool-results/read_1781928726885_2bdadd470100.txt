@@ -1,0 +1,792 @@
+     1→"""Peer connection manager for Presidium.
+     2→
+     3→Manages the lifecycle of peer connections:
+     4→- Peer discovery → handshake → connected
+     5→- E2EE key exchange session management
+     6→- Message routing between peers
+     7→- Connection health monitoring
+     8→"""
+     9→
+    10→from __future__ import annotations
+    11→
+    12→import asyncio
+    13→import logging
+    14→import time
+    15→from dataclasses import dataclass, field
+    16→from typing import Awaitable, Callable, Optional
+    17→
+    18→from presidium.core.crypto import (
+    19→    Ed25519KeyPair,
+    20→    X25519KeyPair,
+    21→    SecureBytes,
+    22→    compute_user_id,
+    23→    derive_session_key,
+    24→)
+    25→from presidium.core.network.protocol import (
+    26→    MessageType,
+    27→    HelloPayload,
+    28→    HelloAckPayload,
+    29→    KeyExchangePayload,
+    30→    KeyExchangeAckPayload,
+    31→    ChatMessagePayload,
+    32→    ChatAckPayload,
+    33→    encode_message,
+    34→    decode_message,
+    35→    ProtocolError,
+    36→)
+    37→from presidium.core.network.transport import UDPTransport
+    38→
+    39→logger = logging.getLogger(__name__)
+    40→
+    41→
+    42→# ---------------------------------------------------------------------------
+    43→# Custom exceptions
+    44→# ---------------------------------------------------------------------------
+    45→
+    46→class PeerError(Exception):
+    47→    """Base error for peer operations."""
+    48→
+    49→
+    50→class PeerNotFoundError(PeerError):
+    51→    """Peer not found in the connection table."""
+    52→
+    53→
+    54→class HandshakeError(PeerError):
+    55→    """Handshake with peer failed."""
+    56→
+    57→
+    58→class KeyExchangeError(PeerError):
+    59→    """E2EE key exchange failed."""
+    60→
+    61→
+    62→# ---------------------------------------------------------------------------
+    63→# Peer info
+    64→# ---------------------------------------------------------------------------
+    65→
+    66→@dataclass
+    67→class PeerInfo:
+    68→    """Information about a known peer."""
+    69→    user_id: str  # 32 hex chars
+    70→    public_key_bytes: bytes  # 32 bytes Ed25519
+    71→    addr: Optional[tuple[str, int]] = None
+    72→    nickname: str = ""
+    73→    connected: bool = False
+    74→    last_seen: float = 0.0
+    75→    external_addr: Optional[str] = None
+    76→
+    77→
+    78→# ---------------------------------------------------------------------------
+    79→# E2EE Session
+    80→# ---------------------------------------------------------------------------
+    81→
+    82→@dataclass
+    83→class E2EESession:
+    84→    """An established end-to-end encrypted session with a peer."""
+    85→    peer_user_id: str
+    86→    session_id: bytes  # 16 bytes
+    87→    send_chain_key: bytes  # 32 bytes — current sending chain
+    88→    recv_chain_key: bytes  # 32 bytes — current receiving chain
+    89→    ephemeral_local: X25519KeyPair
+    90→    ephemeral_remote_public: bytes  # 32 bytes X25519 public key
+    91→    established_at: float = field(default_factory=time.monotonic)
+    92→
+    93→    def derive_next_send_key(self) -> bytes:
+    94→        """Advance the send chain and return the next message key."""
+    95→        from presidium.core.crypto import advance_chain_key
+    96→        self.send_chain_key, msg_key = advance_chain_key(self.send_chain_key)
+    97→        return msg_key
+    98→
+    99→    def derive_next_recv_key(self) -> bytes:
+   100→        """Advance the receive chain and return the next message key."""
+   101→        from presidium.core.crypto import advance_chain_key
+   102→        self.recv_chain_key, msg_key = advance_chain_key(self.recv_chain_key)
+   103→        return msg_key
+   104→
+   105→
+   106→# ---------------------------------------------------------------------------
+   107→# Peer Manager
+   108→# ---------------------------------------------------------------------------
+   109→
+   110→class PeerManager:
+   111→    """Manages all peer connections and E2EE sessions.
+   112→
+   113→    Responsibilities:
+   114→    - Maintain a table of known peers
+   115→    - Handle incoming HELLO and KEY_EXCHANGE messages
+   116→    - Initiate outbound handshakes
+   117→    - Route encrypted messages to the correct E2EE session
+   118→    - Track connection health and reconnect as needed
+   119→    """
+   120→
+   121→    def __init__(
+   122→        self,
+   123→        transport: UDPTransport,
+   124→        local_key_pair: Ed25519KeyPair,
+   125→        local_user_id: str,
+   126→    ) -> None:
+   127→        self._transport = transport
+   128→        self._local_key_pair = local_key_pair
+   129→        self._local_user_id = local_user_id
+   130→
+   131→        # Known peers: user_id → PeerInfo
+   132→        self._peers: dict[str, PeerInfo] = {}
+   133→
+   134→        # Active E2EE sessions: peer_user_id → E2EESession
+   135→        self._sessions: dict[str, E2EESession] = {}
+   136→
+   137→        # Pending key exchanges: session_id → (peer_user_id, X25519KeyPair)
+   138→        self._pending_kx: dict[bytes, tuple[str, X25519KeyPair]] = {}
+   139→
+   140→        # Callbacks
+   141→        self._on_chat_message: Optional[Callable[[str, bytes, bytes, float], Awaitable[None]]] = None
+   142→        self._on_peer_connected: Optional[Callable[[str], Awaitable[None]]] = None
+   143→        self._on_peer_disconnected: Optional[Callable[[str], Awaitable[None]]] = None
+   144→
+   145→        # Register transport handlers
+   146→        self._transport.register_handler(MessageType.HELLO, self._handle_hello)
+   147→        self._transport.register_handler(MessageType.HELLO_ACK, self._handle_hello_ack)
+   148→        self._transport.register_handler(MessageType.KEY_EXCHANGE, self._handle_key_exchange)
+   149→        self._transport.register_handler(MessageType.KEY_EXCHANGE_ACK, self._handle_key_exchange_ack)
+   150→        self._transport.register_handler(MessageType.CHAT_MESSAGE, self._handle_chat_message)
+   151→        self._transport.register_handler(MessageType.CHAT_ACK, self._handle_chat_ack)
+   152→
+   153→    # -------------------------------------------------------------------
+   154→    # Public API
+   155→    # -------------------------------------------------------------------
+   156→
+   157→    @property
+   158→    def local_user_id(self) -> str:
+   159→        return self._local_user_id
+   160→
+   161→    def set_chat_handler(
+   162→        self,
+   163→        callback: Callable[[str, bytes, bytes, float], Awaitable[None]],
+   164→    ) -> None:
+   165→        """Set callback for incoming chat messages: (peer_user_id, message_id, decrypted_content, timestamp)."""
+   166→        self._on_chat_message = callback
+   167→
+   168→    def set_peer_connected_handler(
+   169→        self,
+   170→        callback: Callable[[str], Awaitable[None]],
+   171→    ) -> None:
+   172→        """Set callback for when a peer connects."""
+   173→        self._on_peer_connected = callback
+   174→
+   175→    def set_peer_disconnected_handler(
+   176→        self,
+   177→        callback: Callable[[str], Awaitable[None]],
+   178→    ) -> None:
+   179→        """Set callback for when a peer disconnects."""
+   180→        self._on_peer_disconnected = callback
+   181→
+   182→    def add_known_peer(
+   183→        self,
+   184→        user_id: str,
+   185→        public_key_bytes: bytes,
+   186→        nickname: str = "",
+   187→        addr: Optional[tuple[str, int]] = None,
+   188→    ) -> PeerInfo:
+   189→        """Add a peer to the known peers table."""
+   190→        peer = PeerInfo(
+   191→            user_id=user_id,
+   192→            public_key_bytes=public_key_bytes,
+   193→            nickname=nickname,
+   194→            addr=addr,
+   195→            last_seen=time.monotonic(),
+   196→        )
+   197→        self._peers[user_id] = peer
+   198→        logger.info("Added known peer: %s (%s)", user_id, nickname or "no nickname")
+   199→        return peer
+   200→
+   201→    def get_peer(self, user_id: str) -> Optional[PeerInfo]:
+   202→        """Get peer info by user ID."""
+   203→        return self._peers.get(user_id)
+   204→
+   205→    def get_all_peers(self) -> list[PeerInfo]:
+   206→        """Get all known peers."""
+   207→        return list(self._peers.values())
+   208→
+   209→    def get_connected_peers(self) -> list[PeerInfo]:
+   210→        """Get all currently connected peers."""
+   211→        return [p for p in self._peers.values() if p.connected]
+   212→
+   213→    def has_session(self, peer_user_id: str) -> bool:
+   214→        """Check if an E2EE session exists with a peer."""
+   215→        return peer_user_id in self._sessions
+   216→
+   217→    # -------------------------------------------------------------------
+   218→    # Outbound handshake
+   219→    # -------------------------------------------------------------------
+   220→
+   221→    async def connect_to_peer(self, peer: PeerInfo) -> None:
+   222→        """Initiate connection to a peer: handshake + key exchange.
+   223→
+   224→        Args:
+   225→            peer: PeerInfo with at least addr and public_key_bytes.
+   226→
+   227→        Raises:
+   228→            PeerError: If the peer has no address or handshake fails.
+   229→        """
+   230→        if peer.addr is None:
+   231→            raise PeerError(f"Cannot connect to peer {peer.user_id}: no address.")
+   232→
+   233→        # Step 1: NAT hole punch
+   234→        punch_ok = await self._transport.punch(peer.addr, bytes.fromhex(peer.user_id))
+   235→        if not punch_ok:
+   236→            logger.warning("NAT punch failed for %s, attempting direct send", peer.user_id)
+   237→
+   238→        # Step 2: Send HELLO
+   239→        hello = HelloPayload(
+   240→            user_id=bytes.fromhex(self._local_user_id),
+   241→            public_key=self._local_key_pair.public_key_bytes,
+   242→            listen_port=self._transport._config.listen_port,
+   243→        )
+   244→        await self._transport.send_reliable(MessageType.HELLO, hello, peer.addr)
+   245→        logger.info("HELLO sent to %s", peer.user_id)
+   246→
+   247→    async def initiate_key_exchange(self, peer_user_id: str) -> None:
+   248→        """Start an E2EE key exchange with a connected peer.
+   249→
+   250→        Generates an ephemeral X25519 key pair, signs it with the
+   251→        long-term Ed25519 key, and sends KEY_EXCHANGE.
+   252→        """
+   253→        peer = self._peers.get(peer_user_id)
+   254→        if peer is None or peer.addr is None:
+   255→            raise PeerNotFoundError(f"Peer {peer_user_id} not found or has no address.")
+   256→
+   257→        # Generate ephemeral X25519 key pair
+   258→        ephemeral = X25519KeyPair()
+   259→        session_id = __import__("os").urandom(16)
+   260→
+   261→        # Sign (sender_id + ephemeral_pub + session_id)
+   262→        signed_data = (
+   263→            bytes.fromhex(self._local_user_id)
+   264→            + ephemeral.public_key_bytes
+   265→            + session_id
+   266→        )
+   267→        signature = self._local_key_pair.sign(signed_data)
+   268→
+   269→        kx_payload = KeyExchangePayload(
+   270→            sender_user_id=bytes.fromhex(self._local_user_id),
+   271→            ephemeral_public_key=ephemeral.public_key_bytes,
+   272→            session_id=session_id,
+   273→            signed_payload=signature,
+   274→        )
+   275→
+   276→        # Store pending KX
+   277→        self._pending_kx[session_id] = (peer_user_id, ephemeral)
+   278→
+   279→        await self._transport.send_reliable(MessageType.KEY_EXCHANGE, kx_payload, peer.addr)
+   280→        logger.info("Key exchange initiated with %s (session %s)", peer_user_id, session_id.hex())
+   281→
+   282→    # -------------------------------------------------------------------
+   283→    # Send encrypted chat message
+   284→    # -------------------------------------------------------------------
+   285→
+   286→    async def send_chat_message(
+   287→        self,
+   288→        peer_user_id: str,
+   289→        plaintext: bytes,
+   290→        reply_to: bytes = b"",
+   291→    ) -> bytes:
+   292→        """Send an encrypted chat message to a peer.
+   293→
+   294→        Args:
+   295→            peer_user_id: The recipient's user ID.
+   296→            plaintext: The raw message content (UTF-8 bytes).
+   297→            reply_to: Optional message_id of the message being replied to.
+   298→
+   299→        Returns:
+   300→            The message_id (16 bytes).
+   301→
+   302→        Raises:
+   303→            PeerError: If no E2EE session exists.
+   304→        """
+   305→        session = self._sessions.get(peer_user_id)
+   306→        if session is None:
+   307→            raise PeerError(f"No E2EE session with {peer_user_id}. Initiate key exchange first.")
+   308→
+   309→        peer = self._peers.get(peer_user_id)
+   310→        if peer is None or peer.addr is None:
+   311→            raise PeerNotFoundError(f"Peer {peer_user_id} not found or has no address.")
+   312→
+   313→        # Derive message key from chain
+   314→        msg_key = session.derive_next_send_key()
+   315→
+   316→        # Encrypt with AES-256-GCM
+   317→        from presidium.core.crypto import AES256GCM
+   318→        encrypted = AES256GCM.encrypt(msg_key, plaintext)
+   319→
+   320→        message_id = __import__("os").urandom(16)
+   321→
+   322→        payload = ChatMessagePayload(
+   323→            session_id=session.session_id,
+   324→            sender_user_id=bytes.fromhex(self._local_user_id),
+   325→            message_id=message_id,
+   326→            encrypted_content=encrypted,
+   327→            timestamp=time.time(),
+   328→            reply_to=reply_to,
+   329→        )
+   330→
+   331→        await self._transport.send_reliable(MessageType.CHAT_MESSAGE, payload, peer.addr)
+   332→        return message_id
+   333→
+   334→    # -------------------------------------------------------------------
+   335→    # Incoming message handlers
+   336→    # -------------------------------------------------------------------
+   337→
+   338→    async def _handle_hello(
+   339→        self, msg_type: int, timestamp: float, payload: HelloPayload, addr: tuple[str, int]
+   340→    ) -> None:
+   341→        """Handle incoming HELLO: validate and send HELLO_ACK."""
+   342→        peer_uid = payload.user_id.hex()
+   343→        logger.info("HELLO received from %s at %s", peer_uid, addr)
+   344→
+   345→        # Verify the public key matches the user_id
+   346→        expected_uid = compute_user_id(payload.public_key)
+   347→        if expected_uid != peer_uid:
+   348→            logger.warning("HELLO from %s: user_id/public_key mismatch, rejecting", peer_uid)
+   349→            ack = HelloAckPayload(
+   350→                user_id=bytes.fromhex(self._local_user_id),
+   351→                public_key=self._local_key_pair.public_key_bytes,
+   352→                accepted=False,
+   353→                error_msg="User ID does not match public key.",
+   354→            )
+   355→            await self._transport.send(MessageType.HELLO_ACK, ack, addr)
+   356→            return
+   357→
+   358→        # Add/update peer
+   359→        peer = self._peers.get(peer_uid)
+   360→        if peer is None:
+   361→            peer = self.add_known_peer(
+   362→                user_id=peer_uid,
+   363→                public_key_bytes=payload.public_key,
+   364→                addr=addr,
+   365→            )
+   366→        else:
+   367→            peer.addr = addr
+   368→            peer.last_seen = time.monotonic()
+   369→
+   370→        # Accept
+   371→        ack = HelloAckPayload(
+   372→            user_id=bytes.fromhex(self._local_user_id),
+   373→            public_key=self._local_key_pair.public_key_bytes,
+   374→            accepted=True,
+   375→        )
+   376→        await self._transport.send(MessageType.HELLO_ACK, ack, addr)
+   377→
+   378→        # Auto-initiate key exchange
+   379→        if not self.has_session(peer_uid):
+   380→            await self.initiate_key_exchange(peer_uid)
+   381→
+   382→    async def _handle_hello_ack(
+   383→        self, msg_type: int, timestamp: float, payload: HelloAckPayload, addr: tuple[str, int]
+   384→    ) -> None:
+   385→        """Handle HELLO_ACK."""
+   386→        peer_uid = payload.user_id.hex()
+   387→        if not payload.accepted:
+   388→            logger.warning("HELLO rejected by %s: %s", peer_uid, payload.error_msg)
+   389→            return
+   390→
+   391→        logger.info("HELLO_ACK received from %s", peer_uid)
+   392→
+   393→        # Add/update peer
+   394→        peer = self._peers.get(peer_uid)
+   395→        if peer is None:
+   396→            peer = self.add_known_peer(
+   397→                user_id=peer_uid,
+   398→                public_key_bytes=payload.public_key,
+   399→                addr=addr,
+   400→            )
+   401→        else:
+   402→            peer.addr = addr
+   403→
+   404→        peer.connected = True
+   405→        peer.last_seen = time.monotonic()
+   406→
+   407→        # Initiate key exchange if no session
+   408→        if not self.has_session(peer_uid):
+   409→            await self.initiate_key_exchange(peer_uid)
+   410→
+   411→        if self._on_peer_connected:
+   412→            await self._on_peer_connected(peer_uid)
+   413→
+   414→    async def _handle_key_exchange(
+   415→        self, msg_type: int, timestamp: float, payload: KeyExchangePayload, addr: tuple[str, int]
+   416→    ) -> None:
+   417→        """Handle incoming KEY_EXCHANGE: verify signature and establish session."""
+   418→        peer_uid = payload.sender_user_id.hex()
+   419→        logger.info("KEY_EXCHANGE received from %s", peer_uid)
+   420→
+   421→        peer = self._peers.get(peer_uid)
+   422→        if peer is None:
+   423→            logger.warning("KEY_EXCHANGE from unknown peer %s", peer_uid)
+   424→            return
+   425→
+   426→        # Verify Ed25519 signature
+   427→        signed_data = (
+   428→            payload.sender_user_id
+   429→            + payload.ephemeral_public_key
+   430→            + payload.session_id
+   431→        )
+   432→        if not Ed25519KeyPair.verify(peer.public_key_bytes, payload.signed_payload, signed_data):
+   433→            logger.warning("KEY_EXCHANGE signature verification failed for %s", peer_uid)
+   434→            return
+   435→
+   436→        # Generate our ephemeral X25519 pair
+   437→        ephemeral = X25519KeyPair()
+   438→
+   439→        # Compute shared secret
+   440→        shared_secret = ephemeral.shared_secret(payload.ephemeral_public_key)
+   441→
+   442→        # Derive chain keys using HKDF
+   443→        session_key = derive_session_key(shared_secret)
+   444→        raw_key = bytes(session_key)
+   445→
+   446→        # Split into send and recv chain keys
+   447→        # Initiator sends on chain A, responder on chain B
+   448→        from presidium.core.crypto import AES256GCM
+   449→        chain_a = raw_key[:16] + __import__("os").urandom(16)  # Send chain
+   450→        chain_b = raw_key[16:] + __import__("os").urandom(16)  # Recv chain
+   451→
+   452→        # As responder, we receive on chain A, send on chain B
+   453→        session = E2EESession(
+   454→            peer_user_id=peer_uid,
+   455→            session_id=payload.session_id,
+   456→            send_chain_key=chain_b,
+   457→            recv_chain_key=chain_a,
+   458→            ephemeral_local=ephemeral,
+   459→            ephemeral_remote_public=payload.ephemeral_public_key,
+   460→        )
+   461→        self._sessions[peer_uid] = session
+   462→
+   463→        # Sign and send KEY_EXCHANGE_ACK
+   464→        ack_signed_data = (
+   465→            bytes.fromhex(self._local_user_id)
+   466→            + ephemeral.public_key_bytes
+   467→            + payload.session_id
+   468→        )
+   469→        ack_signature = self._local_key_pair.sign(ack_signed_data)
+   470→
+   471→        ack = KeyExchangeAckPayload(
+   472→            responder_user_id=bytes.fromhex(self._local_user_id),
+   473→            ephemeral_public_key=ephemeral.public_key_bytes,
+   474→            session_id=payload.session_id,
+   475→            signed_payload=ack_signature,
+   476→        )
+   477→
+   478→        await self._transport.send_reliable(MessageType.KEY_EXCHANGE_ACK, ack, addr)
+   479→        logger.info("E2EE session established with %s (responder)", peer_uid)
+   480→
+   481→        peer.connected = True
+   482→        if self._on_peer_connected:
+   483→            await self._on_peer_connected(peer_uid)
+   484→
+   485→    async def _handle_key_exchange_ack(
+   486→        self, msg_type: int, timestamp: float, payload: KeyExchangeAckPayload, addr: tuple[str, int]
+   487→    ) -> None:
+   488→        """Handle KEY_EXCHANGE_ACK: complete the key exchange as initiator."""
+   489→        peer_uid = payload.responder_user_id.hex()
+   490→        session_id = payload.session_id
+   491→
+   492→        logger.info("KEY_EXCHANGE_ACK received from %s", peer_uid)
+   493→
+   494→        peer = self._peers.get(peer_uid)
+   495→        if peer is None:
+   496→            logger.warning("KEY_EXCHANGE_ACK from unknown peer %s", peer_uid)
+   497→            return
+   498→
+   499→        # Verify signature
+   500→        signed_data = (
+   501→            payload.responder_user_id
+   502→            + payload.ephemeral_public_key
+   503→            + session_id
+   504→        )
+   505→        if not Ed25519KeyPair.verify(peer.public_key_bytes, payload.signed_payload, signed_data):
+   506→            logger.warning("KEY_EXCHANGE_ACK signature verification failed for %s", peer_uid)
+   507→            return
+   508→
+   509→        # Look up our pending ephemeral key
+   510→        pending = self._pending_kx.pop(session_id, None)
+   511→        if pending is None:
+   512→            logger.warning("No pending key exchange for session %s", session_id.hex())
+   513→            return
+   514→
+   515→        _, ephemeral = pending
+   516→
+   517→        # Compute shared secret
+   518→        shared_secret = ephemeral.shared_secret(payload.ephemeral_public_key)
+   519→        session_key = derive_session_key(shared_secret)
+   520→        raw_key = bytes(session_key)
+   521→
+   522→        # As initiator, we send on chain A, receive on chain B
+   523→        chain_a = raw_key[:16] + __import__("os").urandom(16)
+   524→        chain_b = raw_key[16:] + __import__("os").urandom(16)
+   525→
+   526→        # SIMPLIFIED: in production, derive chain keys deterministically from shared secret
+   527→        # rather than mixing random bytes. Here we use a simplified approach for demo.
+   528→        session = E2EESession(
+   529→            peer_user_id=peer_uid,
+   530→            session_id=session_id,
+   531→            send_chain_key=chain_a,
+   532→            recv_chain_key=chain_b,
+   533→            ephemeral_local=ephemeral,
+   534→            ephemeral_remote_public=payload.ephemeral_public_key,
+   535→        )
+   536→        self._sessions[peer_uid] = session
+   537→
+   538→        peer.connected = True
+   539→        logger.info("E2EE session established with %s (initiator)", peer_uid)
+   540→
+   541→        if self._on_peer_connected:
+   542→            await self._on_peer_connected(peer_uid)
+   543→
+   544→    async def _handle_chat_message(
+   545→        self, msg_type: int, timestamp: float, payload: ChatMessagePayload, addr: tuple[str, int]
+   546→    ) -> None:
+   547→        """Handle incoming encrypted chat message: decrypt and dispatch."""
+   548→        peer_uid = payload.sender_user_id.hex()
+   549→        session = self._sessions.get(peer_uid)
+   550→
+   551→        if session is None:
+   552→            logger.warning("Chat message from %s with no E2EE session", peer_uid)
+   553→            return
+   554→
+   555→        # Derive receive key and decrypt
+   556→        msg_key = session.derive_next_recv_key()
+   557→        from presidium.core.crypto import AES256GCM
+   558→        try:
+   559→            plaintext = AES256GCM.decrypt(msg_key, payload.encrypted_content)
+   560→        except Exception as exc:
+   561→            logger.error("Failed to decrypt message from %s: %s", peer_uid, exc)
+   562→            return
+   563→
+   564→        # Send ACK
+   565→        ack = ChatAckPayload(
+   566→            session_id=payload.session_id,
+   567→            message_id=payload.message_id,
+   568→            status=0,  # received
+   569→        )
+   570→        peer = self._peers.get(peer_uid)
+   571→        if peer and peer.addr:
+   572→            await self._transport.send(MessageType.CHAT_ACK, ack, peer.addr)
+   573→
+   574→        # Dispatch to chat handler
+   575→        if self._on_chat_message:
+   576→            await self._on_chat_message(peer_uid, payload.message_id, plaintext, payload.timestamp)
+   577→
+   578→    async def _handle_chat_ack(
+   579→        self, msg_type: int, timestamp: float, payload: ChatAckPayload, addr: tuple[str, int]
+   580→    ) -> None:
+   581→        """Handle chat message delivery ACK."""
+   582→        logger.debug("Chat ACK for message %s, status=%d", payload.message_id.hex(), payload.status)
+   583→        # SIMPLIFIED: in production, update message status in DB and notify UI
+   584→
+   585→    # -------------------------------------------------------------------
+   586→    # Disconnect
+   587→    # -------------------------------------------------------------------
+   588→
+   589→    async def disconnect_peer(self, peer_user_id: str, reason: str = "") -> None:
+   590→        """Disconnect from a peer."""
+   591→        from presidium.core.network.protocol import DisconnectPayload
+   592→        peer = self._peers.get(peer_user_id)
+   593→        if peer and peer.addr:
+   594→            disc = DisconnectPayload(
+   595→                user_id=bytes.fromhex(self._local_user_id),
+   596→                reason=reason,
+   597→            )
+   598→            await self._transport.send(MessageType.DISCONNECT, disc, peer.addr)
+   599→
+   600→        peer_uid = peer_user_id
+   601→        self._sessions.pop(peer_uid, None)
+   602→        if peer:
+   603→            peer.connected = False
+   604→        if self._on_peer_disconnected:
+   605→            await self._on_peer_disconnected(peer_uid)
+   606→        logger.info("Disconnected from %s", peer_uid)
+   607→
+   608→
+   609→# ---------------------------------------------------------------------------
+   610→# Reconnection Manager
+   611→# ---------------------------------------------------------------------------
+   612→
+   613→class ReconnectionManager:
+   614→    """Manages automatic reconnection to disconnected peers.
+   615→
+   616→    Features:
+   617→    - Exponential backoff (1s, 2s, 4s, 8s, 16s, 32s, max 60s)
+   618→    - Heartbeat PING every 30 seconds for connected peers
+   619→    - Automatic E2EE session recovery on reconnect (new ephemeral X25519)
+   620→    - Timeout detection via missed heartbeats (3 missed → consider disconnected)
+   621→    """
+   622→
+   623→    INITIAL_BACKOFF = 1.0  # seconds
+   624→    MAX_BACKOFF = 60.0     # seconds
+   625→    BACKOFF_MULTIPLIER = 2.0
+   626→    HEARTBEAT_INTERVAL = 30.0  # seconds
+   627→    HEARTBEAT_TIMEOUT = 10.0   # seconds to wait for PONG
+   628→    MAX_MISSED_HEARTBEATS = 3  # missed PONGs before disconnect
+   629→
+   630→    def __init__(self, peer_manager: PeerManager) -> None:
+   631→        self._peer_manager = peer_manager
+   632→        self._running = False
+   633→
+   634→        # Reconnection state: peer_user_id → {backoff, last_attempt, consecutive_failures}
+   635→        self._reconnect_state: dict[str, dict] = {}
+   636→
+   637→        # Heartbeat state: peer_user_id → {last_ping, last_pong, missed_count}
+   638→        self._heartbeat_state: dict[str, dict] = {}
+   639→
+   640→        self._bg_tasks: list[asyncio.Task] = []
+   641→
+   642→    # -------------------------------------------------------------------
+   643→    # Lifecycle
+   644→    # -------------------------------------------------------------------
+   645→
+   646→    async def start(self) -> None:
+   647→        """Start the reconnection and heartbeat loops."""
+   648→        self._running = True
+   649→        self._bg_tasks.append(asyncio.create_task(self._reconnect_loop()))
+   650→        self._bg_tasks.append(asyncio.create_task(self._heartbeat_loop()))
+   651→        logger.info("Reconnection manager started.")
+   652→
+   653→    async def stop(self) -> None:
+   654→        """Stop the reconnection manager."""
+   655→        self._running = False
+   656→        for task in self._bg_tasks:
+   657→            task.cancel()
+   658→        await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+   659→        self._bg_tasks.clear()
+   660→
+   661→    # -------------------------------------------------------------------
+   662→    # Reconnection tracking
+   663→    # -------------------------------------------------------------------
+   664→
+   665→    def mark_peer_disconnected(self, peer_user_id: str) -> None:
+   666→        """Mark a peer as disconnected — schedule reconnection attempts."""
+   667→        if peer_user_id not in self._reconnect_state:
+   668→            self._reconnect_state[peer_user_id] = {
+   669→                "backoff": self.INITIAL_BACKOFF,
+   670→                "last_attempt": 0.0,
+   671→                "consecutive_failures": 0,
+   672→            }
+   673→        else:
+   674→            state = self._reconnect_state[peer_user_id]
+   675→            state["consecutive_failures"] += 1
+   676→            state["backoff"] = min(
+   677→                state["backoff"] * self.BACKOFF_MULTIPLIER,
+   678→                self.MAX_BACKOFF,
+   679→            )
+   680→        # Remove heartbeat state
+   681→        self._heartbeat_state.pop(peer_user_id, None)
+   682→
+   683→    def mark_peer_connected(self, peer_user_id: str) -> None:
+   684→        """Mark a peer as connected — reset backoff and start heartbeat."""
+   685→        self._reconnect_state.pop(peer_user_id, None)
+   686→        self._heartbeat_state[peer_user_id] = {
+   687→            "last_ping": time.monotonic(),
+   688→            "last_pong": time.monotonic(),
+   689→            "missed_count": 0,
+   690→        }
+   691→
+   692→    # -------------------------------------------------------------------
+   693→    # Background: reconnection loop
+   694→    # -------------------------------------------------------------------
+   695→
+   696→    async def _reconnect_loop(self) -> None:
+   697→        """Periodically attempt to reconnect to disconnected peers."""
+   698→        while self._running:
+   699→            now = time.monotonic()
+   700→
+   701→            for peer_user_id, state in list(self._reconnect_state.items()):
+   702→                peer = self._peer_manager.get_peer(peer_user_id)
+   703→                if peer is None:
+   704→                    # Peer was removed entirely
+   705→                    self._reconnect_state.pop(peer_user_id, None)
+   706→                    continue
+   707→
+   708→                if peer.connected:
+   709→                    # Already reconnected (e.g., by mDNS or peer-initiated)
+   710→                    self._reconnect_state.pop(peer_user_id, None)
+   711→                    continue
+   712→
+   713→                # Check if it's time for the next attempt
+   714→                elapsed = now - state["last_attempt"]
+   715→                if elapsed < state["backoff"]:
+   716→                    continue
+   717→
+   718→                state["last_attempt"] = now
+   719→
+   720→                try:
+   721→                    await self._peer_manager.connect_to_peer(peer)
+   722→                    logger.info(
+   723→                        "Reconnection attempt to %s (failure #%d, backoff %.1fs)",
+   724→                        peer_user_id[:8],
+   725→                        state["consecutive_failures"],
+   726→                        state["backoff"],
+   727→                    )
+   728→                except Exception as exc:
+   729→                    logger.debug("Reconnection attempt failed for %s: %s", peer_user_id[:8], exc)
+   730→                    # Increase backoff
+   731→                    state["consecutive_failures"] += 1
+   732→                    state["backoff"] = min(
+   733→                        state["backoff"] * self.BACKOFF_MULTIPLIER,
+   734→                        self.MAX_BACKOFF,
+   735→                    )
+   736→
+   737→            await asyncio.sleep(5.0)
+   738→
+   739→    # -------------------------------------------------------------------
+   740→    # Background: heartbeat loop
+   741→    # -------------------------------------------------------------------
+   742→
+   743→    async def _heartbeat_loop(self) -> None:
+   744→        """Send periodic PING to connected peers and detect failures."""
+   745→        while self._running:
+   746→            now = time.monotonic()
+   747→
+   748→            for peer_user_id, hb_state in list(self._heartbeat_state.items()):
+   749→                peer = self._peer_manager.get_peer(peer_user_id)
+   750→                if peer is None or not peer.connected:
+   751→                    self._heartbeat_state.pop(peer_user_id, None)
+   752→                    continue
+   753→
+   754→                # Check if we should send a PING
+   755→                elapsed_since_ping = now - hb_state["last_ping"]
+   756→                if elapsed_since_ping >= self.HEARTBEAT_INTERVAL:
+   757→                    # Send PING
+   758→                    from presidium.core.network.protocol import PingPayload
+   759→                    ping = PingPayload(
+   760→                        sender_id=bytes.fromhex(self._peer_manager.local_user_id),
+   761→                    )
+   762→                    if peer.addr:
+   763→                        try:
+   764→                            await self._peer_manager._transport.send(
+   765→                                MessageType.PING, ping, peer.addr,
+   766→                            )
+   767→                            hb_state["last_ping"] = now
+   768→                        except Exception:
+   769→                            pass
+   770→
+   771→                # Check for missed PONGs
+   772→                elapsed_since_pong = now - hb_state["last_pong"]
+   773→                if elapsed_since_pong > self.HEARTBEAT_INTERVAL * 2:
+   774→                    hb_state["missed_count"] += 1
+   775→                    if hb_state["missed_count"] >= self.MAX_MISSED_HEARTBEATS:
+   776→                        logger.warning(
+   777→                            "Peer %s missed %d heartbeats — marking disconnected",
+   778→                            peer_user_id[:8],
+   779→                            hb_state["missed_count"],
+   780→                        )
+   781→                        peer.connected = False
+   782→                        self.mark_peer_disconnected(peer_user_id)
+   783→
+   784→            await asyncio.sleep(10.0)
+   785→
+   786→    def record_pong(self, peer_user_id: str) -> None:
+   787→        """Record a received PONG for heartbeat tracking."""
+   788→        hb_state = self._heartbeat_state.get(peer_user_id)
+   789→        if hb_state:
+   790→            hb_state["last_pong"] = time.monotonic()
+   791→            hb_state["missed_count"] = 0
+   792→
