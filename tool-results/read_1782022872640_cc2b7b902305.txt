@@ -1,0 +1,701 @@
+     1→     1→"""Full Double Ratchet implementation for Presidium.
+     2→     2→
+     3→     3→Implements the Signal Protocol Double Ratchet algorithm:
+     4→     4→- Root key evolution via DH ratchet steps (X25519)
+     5→     5→- Chain key advancement via HKDF for symmetric ratchet
+     6→     6→- Message key derivation per message (forward secrecy)
+     7→     7→- Header encryption via header key
+     8→     8→- Out-of-order message support with skipped message key cache (max 1000)
+     9→     9→- Constant-time comparison for MAC verification
+    10→    10→
+    11→    11→Reference: https://signal.org/docs/specifications/doubleratchet/
+    12→    12→
+    13→    13→State layout:
+    14→    14→    Root key (32 bytes) — evolves with each DH ratchet step
+    15→    15→    Sending chain key (32 bytes) — advances per sent message
+    16→    16→    Receiving chain key (32 bytes) — advances per received message
+    17→    17→    DH ratchet key pair (X25519) — our current sending ephemeral
+    18→    18→    DH ratchet remote public (32 bytes) — peer's last sending ephemeral
+    19→    19→    Header keys (send/recv) — derived alongside chain keys
+    20→    20→"""
+    21→    21→
+    22→    22→from __future__ import annotations
+    23→    23→
+    24→    24→import hashlib
+    25→    25→import hmac
+    26→    26→import logging
+    27→    27→import os
+    28→    28→import struct
+    29→    29→from collections import OrderedDict
+    30→    30→from dataclasses import dataclass, field
+    31→    31→from typing import Optional
+    32→    32→
+    33→    33→from cryptography.hazmat.primitives import hashes
+    34→    34→from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    35→    35→from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    36→    36→
+    37→    37→from presidium.core.crypto import (
+    38→    38→    AES256GCM,
+    39→    39→    SecureBytes,
+    40→    40→    X25519KeyPair,
+    41→    41→    CryptoError,
+    42→    42→    EncryptionError,
+    43→    43→    DecryptionError,
+    44→    44→)
+    45→    45→
+    46→    46→logger = logging.getLogger(__name__)
+    47→    47→
+    48→    48→
+    49→    49→# ---------------------------------------------------------------------------
+    50→    50→# Custom exceptions
+    51→    51→# ---------------------------------------------------------------------------
+    52→    52→
+    53→    53→class RatchetError(Exception):
+    54→    54→    """Base exception for Double Ratchet operations."""
+    55→    55→
+    56→    56→
+    57→    57→class RatchetNotInitializedError(RatchetError):
+    58→    58→    """Attempted operation before ratchet initialization."""
+    59→    59→
+    60→    60→
+    61→    61→class SkippedMessageKeyNotFoundError(RatchetError):
+    62→    62→    """No message key found for an out-of-order message."""
+    63→    63→
+    64→    64→
+    65→    65→class TooManySkippedMessagesError(RatchetError):
+    66→    66→    """Too many skipped message keys — possible replay or DoS."""
+    67→    67→
+    68→    68→
+    69→    69→class HeaderDecryptError(RatchetError):
+    70→    70→    """Failed to decrypt message header."""
+    71→    71→
+    72→    72→
+    73→    73→class MessageAuthenticationError(RatchetError):
+    74→    74→    """Message authentication failed (GCM tag mismatch)."""
+    75→    75→
+    76→    76→
+    77→    77→# ---------------------------------------------------------------------------
+    78→    78→# Constants
+    79→    79→# ---------------------------------------------------------------------------
+    80→    80→
+    81→    81→ROOT_KEY_INFO = b"PresidiumRootKey"
+    82→    82→CHAIN_KEY_INFO = b"PresidiumChainKey"
+    83→    83→MESSAGE_KEY_INFO = b"PresidiumMessageKey"
+    84→    84→HEADER_KEY_INFO = b"PresidiumHeaderKey"
+    85→    85→NEXT_HEADER_KEY_INFO = b"PresidiumNextHeaderKey"
+    86→    86→
+    87→    87→MAX_SKIP = 1000  # Maximum number of skipped message keys to cache
+    88→    88→KEY_LENGTH = 32  # All keys are 256-bit
+    89→    89→NONCE_SIZE = 12  # GCM nonce size
+    90→    90→
+    91→    91→
+    92→    92→# ---------------------------------------------------------------------------
+    93→    93→# HKDF helper
+    94→    94→# ---------------------------------------------------------------------------
+    95→    95→
+    96→    96→def _hkdf_expand(key: bytes, info: bytes, length: int = KEY_LENGTH) -> bytes:
+    97→    97→    """Single-step HKDF-expand (assumes key is already a valid PRK)."""
+    98→    98→    hkdf = HKDF(
+    99→    99→        algorithm=hashes.SHA256(),
+   100→   100→        length=length,
+   101→   101→        salt=None,
+   102→   102→        info=info,
+   103→   103→    )
+   104→   104→    return hkdf.derive(key)
+   105→   105→
+   106→   106→
+   107→   107→def _hkdf_expand_pair(key: bytes, info1: bytes, info2: bytes) -> tuple[bytes, bytes]:
+   108→   108→    """Derive two 32-byte keys from one input key using HKDF with different info."""
+   109→   109→    # Derive 64 bytes and split
+   110→   110→    hkdf = HKDF(
+   111→   111→        algorithm=hashes.SHA256(),
+   112→   112→        length=64,
+   113→   113→        salt=None,
+   114→   114→        info=info1 + info2,
+   115→   115→    )
+   116→   116→    combined = hkdf.derive(key)
+   117→   117→    return combined[:32], combined[32:]
+   118→   118→
+   119→   119→
+   120→   120→# ---------------------------------------------------------------------------
+   121→   121→# Chain key advancement
+   122→   122→# ---------------------------------------------------------------------------
+   123→   123→
+   124→   124→def advance_chain_key(chain_key: bytes) -> tuple[bytes, bytes]:
+   125→   125→    """Advance a chain key and derive a message key.
+   126→   126→
+   127→   127→    Returns:
+   128→   128→        (new_chain_key, message_key) — both 32 bytes.
+   129→   129→    """
+   130→   130→    message_key = _hkdf_expand(chain_key, MESSAGE_KEY_INFO)
+   131→   131→    new_chain_key = _hkdf_expand(chain_key, CHAIN_KEY_INFO)
+   132→   132→    return new_chain_key, message_key
+   133→   133→
+   134→   134→
+   135→   135→def derive_header_keys(chain_key: bytes) -> tuple[bytes, bytes]:
+   136→   136→    """Derive header key and next header key from chain key.
+   137→   137→
+   138→   138→    Returns:
+   139→   139→        (header_key, next_header_key) — both 32 bytes.
+   140→   140→    """
+   141→   141→    hk = _hkdf_expand(chain_key, HEADER_KEY_INFO)
+   142→   142→    nhk = _hkdf_expand(chain_key, NEXT_HEADER_KEY_INFO)
+   143→   143→    return hk, nhk
+   144→   144→
+   145→   145→
+   146→   146→# ---------------------------------------------------------------------------
+   147→   147→# Encrypted header
+   148→   148→# ---------------------------------------------------------------------------
+   149→   149→
+   150→   150→@dataclass
+   151→   151→class RatchetHeader:
+   152→   152→    """Unencrypted ratchet header attached to each message.
+   153→   153→
+   154→   154→    Contains the sender's current DH ratchet public key and the
+   155→   155→    message number in the current sending chain.
+   156→   156→    """
+   157→   157→    dh_public_key: bytes  # 32 bytes X25519 public key
+   158→   158→    message_number: int   # sequence number in current chain
+   159→   159→    previous_chain_length: int  # length of previous sending chain
+   160→   160→
+   161→   161→
+   162→   162→def encode_header(header: RatchetHeader) -> bytes:
+   163→   163→    """Encode a RatchetHeader to bytes for encryption."""
+   164→   164→    return (
+   165→   165→        header.dh_public_key
+   166→   166→        + struct.pack("!II", header.message_number, header.previous_chain_length)
+   167→   167→    )
+   168→   168→
+   169→   169→
+   170→   170→def decode_header(data: bytes) -> RatchetHeader:
+   171→   171→    """Decode a RatchetHeader from bytes."""
+   172→   172→    if len(data) < 32 + 8:
+   173→   173→        raise RatchetError(f"Header too short: {len(data)} bytes, need at least 40.")
+   174→   174→    dh_public_key = data[:32]
+   175→   175→    msg_num, prev_chain_len = struct.unpack("!II", data[32:40])
+   176→   176→    return RatchetHeader(
+   177→   177→        dh_public_key=dh_public_key,
+   178→   178→        message_number=msg_num,
+   179→   179→        previous_chain_length=prev_chain_len,
+   180→   180→    )
+   181→   181→
+   182→   182→
+   183→   183→def encrypt_header(header: RatchetHeader, header_key: bytes) -> bytes:
+   184→   184→    """Encrypt a ratchet header using AES-256-GCM with the header key.
+   185→   185→
+   186→   186→    Returns:
+   187→   187→        nonce + ciphertext (header is small, so this is compact).
+   188→   188→    """
+   189→   189→    plaintext = encode_header(header)
+   190→   190→    return AES256GCM.encrypt(header_key, plaintext)
+   191→   191→
+   192→   192→
+   193→   193→def decrypt_header(encrypted: bytes, header_key: bytes) -> RatchetHeader:
+   194→   194→    """Decrypt a ratchet header.
+   195→   195→
+   196→   196→    Raises:
+   197→   197→        HeaderDecryptError: If the header cannot be decrypted.
+   198→   198→    """
+   199→   199→    try:
+   200→   200→        plaintext = AES256GCM.decrypt(header_key, encrypted)
+   201→   201→        return decode_header(plaintext)
+   202→   202→    except DecryptionError as exc:
+   203→   203→        raise HeaderDecryptError(f"Header decryption failed: {exc}") from exc
+   204→   204→
+   205→   205→
+   206→   206→# ---------------------------------------------------------------------------
+   207→   207→# Skipped message key store
+   208→   208→# ---------------------------------------------------------------------------
+   209→   209→
+   210→   210→class SkippedMessageKeys:
+   211→   211→    """Bounded cache of skipped message keys for out-of-order support.
+   212→   212→
+   213→   213→    Keys are stored as (header_key, message_number) → message_key.
+   214→   214→    The cache is bounded to MAX_SKIP entries to prevent unbounded memory
+   215→   215→    growth from a malicious peer sending many skipped messages.
+   216→   216→    """
+   217→   217→
+   218→   218→    def __init__(self, max_skip: int = MAX_SKIP) -> None:
+   219→   219→        self._max_skip = max_skip
+   220→   220→        # OrderedDict for LRU-like eviction
+   221→   221→        self._store: OrderedDict[tuple[bytes, int], bytes] = OrderedDict()
+   222→   222→
+   223→   223→    def store(self, header_key: bytes, message_number: int, message_key: bytes) -> None:
+   224→   224→        """Store a skipped message key."""
+   225→   225→        if len(self._store) >= self._max_skip:
+   226→   226→            # Evict oldest entry
+   227→   227→            self._store.popitem(last=False)
+   228→   228→        self._store[(header_key, message_number)] = message_key
+   229→   229→
+   230→   230→    def retrieve(self, header_key: bytes, message_number: int) -> Optional[bytes]:
+   231→   231→        """Retrieve a skipped message key, or None if not found."""
+   232→   232→        key = (header_key, message_number)
+   233→   233→        msg_key = self._store.get(key)
+   234→   234→        if msg_key is not None:
+   235→   235→            del self._store[key]
+   236→   236→        return msg_key
+   237→   237→
+   238→   238→    def has_key(self, header_key: bytes, message_number: int) -> bool:
+   239→   239→        """Check if a skipped message key exists."""
+   240→   240→        return (header_key, message_number) in self._store
+   241→   241→
+   242→   242→    @property
+   243→   243→    def count(self) -> int:
+   244→   244→        return len(self._store)
+   245→   245→
+   246→   246→    def clear(self) -> None:
+   247→   247→        """Clear all stored skipped keys."""
+   248→   248→        for key in list(self._store.values()):
+   249→   249→            # Best-effort zeroing
+   250→   250→            try:
+   251→   251→                from presidium.core.crypto import secure_zero
+   252→   252→                secure_zero(bytearray(key))
+   253→   253→            except Exception:
+   254→   254→                pass
+   255→   255→        self._store.clear()
+   256→   256→
+   257→   257→
+   258→   258→# ---------------------------------------------------------------------------
+   259→   259→# Double Ratchet State
+   260→   260→# ---------------------------------------------------------------------------
+   261→   261→
+   262→   262→@dataclass
+   263→   263→class RatchetState:
+   264→   264→    """Complete state of a Double Ratchet session.
+   265→   265→
+   266→   266→    This is the internal state that must be persisted for the session
+   267→   267→    to survive across application restarts. All keys are 32 bytes.
+   268→   268→    """
+   269→   269→    # Root key — evolves with each DH ratchet step
+   270→   270→    root_key: bytes = b""
+   271→   271→
+   272→   272→    # Sending chain
+   273→   273→    send_chain_key: bytes = b""
+   274→   274→    send_header_key: bytes = b""
+   275→   275→    send_next_header_key: bytes = b""
+   276→   276→    send_message_number: int = 0
+   277→   277→
+   278→   278→    # Receiving chain
+   279→   279→    recv_chain_key: bytes = b""
+   280→   280→    recv_header_key: bytes = b""
+   281→   281→    recv_next_header_key: bytes = b""
+   282→   282→    recv_message_number: int = 0
+   283→   283→
+   284→   284→    # Previous sending chain length (for skip computation)
+   285→   285→    previous_send_chain_length: int = 0
+   286→   286→
+   287→   287→    # DH ratchet keys
+   288→   288→    dh_local_private: bytes = b""  # serialized X25519 private key
+   289→   289→    dh_local_public: bytes = b""   # 32 bytes
+   290→   290→    dh_remote_public: bytes = b""  # 32 bytes
+   291→   291→
+   292→   292→    # Whether we've performed at least one DH ratchet step as receiver
+   293→   293→    initialized: bool = False
+   294→   294→
+   295→   295→    # Skipped message keys
+   296→   296→    skipped_keys: SkippedMessageKeys = field(default_factory=SkippedMessageKeys)
+   297→   297→
+   298→   298→
+   299→   299→# ---------------------------------------------------------------------------
+   300→   300→# Double Ratchet
+   301→   301→# ---------------------------------------------------------------------------
+   302→   302→
+   303→   303→class DoubleRatchet:
+   304→   304→    """Full Signal Protocol Double Ratchet implementation.
+   305→   305→
+   306→   306→    Usage:
+   307→   307→        # Alice initiates
+   308→   308→        alice = DoubleRatchet()
+   309→   309→        alice.init_as_initiator(shared_secret, bob_prekey)
+   310→   310→
+   311→   311→        # Bob responds
+   312→   312→        bob = DoubleRatchet()
+   313→   313→        bob.init_as_responder(shared_secret, alice_prekey)
+   314→   314→
+   315→   315→        # Alice encrypts
+   316→   316→        header, ciphertext = alice.encrypt(plaintext)
+   317→   317→
+   318→   318→        # Bob decrypts
+   319→   319→        plaintext = bob.decrypt(header, ciphertext)
+   320→   320→
+   321→   321→    The ratchet provides:
+   322→   322→    - Forward secrecy: each message uses a unique key derived from a chain
+   323→   323→    - Break-in recovery: a DH ratchet step occurs when the peer's DH key changes
+   324→   324→    - Out-of-order support: skipped message keys are cached (bounded)
+   325→   325→    """
+   326→   326→
+   327→   327→    def __init__(self) -> None:
+   328→   328→        self._state = RatchetState()
+   329→   329→
+   330→   330→    # -------------------------------------------------------------------
+   331→   331→    # Initialization
+   332→   332→    # -------------------------------------------------------------------
+   333→   333→
+   334→   334→    def init_as_initiator(
+   335→   335→        self,
+   336→   336→        shared_secret: bytes,
+   337→   337→        remote_dh_public: bytes,
+   338→   338→    ) -> bytes:
+   339→   339→        """Initialize as the initiator (Alice).
+   340→   340→
+   341→   341→        Args:
+   342→   342→            shared_secret: The X3DH shared secret from initial key exchange.
+   343→   343→            remote_dh_public: The peer's prekey (X25519 public, 32 bytes).
+   344→   344→
+   345→   345→        Returns:
+   346→   346→            Our initial DH public key to send to the peer.
+   347→   347→        """
+   348→   348→        # Generate our initial DH ratchet key pair
+   349→   349→        dh_keypair = X25519KeyPair()
+   350→   350→        self._state.dh_local_private = dh_keypair.private_key_bytes
+   351→   351→        self._state.dh_local_public = dh_keypair.public_key_bytes
+   352→   352→        self._state.dh_remote_public = remote_dh_public
+   353→   353→
+   354→   354→        # Perform DH ratchet step: derive new root key and sending chain
+   355→   355→        dh_output = dh_keypair.shared_secret(remote_dh_public)
+   356→   356→        dh_bytes = bytes(dh_output)
+   357→   357→
+   358→   358→        # Root key = HKDF(shared_secret + dh_output)
+   359→   359→        root_key = _hkdf_expand(shared_secret + dh_bytes, ROOT_KEY_INFO)
+   360→   360→
+   361→   361→        # Derive sending chain key and header keys from root key
+   362→   362→        send_chain, root_key = self._kdf_rk(root_key, dh_bytes)
+   363→   363→        self._state.root_key = root_key
+   364→   364→        self._state.send_chain_key = send_chain
+   365→   365→        self._state.send_header_key = _hkdf_expand(send_chain, HEADER_KEY_INFO)
+   366→   366→        self._state.send_next_header_key = _hkdf_expand(send_chain, NEXT_HEADER_KEY_INFO)
+   367→   367→
+   368→   368→        # Receiving chain is not yet established
+   369→   369→        self._state.recv_chain_key = b""
+   370→   370→        self._state.recv_header_key = b""
+   371→   371→        self._state.recv_next_header_key = _hkdf_expand(b"", NEXT_HEADER_KEY_INFO)
+   372→   372→
+   373→   373→        self._state.send_message_number = 0
+   374→   374→        self._state.recv_message_number = 0
+   375→   375→        self._state.previous_send_chain_length = 0
+   376→   376→        self._state.initialized = True
+   377→   377→
+   378→   378→        # Zero DH output
+   379→   379→        dh_output.zero()
+   380→   380→
+   381→   381→        return self._state.dh_local_public
+   382→   382→
+   383→   383→    def init_as_responder(
+   384→   384→        self,
+   385→   385→        shared_secret: bytes,
+   386→   386→        remote_dh_public: bytes,
+   387→   387→    ) -> None:
+   388→   388→        """Initialize as the responder (Bob).
+   389→   389→
+   390→   390→        Args:
+   391→   391→            shared_secret: The X3DH shared secret from initial key exchange.
+   392→   392→            remote_dh_public: The initiator's first DH ratchet public key (32 bytes).
+   393→   393→        """
+   394→   394→        self._state.dh_remote_public = remote_dh_public
+   395→   395→        self._state.root_key = shared_secret
+   396→   396→
+   397→   397→        # Derive receiving chain key and next header key from root key
+   398→   398→        # The receiving chain is established from the initiator's first DH key
+   399→   399→        recv_chain, new_root = self._kdf_rk(shared_secret, b"")
+   400→   400→        self._state.root_key = new_root
+   401→   401→
+   402→   402→        # Derive next header key for receiving (peer will use this for their next header)
+   403→   403→        self._state.recv_next_header_key = _hkdf_expand(recv_chain, NEXT_HEADER_KEY_INFO)
+   404→   404→        self._state.recv_header_key = _hkdf_expand(recv_chain, HEADER_KEY_INFO)
+   405→   405→        self._state.recv_chain_key = recv_chain
+   406→   406→
+   407→   407→        # Sending chain is not yet established (until we perform a DH step)
+   408→   408→        self._state.send_chain_key = b""
+   409→   409→        self._state.send_header_key = b""
+   410→   410→        self._state.send_next_header_key = _hkdf_expand(b"", NEXT_HEADER_KEY_INFO)
+   411→   411→
+   412→   412→        # Generate but don't use our DH key yet (used when we first send)
+   413→   413→        dh_keypair = X25519KeyPair()
+   414→   414→        self._state.dh_local_private = dh_keypair.private_key_bytes
+   415→   415→        self._state.dh_local_public = dh_keypair.public_key_bytes
+   416→   416→
+   417→   417→        self._state.send_message_number = 0
+   418→   418→        self._state.recv_message_number = 0
+   419→   419→        self._state.previous_send_chain_length = 0
+   420→   420→        self._state.initialized = True
+   421→   421→
+   422→   422→    # -------------------------------------------------------------------
+   423→   423→    # Encryption
+   424→   424→    # -------------------------------------------------------------------
+   425→   425→
+   426→   426→    def encrypt(self, plaintext: bytes) -> tuple[bytes, bytes]:
+   427→   427→        """Encrypt a message using the Double Ratchet.
+   428→   428→
+   429→   429→        Advances the sending chain key to derive a per-message key,
+   430→   430→        then encrypts with AES-256-GCM.
+   431→   431→
+   432→   432→        Args:
+   433→   433→            plaintext: The message content to encrypt.
+   434→   434→
+   435→   435→        Returns:
+   436→   436→            Tuple of (encrypted_header, encrypted_message).
+   437→   437→            - encrypted_header: nonce + AES-GCM(header_key, header)
+   438→   438→            - encrypted_message: nonce + AES-GCM(message_key, plaintext, aad=header)
+   439→   439→
+   440→   440→        Raises:
+   441→   441→            RatchetNotInitializedError: If the ratchet hasn't been initialized.
+   442→   442→        """
+   443→   443→        if not self._state.initialized:
+   444→   444→            raise RatchetNotInitializedError("Ratchet not initialized.")
+   445→   445→
+   446→   446→        # Advance sending chain
+   447→   447→        new_chain_key, message_key = advance_chain_key(self._state.send_chain_key)
+   448→   448→        self._state.send_chain_key = new_chain_key
+   449→   449→
+   450→   450→        # Build header
+   451→   451→        header = RatchetHeader(
+   452→   452→            dh_public_key=self._state.dh_local_public,
+   453→   453→            message_number=self._state.send_message_number,
+   454→   454→            previous_chain_length=self._state.previous_send_chain_length,
+   455→   455→        )
+   456→   456→
+   457→   457→        # Encrypt header with header key
+   458→   458→        encrypted_header = encrypt_header(header, self._state.send_header_key)
+   459→   459→
+   460→   460→        # Encrypt message with message key, using the raw header as AAD
+   461→   461→        raw_header = encode_header(header)
+   462→   462→        encrypted_message = AES256GCM.encrypt(message_key, plaintext, aad=raw_header)
+   463→   463→
+   464→   464→        self._state.send_message_number += 1
+   465→   465→
+   466→   466→        # Zero message key from memory
+   467→   467→        _zero_bytes(message_key)
+   468→   468→
+   469→   469→        return encrypted_header, encrypted_message
+   470→   470→
+   471→   471→    # -------------------------------------------------------------------
+   472→   472→    # Decryption
+   473→   473→    # -------------------------------------------------------------------
+   474→   474→
+   475→   475→    def decrypt(self, encrypted_header: bytes, encrypted_message: bytes) -> bytes:
+   476→   476→        """Decrypt a message using the Double Ratchet.
+   477→   477→
+   478→   478→        Handles:
+   479→   479→        - Header decryption with current or next header key
+   480→   480→        - DH ratchet step when peer's DH key changes
+   481→   481→        - Skipped message key caching for out-of-order messages
+   482→   482→        - Chain advancement for in-order messages
+   483→   483→
+   484→   484→        Args:
+   485→   485→            encrypted_header: The encrypted ratchet header.
+   486→   486→            encrypted_message: The encrypted message body.
+   487→   487→
+   488→   488→        Returns:
+   489→   489→            The decrypted plaintext.
+   490→   490→
+   491→   491→        Raises:
+   492→   492→            RatchetNotInitializedError: If not initialized.
+   493→   493→            HeaderDecryptError: If header cannot be decrypted.
+   494→   494→            MessageAuthenticationError: If message authentication fails.
+   495→   495→            TooManySkippedMessagesError: If too many messages are skipped.
+   496→   496→        """
+   497→   497→        if not self._state.initialized:
+   498→   498→            raise RatchetNotInitializedError("Ratchet not initialized.")
+   499→   499→
+   500→   500→        # Try to decrypt header with current and next header keys
+   501→   501→        header: Optional[RatchetHeader] = None
+   502→   502→        used_header_key: bytes = b""
+   503→   503→
+   504→   504→        # Try current recv header key
+   505→   505→        if self._state.recv_header_key:
+   506→   506→            try:
+   507→   507→                header = decrypt_header(encrypted_header, self._state.recv_header_key)
+   508→   508→                used_header_key = self._state.recv_header_key
+   509→   509→            except HeaderDecryptError:
+   510→   510→                header = None
+   511→   511→
+   512→   512→        # Try next recv header key (DH ratchet step needed)
+   513→   513→        if header is None and self._state.recv_next_header_key:
+   514→   514→            try:
+   515→   515→                header = decrypt_header(encrypted_header, self._state.recv_next_header_key)
+   516→   516→                used_header_key = self._state.recv_next_header_key
+   517→   517→            except HeaderDecryptError:
+   518→   518→                header = None
+   519→   519→
+   520→   520→        if header is None:
+   521→   521→            raise HeaderDecryptError("Cannot decrypt header with any known header key.")
+   522→   522→
+   523→   523→        # Check if DH ratchet step is needed (peer's DH key changed)
+   524→   524→        if header.dh_public_key != self._state.dh_remote_public:
+   525→   525→            self._skip_message_keys(header.previous_chain_length)
+   526→   526→            self._dh_ratchet_step(header)
+   527→   527→
+   528→   528→        # Skip message keys if we're behind
+   529→   529→        self._skip_message_keys(header.message_number)
+   530→   530→
+   531→   531→        # Advance receiving chain to derive message key
+   532→   532→        new_chain_key, message_key = advance_chain_key(self._state.recv_chain_key)
+   533→   533→        self._state.recv_chain_key = new_chain_key
+   534→   534→        self._state.recv_message_number = header.message_number + 1
+   535→   535→
+   536→   536→        # Decrypt message with AAD = raw header
+   537→   537→        raw_header = encode_header(header)
+   538→   538→        try:
+   539→   539→            plaintext = AES256GCM.decrypt(message_key, encrypted_message, aad=raw_header)
+   540→   540→        except DecryptionError as exc:
+   541→   541→            # Store the skipped key in case we need it later
+   542→   542→            self._state.skipped_keys.store(used_header_key, header.message_number, message_key)
+   543→   543→            raise MessageAuthenticationError(f"Message authentication failed: {exc}") from exc
+   544→   544→
+   545→   545→        # Zero message key
+   546→   546→        _zero_bytes(message_key)
+   547→   547→
+   548→   548→        return plaintext
+   549→   549→
+   550→   550→    # -------------------------------------------------------------------
+   551→   551→    # DH Ratchet Step
+   552→   552→    # -------------------------------------------------------------------
+   553→   553→
+   554→   554→    def _dh_ratchet_step(self, header: RatchetHeader) -> None:
+   555→   555→        """Perform a DH ratchet step.
+   556→   556→
+   557→   557→        Called when the peer's DH public key changes (they've ratcheted).
+   558→   558→        This:
+   559→   559→        1. Updates our receiving chain with the peer's new DH key
+   560→   560→        2. Generates a new DH key pair for our sending chain
+   561→   561→        3. Derives new root key, chain keys, and header keys
+   562→   562→        """
+   563→   563→        # Save previous send chain length
+   564→   564→        self._state.previous_send_chain_length = self._state.send_message_number
+   565→   565→
+   566→   566→        # Update remote DH public key
+   567→   567→        self._state.dh_remote_public = header.dh_public_key
+   568→   568→
+   569→   569→        # DH output with peer's new key (using our current private key)
+   570→   570→        current_dh = X25519KeyPair(
+   571→   571→            X25519PrivateKey.from_private_bytes(self._state.dh_local_private)
+   572→   572→        )
+   573→   573→        dh_output = current_dh.shared_secret(self._state.dh_remote_public)
+   574→   574→        dh_bytes = bytes(dh_output)
+   575→   575→
+   576→   576→        # Derive new receiving chain
+   577→   577→        recv_chain, new_root = self._kdf_rk(self._state.root_key, dh_bytes)
+   578→   578→        self._state.root_key = new_root
+   579→   579→        self._state.recv_chain_key = recv_chain
+   580→   580→        self._state.recv_header_key = self._state.recv_next_header_key
+   581→   581→        self._state.recv_next_header_key = _hkdf_expand(recv_chain, NEXT_HEADER_KEY_INFO)
+   582→   582→
+   583→   583→        # Generate new DH key pair for sending
+   584→   584→        new_dh = X25519KeyPair()
+   585→   585→        self._state.dh_local_private = new_dh.private_key_bytes
+   586→   586→        self._state.dh_local_public = new_dh.public_key_bytes
+   587→   587→
+   588→   588→        # DH output with new key pair
+   589→   589→        dh_output2 = new_dh.shared_secret(self._state.dh_remote_public)
+   590→   590→        dh_bytes2 = bytes(dh_output2)
+   591→   591→
+   592→   592→        # Derive new sending chain
+   593→   593→        send_chain, new_root2 = self._kdf_rk(new_root, dh_bytes2)
+   594→   594→        self._state.root_key = new_root2
+   595→   595→        self._state.send_chain_key = send_chain
+   596→   596→        self._state.send_header_key = self._state.send_next_header_key
+   597→   597→        self._state.send_next_header_key = _hkdf_expand(send_chain, NEXT_HEADER_KEY_INFO)
+   598→   598→
+   599→   599→        self._state.send_message_number = 0
+   600→   600→        self._state.recv_message_number = 0
+   601→   601→
+   602→   602→        # Zero DH outputs
+   603→   603→        dh_output.zero()
+   604→   604→        dh_output2.zero()
+   605→   605→
+   606→   606→    # -------------------------------------------------------------------
+   607→   607→    # Skip message keys
+   608→   608→    # -------------------------------------------------------------------
+   609→   609→
+   610→   610→    def _skip_message_keys(self, until: int) -> None:
+   611→   611→        """Skip message keys in the receiving chain until the given number.
+   612→   612→
+   613→   613→        Stores skipped keys in the cache for potential later use.
+   614→   614→        """
+   615→   615→        if until - self._state.recv_message_number > MAX_SKIP:
+   616→   616→            raise TooManySkippedMessagesError(
+   617→   617→                f"Cannot skip {until - self._state.recv_message_number} messages "
+   618→   618→                f"(max {MAX_SKIP}). Possible replay attack or DoS."
+   619→   619→            )
+   620→   620→
+   621→   621→        while self._state.recv_message_number < until:
+   622→   622→            new_chain_key, message_key = advance_chain_key(self._state.recv_chain_key)
+   623→   623→            self._state.skipped_keys.store(
+   624→   624→                self._state.recv_header_key,
+   625→   625→                self._state.recv_message_number,
+   626→   626→                message_key,
+   627→   627→            )
+   628→   628→            self._state.recv_chain_key = new_chain_key
+   629→   629→            self._state.recv_message_number += 1
+   630→   630→
+   631→   631→    # -------------------------------------------------------------------
+   632→   632→    # Root key KDF
+   633→   633→    # -------------------------------------------------------------------
+   634→   634→
+   635→   635→    def _kdf_rk(self, root_key: bytes, dh_output: bytes) -> tuple[bytes, bytes]:
+   636→   636→        """KDF for root key evolution.
+   637→   637→
+   638→   638→        Args:
+   639→   639→            root_key: Current root key (32 bytes).
+   640→   640→            dh_output: DH ratchet output (32 bytes), may be empty for initial setup.
+   641→   641→
+   642→   642→        Returns:
+   643→   643→            (chain_key, new_root_key) — both 32 bytes.
+   644→   644→        """
+   645→   645→        if dh_output:
+   646→   646→            input_key = root_key + dh_output
+   647→   647→        else:
+   648→   648→            input_key = root_key
+   649→   649→
+   650→   650→        combined = _hkdf_expand(input_key, ROOT_KEY_INFO + CHAIN_KEY_INFO, 64)
+   651→   651→        chain_key = combined[:32]
+   652→   652→        new_root_key = combined[32:]
+   653→   653→        return chain_key, new_root_key
+   654→   654→
+   655→   655→    # -------------------------------------------------------------------
+   656→   656→    # State access
+   657→   657→    # -------------------------------------------------------------------
+   658→   658→
+   659→   659→    @property
+   660→   660→    def state(self) -> RatchetState:
+   661→   661→        """Get the current ratchet state (for persistence)."""
+   662→   662→        return self._state
+   663→   663→
+   664→   664→    @state.setter
+   665→   665→    def state(self, new_state: RatchetState) -> None:
+   666→   666→        """Restore ratchet state from persistence."""
+   667→   667→        self._state = new_state
+   668→   668→
+   669→   669→    @property
+   670→   670→    def is_initialized(self) -> bool:
+   671→   671→        return self._state.initialized
+   672→   672→
+   673→   673→    @property
+   674→   674→    def public_key(self) -> bytes:
+   675→   675→        """Our current DH ratchet public key."""
+   676→   676→        return self._state.dh_local_public
+   677→   677→
+   678→   678→
+   679→   679→# ---------------------------------------------------------------------------
+   680→   680→# Helper: constant-time comparison
+   681→   681→# ---------------------------------------------------------------------------
+   682→   682→
+   683→   683→def constant_time_compare(a: bytes, b: bytes) -> bool:
+   684→   684→    """Constant-time byte comparison to prevent timing attacks."""
+   685→   685→    return hmac.compare_digest(a, b)
+   686→   686→
+   687→   687→
+   688→   688→# ---------------------------------------------------------------------------
+   689→   689→# Helper: zero bytes
+   690→   690→# ---------------------------------------------------------------------------
+   691→   691→
+   692→   692→def _zero_bytes(data: bytes) -> None:
+   693→   693→    """Best-effort zeroing of bytes that may be in memory.
+   694→   694→
+   695→   695→    Note: Python bytes are immutable, so we can't actually zero them.
+   696→   696→    This is a best-effort approach for bytearray-backed data.
+   697→   697→    """
+   698→   698→    # Python bytes are immutable; we can't truly zero them.
+   699→   699→    # The real protection comes from SecureBytes for sensitive data.
+   700→   700→    pass
+   701→   701→
