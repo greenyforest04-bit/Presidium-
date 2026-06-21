@@ -44,23 +44,33 @@ def shared_secret() -> bytes:
 
 @pytest.fixture
 def bob_prekey() -> bytes:
-    """Generate a random X25519 prekey for Bob."""
+    """Generate a random X25519 prekey for Bob (public key only)."""
     return X25519KeyPair().public_key_bytes
 
 
 @pytest.fixture
-def alice_init(shared_secret: bytes, bob_prekey: bytes) -> DoubleRatchet:
+def bob_prekey_pair() -> X25519KeyPair:
+    """Generate a full X25519 prekey pair for Bob (public + private)."""
+    return X25519KeyPair()
+
+
+@pytest.fixture
+def alice_init(shared_secret: bytes, bob_prekey_pair: X25519KeyPair) -> DoubleRatchet:
     """Create an initiator (Alice) ratchet."""
     ratchet = DoubleRatchet()
-    ratchet.init_as_initiator(shared_secret, bob_prekey)
+    ratchet.init_as_initiator(shared_secret, bob_prekey_pair.public_key_bytes)
     return ratchet
 
 
 @pytest.fixture
-def bob_responder(shared_secret: bytes, alice_init: DoubleRatchet) -> DoubleRatchet:
-    """Create a responder (Bob) ratchet using Alice's first public key."""
+def bob_responder(shared_secret: bytes, alice_init: DoubleRatchet, bob_prekey_pair: X25519KeyPair) -> DoubleRatchet:
+    """Create a responder (Bob) ratchet using Alice's first public key and Bob's prekey private key."""
     ratchet = DoubleRatchet()
-    ratchet.init_as_responder(shared_secret, alice_init.public_key)
+    ratchet.init_as_responder(
+        shared_secret,
+        alice_init.public_key,
+        local_prekey_private=bob_prekey_pair.private_key_bytes,
+    )
     return ratchet
 
 

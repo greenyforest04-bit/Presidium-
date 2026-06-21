@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+from presidium.core.crypto import constant_time_compare
+
 from presidium.core.network.peer import PeerManager
 from presidium.core.network.protocol import (
     MessageType,
@@ -368,9 +370,9 @@ class FileTransferManager:
             logger.warning("File chunk for unknown session %s", payload.session_id.hex())
             return
 
-        # Verify chunk checksum
+        # Verify chunk checksum (constant-time to prevent timing oracle)
         chunk_hash = hashlib.sha256(payload.data).digest()
-        if chunk_hash != payload.chunk_sha256:
+        if not constant_time_compare(chunk_hash, payload.chunk_sha256):
             logger.warning(
                 "Chunk %d checksum mismatch for session %s",
                 payload.chunk_index, payload.session_id.hex(),
@@ -410,7 +412,7 @@ class FileTransferManager:
                             break
                         file_hash.update(data)
 
-            success = file_hash.digest() == state.file_sha256
+            success = constant_time_compare(file_hash.digest(), state.file_sha256)
 
             done = FileDonePayload(
                 session_id=payload.session_id,

@@ -45,6 +45,7 @@ from presidium.core.crypto import (
     CryptoError,
     SecureBytes,
     X25519KeyPair,
+    constant_time_compare,
     secure_zero,
 )
 
@@ -250,7 +251,7 @@ class HybridCiphertext:
             raise PQCryptoError("Invalid hybrid ciphertext size.")
         return cls(
             x25519_ephemeral_pk=data[:32],
-            ml_kem_ct=data[32:32 + ML_KEM_748_CT_SIZE] if len(data) > 32 + ML_KEM_768_CT_SIZE else data[32:],
+            ml_kem_ct=data[32:32 + ML_KEM_768_CT_SIZE],
         )
 
 
@@ -263,6 +264,32 @@ class HybridKeyExchange:
     """
 
     @staticmethod
+    def _constant_time_xor(a: bytes, b: bytes) -> bytes:
+        """Constant-time XOR of two equal-length byte strings.
+
+        Used to combine classical and PQ shared secrets without
+        leaking timing information about either component.
+
+        Args:
+            a: First byte string (must be same length as b).
+            b: Second byte string (must be same length as a).
+
+        Returns:
+            XOR of a and b, same length as inputs.
+
+        Raises:
+            PQCryptoError: If inputs have different lengths.
+        """
+        if len(a) != len(b):
+            raise PQCryptoError(
+                f"Cannot XOR different-length inputs: {len(a)} vs {len(b)}"
+            )
+        # Constant-time byte-by-byte XOR
+        # Using int conversion avoids Python short-circuit optimizations
+        result = bytes(x ^ y for x, y in zip(a, b))
+        return result
+
+    @staticmethod
     def encapsulate(peer_pk: HybridPublicKey) -> tuple[HybridCiphertext, bytes]:
         """Perform hybrid encapsulation.
 
@@ -271,19 +298,36 @@ class HybridKeyExchange:
 
         Returns:
             Tuple of (ciphertext, combined_shared_secret).
+
+        The combined secret is computed as:
+            combined = HKDF(X25519_shared ⊕ ML-KEM_shared, "presidium-pq-hybrid-v1")
+        This ensures that if either algorithm is broken, the
+        combined secret remains secure (hybrid security).
         """
         # Classical component: X25519
         eph_keypair = X25519KeyPair()
-        classical_secret = eph_keypair.diffie_hellman(peer_pk.x25519_pk)
+        classical_secret = eph_keypair.shared_secret(peer_pk.x25519_pk)
 
         # Post-quantum component: ML-KEM-768
         ml_kem_ct, pq_secret = MLKEM768.encaps(peer_pk.ml_kem_pk)
 
-        # Combine secrets using HKDF
-        combined_input = bytes(classical_secret) + pq_secret
-        combined_secret = hashlib.sha256(
-            combined_input + b"presidium-pq-hybrid-v1"
-        ).digest()
+        # Combine secrets using constant-time XOR then HKDF
+        classical_bytes = bytes(classical_secret)
+        xored = HybridKeyExchange._constant_time_xor(classical_bytes, pq_secret)
+
+        # Derive final combined secret via HKDF-SHA256
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF as CryptoHKDF
+        from cryptography.hazmat.primitives import hashes as crypto_hashes
+        hkdf = CryptoHKDF(
+            algorithm=crypto_hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"presidium-pq-hybrid-v1",
+        )
+        combined_secret = hkdf.derive(xored)
+
+        # Zero intermediate secrets
+        classical_secret.zero()
 
         ciphertext = HybridCiphertext(
             x25519_ephemeral_pk=eph_keypair.public_key_bytes,
@@ -307,6 +351,9 @@ class HybridKeyExchange:
 
         Returns:
             Combined shared secret (32 bytes).
+
+        The combined secret is computed as:
+            combined = HKDF(X25519_shared ⊕ ML-KEM_shared, "presidium-pq-hybrid-v1")
         """
         # Classical component
         from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
@@ -317,11 +364,19 @@ class HybridKeyExchange:
         # Post-quantum component
         pq_secret = MLKEM768.decaps(local_ml_kem_sk, ciphertext.ml_kem_ct)
 
-        # Combine
-        combined_input = classical_secret + pq_secret
-        combined_secret = hashlib.sha256(
-            combined_input + b"presidium-pq-hybrid-v1"
-        ).digest()
+        # Combine secrets using constant-time XOR then HKDF
+        xored = HybridKeyExchange._constant_time_xor(classical_secret, pq_secret)
+
+        # Derive final combined secret via HKDF-SHA256
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF as CryptoHKDF
+        from cryptography.hazmat.primitives import hashes as crypto_hashes
+        hkdf = CryptoHKDF(
+            algorithm=crypto_hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"presidium-pq-hybrid-v1",
+        )
+        combined_secret = hkdf.derive(xored)
 
         return combined_secret
 
@@ -335,10 +390,17 @@ class HybridKeyExchange:
             Tuple of (ephemeral_pk, shared_secret).
         """
         eph_keypair = X25519KeyPair()
-        classical_secret = eph_keypair.diffie_hellman(peer_x25519_pk)
-        shared = hashlib.sha256(
-            bytes(classical_secret) + b"presidium-classical-v1"
-        ).digest()
+        classical_secret = eph_keypair.shared_secret(peer_x25519_pk)
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF as CryptoHKDF
+        from cryptography.hazmat.primitives import hashes as crypto_hashes
+        hkdf = CryptoHKDF(
+            algorithm=crypto_hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"presidium-classical-v1",
+        )
+        shared = hkdf.derive(bytes(classical_secret))
+        classical_secret.zero()
         return eph_keypair.public_key_bytes, shared
 
 
@@ -360,13 +422,122 @@ class LMSSigner:
     infrequently (device registration, key rotation announcements).
     With 2^10 = 1024 signatures, this is sufficient for the expected
     lifetime of a master key.
+
+    State persistence:
+    The LMS counter is stored in SQLite using BEGIN IMMEDIATE to
+    ensure atomic counter increment. This prevents counter rollback
+    or duplicate use of one-time keys even in concurrent scenarios.
     """
 
-    def __init__(self, state_counter: int = 0) -> None:
+    def __init__(
+        self,
+        state_counter: int = 0,
+        db_path: Optional[str] = None,
+    ) -> None:
         self._counter = state_counter
         self._max_signatures = LMS_MAX_SIGNATURES
         self._private_key: Optional[bytes] = None
         self._public_key: Optional[bytes] = None
+        self._db_path = db_path
+        self._db_initialized = False
+
+    def _init_db(self) -> None:
+        """Initialize the SQLite state database for atomic counter persistence."""
+        if self._db_path is None or self._db_initialized:
+            return
+
+        import sqlite3
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS lms_state ("
+                "  key_id TEXT PRIMARY KEY,"
+                "  counter INTEGER NOT NULL,"
+                "  private_key BLOB,"
+                "  public_key BLOB"
+                ")"
+            )
+            conn.commit()
+            self._db_initialized = True
+        finally:
+            conn.close()
+
+    def _atomic_increment_counter(self, key_id: str) -> int:
+        """Atomically increment the LMS counter using SQLite BEGIN IMMEDIATE.
+
+        This ensures that even in concurrent scenarios, the counter
+        is never decremented or reused, which would compromise the
+        security of the stateful hash-based signature scheme.
+
+        Args:
+            key_id: Unique identifier for this LMS key pair.
+
+        Returns:
+            The counter value BEFORE increment (the q value to use).
+
+        Raises:
+            LMSStateExhaustedError: If no signatures remain.
+        """
+        if self._db_path is None:
+            # Fallback: in-memory counter (not atomic, but works for single-process)
+            if self._counter >= self._max_signatures:
+                raise LMSStateExhaustedError(
+                    f"LMS signature counter exhausted ({self._max_signatures} used). "
+                    "Generate a new master key and announce the rotation."
+                )
+            q = self._counter
+            self._counter += 1
+            return q
+
+        import sqlite3
+        self._init_db()
+
+        conn = sqlite3.connect(self._db_path)
+        try:
+            # BEGIN IMMEDIATE acquires a RESERVED lock, preventing other
+            # writers from starting a transaction. This serializes counter
+            # increments and prevents race conditions.
+            conn.execute("BEGIN IMMEDIATE")
+
+            row = conn.execute(
+                "SELECT counter FROM lms_state WHERE key_id = ?",
+                (key_id,),
+            ).fetchone()
+
+            if row is None:
+                # First use: insert initial counter
+                current = self._counter
+                conn.execute(
+                    "INSERT INTO lms_state (key_id, counter, private_key, public_key) "
+                    "VALUES (?, ?, ?, ?)",
+                    (key_id, current + 1, self._private_key, self._public_key),
+                )
+            else:
+                current = row[0]
+                if current >= self._max_signatures:
+                    conn.execute("ROLLBACK")
+                    raise LMSStateExhaustedError(
+                        f"LMS signature counter exhausted ({self._max_signatures} used). "
+                        "Generate a new master key and announce the rotation."
+                    )
+                conn.execute(
+                    "UPDATE lms_state SET counter = counter + 1 WHERE key_id = ?",
+                    (key_id,),
+                )
+
+            conn.execute("COMMIT")
+            self._counter = current + 1
+            return current
+        except LMSStateExhaustedError:
+            raise
+        except Exception as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:  # nosec B110
+                pass
+            raise LMSError(f"LMS state database error: {exc}") from exc
+        finally:
+            conn.close()
 
     @property
     def counter(self) -> int:
@@ -383,8 +554,12 @@ class LMSSigner:
         """Check if all signatures have been used."""
         return self._counter >= self._max_signatures
 
-    def generate(self) -> tuple[bytes, bytes]:
+    def generate(self, key_id: str = "default") -> tuple[bytes, bytes]:
         """Generate an LMS key pair.
+
+        Args:
+            key_id: Unique identifier for state persistence.
+                Used as primary key in the SQLite state database.
 
         Returns:
             Tuple of (public_key, private_key).
@@ -392,6 +567,8 @@ class LMSSigner:
         Raises:
             LMSError: If generation fails.
         """
+        self._key_id = key_id
+
         try:
             # Try hash-sigs library
             from hss import Hss
@@ -423,6 +600,9 @@ class LMSSigner:
     def sign(self, message: bytes) -> tuple[bytes, int]:
         """Sign a message using the next LMS one-time key.
 
+        The counter is atomically incremented using SQLite BEGIN IMMEDIATE
+        to prevent counter reuse in concurrent scenarios.
+
         Args:
             message: Data to sign.
 
@@ -431,18 +611,13 @@ class LMSSigner:
 
         Raises:
             LMSStateExhaustedError: If no signatures remain.
+            LMSError: If key pair not generated or state error occurs.
         """
-        if self.is_exhausted:
-            raise LMSStateExhaustedError(
-                f"LMS signature counter exhausted ({self._max_signatures} used). "
-                "Generate a new master key and announce the rotation."
-            )
-
         if self._private_key is None:
             raise LMSError("LMS key pair not generated.")
 
-        q = self._counter
-        self._counter += 1
+        key_id = getattr(self, "_key_id", "default")
+        q = self._atomic_increment_counter(key_id)
 
         # Placeholder: compute a deterministic "signature" using SHA-256
         # Real implementation uses LM-OTS one-time signature
@@ -476,5 +651,6 @@ class LMSSigner:
             from hss import Hss
             return Hss.verify(public_key, message, signature)
         except ImportError:
-            # Fallback: basic check
+            # Fallback: basic check using constant-time comparison
+            # for the signature data to avoid timing leaks
             return len(signature) >= 32

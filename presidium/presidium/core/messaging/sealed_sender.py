@@ -50,6 +50,7 @@ from presidium.core.crypto import (
     Ed25519KeyPair,
     SecureBytes,
     X25519KeyPair,
+    constant_time_compare,
     derive_session_key,
     secure_zero,
 )
@@ -291,7 +292,7 @@ class HPKEContext:
             eph_keypair = X25519KeyPair()
 
             # DH key agreement
-            shared_secret = eph_keypair.diffie_hellman(recipient_public_key)
+            shared_secret = eph_keypair.shared_secret(recipient_public_key)
 
             # Derive encryption key and nonce via HKDF
             from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -545,7 +546,7 @@ class SealedSenderManager:
         expected_hint = hashlib.sha256(
             self._x25519.public_key_bytes
         ).digest()[:RECIPIENT_HINT_SIZE]
-        if envelope.recipient_hint != expected_hint:
+        if not constant_time_compare(envelope.recipient_hint, expected_hint):
             raise RecipientMismatchError(
                 "Envelope recipient hint does not match our public key."
             )
@@ -600,4 +601,4 @@ class SealedSenderManager:
     def matches_recipient_hint(self, hint: bytes) -> bool:
         """Check if a recipient hint matches our public key."""
         expected = self.compute_recipient_hint(self._x25519.public_key_bytes)
-        return expected == hint
+        return constant_time_compare(expected, hint)

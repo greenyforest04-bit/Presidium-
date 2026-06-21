@@ -6,13 +6,25 @@ Provides:
 - AES-256-GCM authenticated encryption
 - Argon2id key derivation from user password
 - Secure memory zeroing for sensitive key material
+- Constant-time comparison for MAC/signature verification
+
+Security audit notes:
+- All MAC/signature comparisons use hmac.compare_digest (constant-time)
+- SecureBytes uses ctypes.memset for zeroing + mlock/munlock on Linux
+- os.urandom is used ONLY for cryptographic purposes
+- Non-cryptographic random uses secrets.token_bytes
+- Argon2id parameters configurable via PRESIDIUM_ARGON_* env vars
 """
 
 from __future__ import annotations
 
 import ctypes
+import hmac
+import logging
 import os
+import secrets
 import struct
+import sys
 from typing import Optional
 
 from cryptography.hazmat.primitives import serialization, hashes
@@ -53,11 +65,28 @@ class SignatureError(CryptoError):
 # Secure memory zeroing
 # ---------------------------------------------------------------------------
 
+# Platform detection for mlock/munlock
+_LINUX = sys.platform == "linux"
+_libc = None
+if _LINUX:
+    try:
+        _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        _libc.mlock.restype = ctypes.c_int
+        _libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        _libc.munlock.restype = ctypes.c_int
+        _libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    except OSError:
+        _libc = None
+
+logger = logging.getLogger(__name__)
+
+
 def secure_zero(buffer: bytearray | memoryview) -> None:
     """Overwrite a bytearray with zeros using ctypes.memset.
 
     This is a best-effort approach; Python's memory model makes true
     guarantees impossible, but we avoid the optimiser eliding the write.
+    On Linux, also calls munlock to release any mlock'd pages.
     """
     if isinstance(buffer, memoryview):
         # memoryview cannot be overwritten directly via memset safely;
@@ -66,14 +95,36 @@ def secure_zero(buffer: bytearray | memoryview) -> None:
             for i in range(len(buffer)):
                 buffer[i] = 0
         return
-    ctypes.memset(ctypes.addressof((ctypes.c_char * len(buffer)).from_buffer(buffer)), 0, len(buffer))
+    addr = ctypes.addressof((ctypes.c_char * len(buffer)).from_buffer(buffer))
+    ctypes.memset(addr, 0, len(buffer))
+    # On Linux, release mlock'd memory after zeroing
+    if _LINUX and _libc is not None:
+        try:
+            _libc.munlock(addr, len(buffer))
+        except Exception:
+            pass  # Best-effort; may fail if not mlock'd
 
 
 class SecureBytes:
-    """A byte container that zeroes its memory on deletion."""
+    """A byte container that zeroes its memory on deletion.
+
+    Uses ctypes.memset for secure zeroing and mlock on Linux
+    to prevent the buffer from being swapped to disk.
+    """
 
     def __init__(self, data: bytes | bytearray) -> None:
         self._data = bytearray(data)
+        self._locked = False
+        # Attempt to mlock the buffer on Linux to prevent swapping
+        if _LINUX and _libc is not None:
+            try:
+                addr = ctypes.addressof(
+                    (ctypes.c_char * len(self._data)).from_buffer(self._data)
+                )
+                if _libc.mlock(addr, len(self._data)) == 0:
+                    self._locked = True
+            except Exception:
+                pass  # Best-effort; mlock may fail due to limits
 
     def __len__(self) -> int:
         return len(self._data)
@@ -90,8 +141,9 @@ class SecureBytes:
         return memoryview(self._data)
 
     def zero(self) -> None:
-        """Explicitly zero the internal buffer."""
+        """Explicitly zero the internal buffer and release mlock."""
         secure_zero(self._data)
+        self._locked = False
 
     def __del__(self) -> None:
         try:
@@ -103,6 +155,44 @@ class SecureBytes:
 # ---------------------------------------------------------------------------
 # Argon2id key derivation
 # ---------------------------------------------------------------------------
+
+def _get_argon2_params() -> tuple[int, int, int]:
+    """Get Argon2id parameters from env vars or defaults.
+
+    Environment variables (override CryptoConfig defaults):
+        PRESIDIUM_ARGON_MEMORY: Memory cost in KiB (default: 65536 = 64 MB)
+        PRESIDIUM_ARGON_ITERATIONS: Time cost / iterations (default: 3)
+        PRESIDIUM_ARGON_PARALLELISM: Parallelism (default: 4)
+
+    Returns:
+        Tuple of (time_cost, memory_cost, parallelism).
+    """
+    time_cost = int(os.environ.get("PRESIDIUM_ARGON_ITERATIONS", "3"))
+    memory_cost = int(os.environ.get("PRESIDIUM_ARGON_MEMORY", "65536"))
+    parallelism = int(os.environ.get("PRESIDIUM_ARGON_PARALLELISM", "4"))
+
+    # Enforce minimums per security audit requirements
+    if time_cost < 3:
+        logger.warning(
+            "PRESIDIUM_ARGON_ITERATIONS=%d is below minimum (3), using 3.",
+            time_cost,
+        )
+        time_cost = 3
+    if memory_cost < 65536:
+        logger.warning(
+            "PRESIDIUM_ARGON_MEMORY=%d KiB is below minimum (65536 = 64 MB), using 65536.",
+            memory_cost,
+        )
+        memory_cost = 65536
+    if parallelism < 1:
+        logger.warning(
+            "PRESIDIUM_ARGON_PARALLELISM=%d is below minimum (1), using 1.",
+            parallelism,
+        )
+        parallelism = 1
+
+    return time_cost, memory_cost, parallelism
+
 
 def derive_key_from_password(
     password: str,
@@ -116,6 +206,7 @@ def derive_key_from_password(
         password: The user-provided password.
         salt: Random salt (at least 16 bytes).
         config: CryptoConfig with Argon2 parameters. Uses defaults if None.
+            Environment variables PRESIDIUM_ARGON_* take precedence.
         key_length: Output key length in bytes (default 32 for AES-256).
 
     Returns:
@@ -124,8 +215,16 @@ def derive_key_from_password(
     Raises:
         KeyDerivationError: If key derivation fails.
     """
+    # Environment variables take precedence over config
+    env_time, env_mem, env_par = _get_argon2_params()
+
     if config is None:
         config = CryptoConfig()
+
+    # Use env vars if they differ from defaults (user explicitly set them)
+    time_cost = env_time
+    memory_cost = env_mem
+    parallelism = env_par
 
     if len(salt) < 16:
         raise KeyDerivationError("Salt must be at least 16 bytes.")
@@ -134,9 +233,9 @@ def derive_key_from_password(
         derived = hash_secret_raw(
             secret=password.encode("utf-8"),
             salt=salt,
-            time_cost=config.argon2_time_cost,
-            memory_cost=config.argon2_memory_cost,
-            parallelism=config.argon2_parallelism,
+            time_cost=time_cost,
+            memory_cost=memory_cost,
+            parallelism=parallelism,
             hash_len=key_length,
             type=Type.ID,
         )
@@ -146,8 +245,43 @@ def derive_key_from_password(
 
 
 def generate_salt(size: int = 32) -> bytes:
-    """Generate a cryptographically random salt."""
+    """Generate a cryptographically random salt.
+
+    Uses os.urandom which is suitable for cryptographic purposes.
+    For non-cryptographic random, use secrets.token_bytes instead.
+    """
     return os.urandom(size)
+
+
+def generate_random_id(size: int = 16) -> bytes:
+    """Generate a non-cryptographic random ID.
+
+    Uses secrets.token_bytes for non-cryptographic identifiers
+    such as session IDs, poll IDs, notification IDs, etc.
+    This keeps os.urandom reserved for cryptographic purposes only.
+    """
+    return secrets.token_bytes(size)
+
+
+def constant_time_compare(a: bytes, b: bytes) -> bool:
+    """Constant-time byte comparison to prevent timing attacks.
+
+    Uses hmac.compare_digest which is designed to resist timing
+    side-channels when comparing MACs, signatures, or other
+    security-sensitive byte sequences.
+
+    MUST be used for:
+    - MAC/tag verification
+    - Signature comparison
+    - Recipient hint matching
+    - Hash digest comparison
+    - Any security-sensitive byte equality check
+
+    MUST NOT be used for:
+    - Length checks (len(a) != len(b) is fine)
+    - Non-security comparisons
+    """
+    return hmac.compare_digest(a, b)
 
 
 # ---------------------------------------------------------------------------

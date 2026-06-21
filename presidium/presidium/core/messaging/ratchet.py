@@ -41,6 +41,7 @@ from presidium.core.crypto import (
     CryptoError,
     EncryptionError,
     DecryptionError,
+    constant_time_compare,
 )
 
 logger = logging.getLogger(__name__)
@@ -250,7 +251,7 @@ class SkippedMessageKeys:
             try:
                 from presidium.core.crypto import secure_zero
                 secure_zero(bytearray(key))
-            except Exception:
+            except Exception:  # nosec B110
                 pass
         self._store.clear()
 
@@ -338,6 +339,12 @@ class DoubleRatchet:
     ) -> bytes:
         """Initialize as the initiator (Alice).
 
+        Follows the Signal Double Ratchet specification:
+        1. Set root_key = X3DH shared_secret
+        2. Generate new DH ratchet key pair
+        3. Perform DH with the responder's prekey
+        4. KDF_RK(root_key, dh_output) → (sending_chain_key, new_root_key)
+
         Args:
             shared_secret: The X3DH shared secret from initial key exchange.
             remote_dh_public: The peer's prekey (X25519 public, 32 bytes).
@@ -351,21 +358,19 @@ class DoubleRatchet:
         self._state.dh_local_public = dh_keypair.public_key_bytes
         self._state.dh_remote_public = remote_dh_public
 
-        # Perform DH ratchet step: derive new root key and sending chain
+        # Perform DH ratchet step: derive sending chain from shared_secret + DH output
         dh_output = dh_keypair.shared_secret(remote_dh_public)
         dh_bytes = bytes(dh_output)
 
-        # Root key = HKDF(shared_secret + dh_output)
-        root_key = _hkdf_expand(shared_secret + dh_bytes, ROOT_KEY_INFO)
-
-        # Derive sending chain key and header keys from root key
-        send_chain, root_key = self._kdf_rk(root_key, dh_bytes)
-        self._state.root_key = root_key
+        # KDF_RK(shared_secret, dh_output) → (sending_chain, new_root_key)
+        # Per Signal spec: root_key starts as X3DH shared_secret
+        send_chain, new_root = self._kdf_rk(shared_secret, dh_bytes)
+        self._state.root_key = new_root
         self._state.send_chain_key = send_chain
         self._state.send_header_key = _hkdf_expand(send_chain, HEADER_KEY_INFO)
         self._state.send_next_header_key = _hkdf_expand(send_chain, NEXT_HEADER_KEY_INFO)
 
-        # Receiving chain is not yet established
+        # Receiving chain is not yet established (until peer sends a message)
         self._state.recv_chain_key = b""
         self._state.recv_header_key = b""
         self._state.recv_next_header_key = _hkdf_expand(b"", NEXT_HEADER_KEY_INFO)
@@ -384,25 +389,52 @@ class DoubleRatchet:
         self,
         shared_secret: bytes,
         remote_dh_public: bytes,
+        local_prekey_private: Optional[bytes] = None,
     ) -> None:
         """Initialize as the responder (Bob).
+
+        Follows the Signal Double Ratchet specification:
+        1. Set root_key = X3DH shared_secret
+        2. Compute DH with the initiator's first DH ratchet key using our prekey
+        3. KDF_RK(root_key, dh_output) → (receiving_chain_key, new_root_key)
 
         Args:
             shared_secret: The X3DH shared secret from initial key exchange.
             remote_dh_public: The initiator's first DH ratchet public key (32 bytes).
+            local_prekey_private: Our prekey private key (32 bytes) that the
+                initiator used. This is needed to compute the same DH output
+                as the initiator. If None, the receiving chain cannot be
+                established until a DH ratchet step occurs during decrypt.
         """
         self._state.dh_remote_public = remote_dh_public
         self._state.root_key = shared_secret
 
-        # Derive receiving chain key and next header key from root key
-        # The receiving chain is established from the initiator's first DH key
-        recv_chain, new_root = self._kdf_rk(shared_secret, b"")
-        self._state.root_key = new_root
+        if local_prekey_private is not None:
+            # Compute the same DH output as the initiator:
+            # DH(our_prekey_priv, their_first_dh_pub) = DH(their_first_dh_priv, our_prekey_pub)
+            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+            prekey = X25519PrivateKey.from_private_bytes(local_prekey_private)
+            remote_pk = X25519PublicKey.from_public_bytes(remote_dh_public)
+            dh_output = prekey.exchange(remote_pk)
 
-        # Derive next header key for receiving (peer will use this for their next header)
-        self._state.recv_next_header_key = _hkdf_expand(recv_chain, NEXT_HEADER_KEY_INFO)
-        self._state.recv_header_key = _hkdf_expand(recv_chain, HEADER_KEY_INFO)
-        self._state.recv_chain_key = recv_chain
+            # KDF_RK(shared_secret, dh_output) → (receiving_chain, new_root_key)
+            # This MUST produce the same chain key as the initiator's sending chain
+            recv_chain, new_root = self._kdf_rk(shared_secret, dh_output)
+            self._state.root_key = new_root
+
+            # Derive header keys from receiving chain
+            self._state.recv_header_key = _hkdf_expand(recv_chain, HEADER_KEY_INFO)
+            self._state.recv_next_header_key = _hkdf_expand(recv_chain, NEXT_HEADER_KEY_INFO)
+            self._state.recv_chain_key = recv_chain
+        else:
+            # Without the prekey private key, we cannot derive the receiving chain
+            # yet. The first decrypt will handle this via the DH ratchet step.
+            # The recv_next_header_key will be tried during decryption.
+            recv_chain, new_root = self._kdf_rk(shared_secret, b"")
+            self._state.root_key = new_root
+            self._state.recv_next_header_key = _hkdf_expand(recv_chain, NEXT_HEADER_KEY_INFO)
+            self._state.recv_header_key = _hkdf_expand(recv_chain, HEADER_KEY_INFO)
+            self._state.recv_chain_key = recv_chain
 
         # Sending chain is not yet established (until we perform a DH step)
         self._state.send_chain_key = b""
@@ -429,6 +461,9 @@ class DoubleRatchet:
         Advances the sending chain key to derive a per-message key,
         then encrypts with AES-256-GCM.
 
+        If the sending chain hasn't been established yet (responder's first
+        message), a DH ratchet step is performed first to create it.
+
         Args:
             plaintext: The message content to encrypt.
 
@@ -442,6 +477,11 @@ class DoubleRatchet:
         """
         if not self._state.initialized:
             raise RatchetNotInitializedError("Ratchet not initialized.")
+
+        # If sending chain is not established, perform a DH ratchet step
+        # This happens when the responder sends their first message
+        if not self._state.send_chain_key or not self._state.send_header_key:
+            self._perform_sending_dh_ratchet()
 
         # Advance sending chain
         new_chain_key, message_key = advance_chain_key(self._state.send_chain_key)
@@ -480,6 +520,7 @@ class DoubleRatchet:
         - DH ratchet step when peer's DH key changes
         - Skipped message key caching for out-of-order messages
         - Chain advancement for in-order messages
+        - Retrieval from skipped keys cache for late-arriving messages
 
         Args:
             encrypted_header: The encrypted ratchet header.
@@ -520,8 +561,33 @@ class DoubleRatchet:
         if header is None:
             raise HeaderDecryptError("Cannot decrypt header with any known header key.")
 
+        # Check if this is a late-arriving message (already in skipped keys cache)
+        # This handles out-of-order messages that arrive after we've already
+        # advanced the receiving chain past their message number.
+        if header.message_number < self._state.recv_message_number:
+            cached_key = self._state.skipped_keys.retrieve(
+                used_header_key, header.message_number
+            )
+            if cached_key is not None:
+                # Found in cache — decrypt with cached key
+                raw_header = encode_header(header)
+                try:
+                    plaintext = AES256GCM.decrypt(
+                        cached_key, encrypted_message, aad=raw_header
+                    )
+                except DecryptionError as exc:
+                    raise MessageAuthenticationError(
+                        f"Message authentication failed for cached key: {exc}"
+                    ) from exc
+                _zero_bytes(cached_key)
+                return plaintext
+            # Not in cache — might be a replay or error
+            # Fall through to normal processing (will likely fail)
+
         # Check if DH ratchet step is needed (peer's DH key changed)
-        if header.dh_public_key != self._state.dh_remote_public:
+        # Use constant-time comparison to prevent timing side-channel
+        # on public key changes
+        if not constant_time_compare(header.dh_public_key, self._state.dh_remote_public):
             self._skip_message_keys(header.previous_chain_length)
             self._dh_ratchet_step(header)
 
@@ -603,6 +669,42 @@ class DoubleRatchet:
         dh_output.zero()
         dh_output2.zero()
 
+    def _perform_sending_dh_ratchet(self) -> None:
+        """Perform a sending DH ratchet step.
+
+        This is called when the sending chain hasn't been established yet,
+        which happens when the responder sends their first message. It:
+        1. Saves previous send chain length
+        2. Generates a new DH key pair for sending
+        3. Derives sending chain from root key + DH output
+        """
+        # Save previous send chain length
+        self._state.previous_send_chain_length = self._state.send_message_number
+
+        # Generate new DH key pair for sending
+        new_dh = X25519KeyPair()
+        self._state.dh_local_private = new_dh.private_key_bytes
+        self._state.dh_local_public = new_dh.public_key_bytes
+
+        # DH output with peer's key using new key pair
+        if self._state.dh_remote_public:
+            dh_output = new_dh.shared_secret(self._state.dh_remote_public)
+            dh_bytes = bytes(dh_output)
+
+            # Derive new sending chain
+            send_chain, new_root = self._kdf_rk(self._state.root_key, dh_bytes)
+            self._state.root_key = new_root
+            self._state.send_chain_key = send_chain
+            self._state.send_header_key = self._state.send_next_header_key
+            self._state.send_next_header_key = _hkdf_expand(send_chain, NEXT_HEADER_KEY_INFO)
+
+            dh_output.zero()
+        else:
+            # No remote key yet - this shouldn't happen in normal operation
+            raise RatchetError("Cannot perform sending DH ratchet: no remote public key")
+
+        self._state.send_message_number = 0
+
     # -------------------------------------------------------------------
     # Skip message keys
     # -------------------------------------------------------------------
@@ -611,11 +713,30 @@ class DoubleRatchet:
         """Skip message keys in the receiving chain until the given number.
 
         Stores skipped keys in the cache for potential later use.
+        Raises TooManySkippedMessagesError if the skip count exceeds MAX_SKIP,
+        and emits a CRITICAL alert to the security log.
         """
-        if until - self._state.recv_message_number > MAX_SKIP:
+        skip_count = until - self._state.recv_message_number
+        if skip_count > MAX_SKIP:
+            # SECURITY ALERT: This could indicate a replay attack, DoS,
+            # or a malfunctioning peer. Log at CRITICAL level for monitoring.
+            logger.critical(
+                "SECURITY ALERT: Skipped message key window exceeded! "
+                "skip_count=%d, max_skip=%d, recv_msg_num=%d, until=%d. "
+                "Possible replay attack or DoS.",
+                skip_count, MAX_SKIP, self._state.recv_message_number, until,
+            )
             raise TooManySkippedMessagesError(
-                f"Cannot skip {until - self._state.recv_message_number} messages "
+                f"Cannot skip {skip_count} messages "
                 f"(max {MAX_SKIP}). Possible replay attack or DoS."
+            )
+
+        # Warn when approaching the limit (>= 80% of MAX_SKIP)
+        if skip_count >= int(MAX_SKIP * 0.8):
+            logger.warning(
+                "Skipped message key window approaching limit: "
+                "skip_count=%d/%d (%.0f%%). Monitor for suspicious activity.",
+                skip_count, MAX_SKIP, (skip_count / MAX_SKIP) * 100,
             )
 
         while self._state.recv_message_number < until:
@@ -677,12 +798,13 @@ class DoubleRatchet:
 
 
 # ---------------------------------------------------------------------------
-# Helper: constant-time comparison
+# Re-export constant_time_compare from crypto module for backward compatibility
 # ---------------------------------------------------------------------------
 
-def constant_time_compare(a: bytes, b: bytes) -> bool:
-    """Constant-time byte comparison to prevent timing attacks."""
-    return hmac.compare_digest(a, b)
+# constant_time_compare is now imported from presidium.core.crypto
+# It is re-exported here for any code that imported it from this module.
+# Use presidium.core.crypto.constant_time_compare directly in new code.
+
 
 
 # ---------------------------------------------------------------------------
