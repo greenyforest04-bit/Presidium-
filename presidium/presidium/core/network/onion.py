@@ -33,7 +33,7 @@ Limitations (v1):
     - No stream multiplexing (one circuit = one message flow)
     - No congestion control (best-effort relay)
     - Exit node can observe plaintext (use with Sealed Sender for full privacy)
-    - No guard persistence (random selection each time)
+    - Guard nodes persist for 10 minutes (GUARD_ROTATION_INTERVAL)
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
 from presidium.core.crypto import AES256GCM, CryptoError, SecureBytes, secure_zero
+from presidium.core.network.net_security import ReplayBloomFilter
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +60,11 @@ logger = logging.getLogger(__name__)
 CIRCUIT_ID_SIZE = 16
 HOP_COUNT = 3
 CIRCUIT_LIFETIME_SECONDS = 600  # 10 minutes
+GUARD_ROTATION_INTERVAL = 600  # 10 minutes — guard rotation period
 ONION_VERSION = 1
 NONCE_SIZE = 12
 MAX_RELAY_PAYLOAD = 65536
+REPLAY_NONCE_SIZE = 8  # 64-bit nonce for replay protection
 
 # Onion message types
 ONION_CMD_CREATE = 0x01
@@ -221,8 +224,8 @@ class OnionLayerCrypto:
     ) -> bytes:
         """Add one layer of onion encryption.
 
-        Wraps the plaintext with routing info (next hop + circuit ID)
-        and encrypts with the hop's key.
+        Wraps the plaintext with routing info (next hop + circuit ID),
+        a 64-bit replay nonce, and encrypts with the hop's key.
 
         Args:
             plaintext: The data to wrap (may already be layered).
@@ -233,12 +236,17 @@ class OnionLayerCrypto:
         Returns:
             Encrypted layer bytes.
         """
-        # Build the inner payload: next_hop_len + next_hop + circuit_id + plaintext
+        # Generate replay protection nonce
+        replay_nonce = os.urandom(REPLAY_NONCE_SIZE)
+
+        # Build the inner payload:
+        # next_hop_len + next_hop + circuit_id + replay_nonce + plaintext
         next_hop_bytes = next_hop_addr.encode("utf-8")
         inner = (
             struct.pack("!H", len(next_hop_bytes))
             + next_hop_bytes
             + next_circuit_id.encode()
+            + replay_nonce
             + plaintext
         )
 
@@ -252,18 +260,23 @@ class OnionLayerCrypto:
     def peel_layer(
         encrypted: bytes,
         key: bytes,
+        replay_filter: Optional[ReplayBloomFilter] = None,
+        circuit_id_bytes: bytes = b"",
     ) -> tuple[str, CircuitId, bytes]:
-        """Peel one layer of onion encryption.
+        """Peel one layer of onion encryption with replay protection.
 
         Args:
             encrypted: The encrypted layer (nonce + ciphertext).
             key: This hop's AES-256-GCM key (32 bytes).
+            replay_filter: Optional Bloom filter for replay detection.
+            circuit_id_bytes: Incoming circuit ID bytes for replay key scope.
 
         Returns:
             Tuple of (next_hop_addr, next_circuit_id, remaining_payload).
 
         Raises:
             DecryptionError: If decryption fails.
+            OnionError: If replay attack detected.
         """
         if len(encrypted) < NONCE_SIZE + 16:  # nonce + minimal GCM tag
             raise DecryptionError("Encrypted data too short.")
@@ -295,9 +308,23 @@ class OnionLayerCrypto:
         next_circuit_id = CircuitId(inner[offset:offset + CIRCUIT_ID_SIZE])
         offset += CIRCUIT_ID_SIZE
 
+        # Extract and validate replay nonce
         remaining = inner[offset:]
 
-        return next_hop, next_circuit_id, remaining
+        if len(remaining) < REPLAY_NONCE_SIZE:
+            raise OnionError("Replay nonce missing from onion layer")
+
+        replay_nonce = remaining[:REPLAY_NONCE_SIZE]
+        # Composite replay key: nonce + circuit context
+        replay_key = replay_nonce + circuit_id_bytes
+        if replay_filter is not None and replay_filter.check_and_add(replay_key):
+            raise OnionError(
+                "Replay attack detected: duplicate nonce in onion layer"
+            )
+
+        payload = remaining[REPLAY_NONCE_SIZE:]
+
+        return next_hop, next_circuit_id, payload
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +417,17 @@ class OnionRoutingManager:
         self._relay_state = RelayState()
         self._is_relay_enabled = False
 
+        # Guard rotation state
+        self._guard_node: Optional[HopDescriptor] = None
+        self._guard_created_at: float = 0.0
+
+        # Replay protection
+        self._replay_filter = ReplayBloomFilter(
+            expected_items=500_000,
+            false_positive_rate=0.001,
+            ttl_seconds=3600.0,  # 1 hour
+        )
+
         # Callbacks
         self._send_to_peer: Optional[Callable[[str, bytes], Awaitable[None]]] = None
         self._on_incoming_message: Optional[Callable[[bytes, bytes], Awaitable[None]]] = None
@@ -455,6 +493,49 @@ class OnionRoutingManager:
         logger.info("Onion routing manager stopped.")
 
     # -------------------------------------------------------------------
+    # Guard selection
+    # -------------------------------------------------------------------
+
+    def _select_guard(self, available_hops: list[HopDescriptor]) -> HopDescriptor:
+        """Select a guard node with 10-minute rotation period.
+
+        Guard nodes are persistent for 10 minutes to prevent guard
+        rotation attacks. An attacker who can observe guard selection
+        would need to maintain a malicious relay for the full rotation
+        period to be selected as a guard.
+
+        Args:
+            available_hops: List of candidate HopDescriptor objects.
+
+        Returns:
+            The selected (or reused) guard HopDescriptor.
+
+        Raises:
+            CircuitError: If no hops are available for guard selection.
+        """
+        now = time.monotonic()
+
+        # Reuse existing guard if within rotation interval
+        if (self._guard_node is not None
+                and now - self._guard_created_at < GUARD_ROTATION_INTERVAL):
+            logger.debug("Reusing guard node (age=%.0fs)", now - self._guard_created_at)
+            return self._guard_node
+
+        # Select new guard
+        if not available_hops:
+            raise CircuitError("No peers available for guard selection")
+
+        guard = available_hops[os.urandom(1)[0] % len(available_hops)]
+        self._guard_node = guard
+        self._guard_created_at = now
+        logger.info(
+            "New guard node selected: %s (rotation every %ds)",
+            guard.peer_id[:8] if guard.peer_id else "unknown",
+            GUARD_ROTATION_INTERVAL,
+        )
+        return guard
+
+    # -------------------------------------------------------------------
     # Circuit creation (sender side)
     # -------------------------------------------------------------------
 
@@ -463,6 +544,8 @@ class OnionRoutingManager:
 
         Selects relay nodes from the DHT, performs layered key
         exchange with each hop, and returns an active circuit.
+        The guard node persists across circuit rotations for
+        GUARD_ROTATION_INTERVAL (10 minutes).
 
         Returns:
             An established OnionCircuit.
@@ -479,6 +562,10 @@ class OnionRoutingManager:
             raise CircuitError(
                 f"Not enough relay nodes available: {len(hops)}/{HOP_COUNT}."
             )
+
+        # Apply guard rotation: reuse persistent guard if within interval
+        guard = self._select_guard(hops)
+        hops[0] = guard
 
         circuit = OnionCircuit(
             hops=hops,
@@ -635,8 +722,10 @@ class OnionRoutingManager:
             try:
                 next_addr, next_cid, remaining = OnionLayerCrypto.peel_layer(
                     encrypted_layer, enc_key,
+                    replay_filter=self._replay_filter,
+                    circuit_id_bytes=incoming_circuit_id,
                 )
-            except DecryptionError as exc:
+            except (DecryptionError, OnionError) as exc:
                 logger.error("Failed to peel layer: %s", exc)
                 return
 

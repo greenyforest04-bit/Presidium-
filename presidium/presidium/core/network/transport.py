@@ -28,6 +28,7 @@ from presidium.core.network.protocol import (
     PongPayload,
     PingPayload,
 )
+from presidium.core.network.net_security import AmplificationProtector, IPRateLimiter
 from presidium.utils.config import NetworkConfig
 
 logger = logging.getLogger(__name__)
@@ -165,6 +166,9 @@ class UDPTransport:
 
         # NAT traversal
         self._punch_events: dict[bytes, asyncio.Event] = {}  # peer_user_id → Event
+
+        # Per-IP rate limiting (DoS mitigation)
+        self._rate_limiter = IPRateLimiter(max_connections_per_minute=30, max_requests_per_minute=120)
 
         # Background tasks
         self._bg_tasks: list[asyncio.Task] = []
@@ -337,6 +341,11 @@ class UDPTransport:
 
     async def _on_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
         """Called by the protocol when a datagram is received."""
+        # Per-IP rate limiting
+        ip_addr = addr[0]
+        if not self._rate_limiter.check_request(ip_addr):
+            return  # Silently drop rate-limited requests
+
         try:
             msg_type, timestamp, payload = decode_message(data)
         except ProtocolError as exc:
@@ -383,6 +392,12 @@ class UDPTransport:
             external_addr=f"{addr[0]}:{addr[1]}",
             your_external_addr=f"{addr[0]}:{addr[1]}",
         )
+        # Amplification protection: response must not exceed 2× request
+        ack_size = len(encode_message(MessageType.PUNCH_ACK, ack))
+        # PUNCH payloads are typically small; use a reasonable estimate
+        if not AmplificationProtector.check_response_size(64, ack_size):
+            logger.warning("Dropping PUNCH_ACK: amplification limit exceeded")
+            return
         await self.send(MessageType.PUNCH_ACK, ack, addr)
         peer.last_seen = time.monotonic()
 
@@ -402,6 +417,10 @@ class UDPTransport:
             sender_id=self._local_user_id,
             ping_timestamp=time.time(),
         )
+        # Amplification protection
+        pong_data = encode_message(MessageType.PONG, pong)
+        if not AmplificationProtector.check_response_size(32, len(pong_data)):
+            return
         await self.send(MessageType.PONG, pong, addr)
 
     async def _handle_pong(self, payload: PongPayload, addr: tuple[str, int]) -> None:

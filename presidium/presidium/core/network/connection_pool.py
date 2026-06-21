@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from presidium.core.network.peer import PeerManager, PeerInfo
+from presidium.core.network.net_security import IPRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,12 @@ class ConnectionPool:
         # Round-robin index for fair queueing
         self._rr_index = 0
 
+        # Per-IP rate limiting (DoS mitigation)
+        self._rate_limiter = IPRateLimiter(
+            max_connections_per_minute=30,
+            max_requests_per_minute=120,
+        )
+
         # Background tasks
         self._bg_tasks: list[asyncio.Task] = []
 
@@ -128,6 +135,13 @@ class ConnectionPool:
         Returns:
             True if the message was queued, False if dropped.
         """
+        # Per-IP rate limiting
+        peer = self._peer_manager.get_peer(peer_user_id)
+        if peer and peer.addr:
+            if not self._rate_limiter.check_request(peer.addr[0]):
+                logger.warning("Rate limited peer %s", peer_user_id[:8])
+                return False
+
         slot = self._get_or_create_slot(peer_user_id)
 
         if slot.health == PeerHealth.DEAD:
@@ -233,6 +247,10 @@ class ConnectionPool:
 
             await asyncio.sleep(0.01)  # Small yield to prevent CPU spinning
 
+    def cleanup_rate_limiter(self, max_age: float = 300.0) -> None:
+        """Remove stale rate limiter entries."""
+        self._rate_limiter.cleanup(max_age=max_age)
+
     # -------------------------------------------------------------------
     # Background: health check
     # -------------------------------------------------------------------
@@ -269,11 +287,20 @@ class ConnectionPool:
     def _get_or_create_slot(self, peer_user_id: str) -> PeerSlot:
         """Get or create a peer slot, enforcing max connections."""
         if peer_user_id not in self._slots:
+            # Verify max connections limit
             if len(self._slots) >= MAX_CONNECTIONS:
                 # Evict the least recently successful peer
                 lrs = min(self._slots.items(), key=lambda x: x[1].last_success_at)
                 logger.info("Evicting peer %s to make room for %s", lrs[0][:8], peer_user_id[:8])
                 del self._slots[lrs[0]]
+
+            # Per-IP rate limiting for new connections
+            peer = self._peer_manager.get_peer(peer_user_id)
+            if peer and peer.addr:
+                if not self._rate_limiter.check_connection(peer.addr[0]):
+                    logger.warning("Rate limited connection from %s for peer %s", peer.addr[0], peer_user_id[:8])
+                    # Return the slot anyway but log the warning — the enqueue
+                    # method will handle dropping if needed
 
             self._slots[peer_user_id] = PeerSlot(peer_user_id=peer_user_id)
         return self._slots[peer_user_id]

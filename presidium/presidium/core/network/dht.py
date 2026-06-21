@@ -33,6 +33,12 @@ from presidium.core.network.protocol import (
     DHTNodeInfo,
 )
 from presidium.core.network.transport import UDPTransport
+from presidium.core.network.net_security import (
+    hashcash_verify,
+    compute_pow_difficulty,
+    validate_lookup_diversity,
+    SubnetDiversityConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +57,7 @@ REPUBLISH_INTERVAL = 86400 # 24 hours — key republish
 MAX_STORED_VALUES = 2048
 EVICT_CHECK_INTERVAL = 300 # 5 minutes — check stale nodes
 MAX_CONCURRENT_RPCS = 16
+HASHCASH_DEFAULT_DIFFICULTY = 4  # Leading zero bits required for PoW
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +101,7 @@ class DHTNode:
     last_pinged: float = 0.0
     ping_pending: bool = False
     failures: int = 0
+    pow_nonce: bytes = b""  # Hashcash PoW nonce
 
     @property
     def is_stale(self) -> bool:
@@ -114,9 +122,10 @@ class KBucket:
     - If the least-recently-seen node doesn't respond → evict old, add new
     """
 
-    def __init__(self, k: int = K_BUCKET_SIZE) -> None:
+    def __init__(self, k: int = K_BUCKET_SIZE, verify_fn=None) -> None:
         self.k = k
         self._nodes: OrderedDict[bytes, DHTNode] = OrderedDict()
+        self._verify_fn = verify_fn  # PoW verification callback(node) -> bool
 
     def __len__(self) -> int:
         return len(self._nodes)
@@ -164,6 +173,10 @@ class KBucket:
             node.last_seen = time.monotonic()
             node.failures = 0
             self._nodes[node.user_id] = node
+            return None
+
+        # Verify PoW for new nodes before adding
+        if self._verify_fn is not None and not self._verify_fn(node):
             return None
 
         if len(self._nodes) < self.k:
@@ -219,11 +232,12 @@ class RoutingTable:
     corresponding to actual network distances will be populated.
     """
 
-    def __init__(self, local_id: bytes, k: int = K_BUCKET_SIZE) -> None:
+    def __init__(self, local_id: bytes, k: int = K_BUCKET_SIZE, verify_fn=None) -> None:
         self._local_id = local_id
         self._k = k
+        self._verify_fn = verify_fn  # PoW verification callback passed to KBuckets
         # 128 buckets (0..127), bucket 0 is unused
-        self._buckets: list[KBucket] = [KBucket(k) for _ in range(ID_BITS)]
+        self._buckets: list[KBucket] = [KBucket(k, verify_fn=verify_fn) for _ in range(ID_BITS)]
 
     def _bucket_for(self, node_id: bytes) -> KBucket:
         """Get the appropriate bucket for a node ID."""
@@ -348,8 +362,12 @@ class DHTService:
         self._local_addr = local_addr
         self._local_public_key = local_public_key
 
-        self._routing_table = RoutingTable(local_user_id)
+        self._routing_table = RoutingTable(local_user_id, verify_fn=self.verify_peer_pow)
         self._store: dict[bytes, StoredValue] = {}
+
+        # Sybil resistance: PoW verification state
+        self._verified_peers: set[bytes] = set()  # user_ids with verified PoW
+        self._pow_difficulty: int = HASHCASH_DEFAULT_DIFFICULTY
 
         # Pending RPCs: request_key → PendingRPC
         self._pending_rpcs: dict[bytes, PendingRPC] = {}
@@ -375,6 +393,42 @@ class DHTService:
 
         self._bg_tasks: list[asyncio.Task] = []
         self._running = False
+
+    def verify_peer_pow(self, node: DHTNode) -> bool:
+        """Verify Hashcash PoW for a peer before adding to routing table.
+
+        Known/verified peers bypass PoW check. Unknown peers must provide
+        a valid PoW stamp with dynamic difficulty based on network size.
+        """
+        if node.user_id in self._verified_peers:
+            return True
+
+        # Compute dynamic difficulty based on peer count
+        peer_count = len(self._verified_peers)
+        self._pow_difficulty = compute_pow_difficulty(peer_count)
+
+        if not node.pow_nonce:
+            logger.warning(
+                "Sybil resistance: peer %s has no PoW nonce (difficulty=%d)",
+                node.user_id.hex()[:8], self._pow_difficulty,
+            )
+            return False
+
+        # Verify the PoW stamp
+        resource = node.user_id + node.public_key
+        if hashcash_verify(resource, node.pow_nonce, self._pow_difficulty):
+            self._verified_peers.add(node.user_id)
+            logger.debug(
+                "PoW verified for peer %s (difficulty=%d)",
+                node.user_id.hex()[:8], self._pow_difficulty,
+            )
+            return True
+        else:
+            logger.warning(
+                "Sybil resistance: PoW verification FAILED for peer %s (difficulty=%d)",
+                node.user_id.hex()[:8], self._pow_difficulty,
+            )
+            return False
 
     # -------------------------------------------------------------------
     # Lifecycle
@@ -735,25 +789,41 @@ class DHTService:
         self, msg_type: int, timestamp: float, payload: DHTFindNodeRespPayload, addr: tuple[str, int]
     ) -> None:
         """Handle FIND_NODE response — add nodes and resolve pending RPC."""
-        for node_info in payload.nodes:
-            node = DHTNode(
-                user_id=node_info.user_id,
-                addr=node_info.addr,
-                public_key=node_info.public_key,
+        resp_nodes = [
+            DHTNode(
+                user_id=ni.user_id,
+                addr=ni.addr,
+                public_key=ni.public_key,
             )
+            for ni in payload.nodes
+        ]
+
+        # Eclipse attack prevention: validate subnet diversity
+        peer_addrs = [(n.addr.rsplit(":", 1)[0], 0) for n in resp_nodes if n.addr]
+        if peer_addrs and not validate_lookup_diversity(peer_addrs):
+            logger.warning(
+                "Eclipse attack detection: FIND_NODE response from %s "
+                "lacks /24 subnet diversity. Possible eclipse attack.",
+                payload.sender_id.hex()[:8] if payload.sender_id else "unknown",
+            )
+            # Don't add nodes from responses that fail diversity check
+            # unless we have very few peers
+            if len(self._verified_peers) >= K_BUCKET_SIZE:
+                # Still resolve the pending future so the RPC doesn't hang
+                request_key = payload.target_id + payload.sender_id
+                future = self._pending_find_node.get(request_key)
+                if future and not future.done():
+                    future.set_result(resp_nodes)
+                return
+
+        for node in resp_nodes:
             self._routing_table.add_node(node)
 
         # Resolve pending future
         request_key = payload.target_id + payload.sender_id
         future = self._pending_find_node.get(request_key)
         if future and not future.done():
-            nodes = [
-                DHTNode(
-                    user_id=ni.user_id, addr=ni.addr, public_key=ni.public_key,
-                )
-                for ni in payload.nodes
-            ]
-            future.set_result(nodes)
+            future.set_result(resp_nodes)
 
     async def _handle_find_value(
         self, msg_type: int, timestamp: float, payload: DHTFindValuePayload, addr: tuple[str, int]

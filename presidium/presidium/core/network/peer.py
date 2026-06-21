@@ -35,6 +35,7 @@ from presidium.core.network.protocol import (
     ProtocolError,
 )
 from presidium.core.network.transport import UDPTransport
+from presidium.core.crypto.agility import SuiteNegotiator, CryptoSuite
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,9 @@ class PeerManager:
         self._on_chat_message: Optional[Callable[[str, bytes, bytes, float], Awaitable[None]]] = None
         self._on_peer_connected: Optional[Callable[[str], Awaitable[None]]] = None
         self._on_peer_disconnected: Optional[Callable[[str], Awaitable[None]]] = None
+
+        # Crypto suite negotiator (downgrade attack prevention)
+        self._suite_negotiator = SuiteNegotiator()
 
         # Register transport handlers
         self._transport.register_handler(MessageType.HELLO, self._handle_hello)
@@ -351,6 +355,30 @@ class PeerManager:
                 public_key=self._local_key_pair.public_key_bytes,
                 accepted=False,
                 error_msg="User ID does not match public key.",
+            )
+            await self._transport.send(MessageType.HELLO_ACK, ack, addr)
+            return
+
+        # Crypto suite negotiation — reject downgrade attacks
+        # Assume the peer advertises suites via a field or defaults to V1
+        peer_supported_suites = getattr(payload, 'supported_suites', None)
+        if peer_supported_suites is None:
+            # Current protocol doesn't carry suite info; assume V1-only peer
+            peer_supported_suites = [CryptoSuite.V1_CLASSICAL.value]
+        negotiated = self._suite_negotiator.negotiate(peer_uid, peer_supported_suites)
+        if negotiated.is_downgrade and CryptoSuite.V2_HYBRID_PQ in self._suite_negotiator.local_supported_suites:
+            # Both sides support V2 but V1 was selected — possible downgrade attack
+            logger.critical(
+                "SECURITY: Downgrade attack detected! Peer supports V2 but "
+                "negotiated V1. Rejecting session with peer %s.",
+                peer_uid[:8],
+            )
+            # Send rejection and do NOT proceed with key exchange
+            ack = HelloAckPayload(
+                user_id=bytes.fromhex(self._local_user_id),
+                public_key=self._local_key_pair.public_key_bytes,
+                accepted=False,
+                error_msg="Downgrade attack detected: crypto suite negotiation failed.",
             )
             await self._transport.send(MessageType.HELLO_ACK, ack, addr)
             return
