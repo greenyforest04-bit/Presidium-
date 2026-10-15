@@ -1,0 +1,542 @@
+ 🎨 PRESIDIUM UI/UX REDESIGN — ПРОМТ ДЛЯ ЛОКАЛЬНОГО АГЕНТА
+
+## 📋 КОНТЕКСТ ПРОЕКТА
+
+Ты работаешь над **Presidium** — децентрализованным P2P мессенджером на Python + PySide6 (Qt6). 
+Стек: `asyncio`, `qasync`, `PySide6`, `aiosqlite`, `Pillow`.
+
+Текущая проблема: UI функциональный, но выглядит "инженерно". Нужен **элитный минималистичный дизайн уровня Telegram iOS / iMessage macOS / Linear.app**.
+
+---
+
+## 🎯 ЦЕЛЬ
+
+Полный редизайн интерфейса с сохранением всей бизнес-логики. Только UI-слой (`presidium/ui/`). 
+НЕ трогай: `core/`, `db/`, `network/`, `messaging/` — только импортируй из них.
+
+---
+
+## 🏛 РЕФЕРЕНСЫ (запомни эти принципы)
+
+| Принцип | Откуда | Как реализовать в PySide6 |
+|---------|--------|---------------------------|
+| **OLED Black** | Telegram iOS | `BG_PRIMARY = "#0F0F0F"` (не #000000, чтобы не смириться с OLED burn-in, но глубокий) |
+| **Glassmorphism** | iMessage macOS | `QGraphicsBlurEffect(radius=20)` + `rgba(255,255,255,0.05)` overlay |
+| **4px Grid** | Linear.app | Все отступы кратны 4: 4, 8, 12, 16, 24, 32, 48 |
+| **Spring Animations** | Apple Design | `QEasingCurve.OutBack` для появления, `QPropertyAnimation` |
+| **Material You** | Android | Accent color динамический (default `#6366F1`), но можно менять |
+| **OLED Safe** | Modern apps | Чистый `#000000` как ОПЦИЯ в настройках (true black mode) |
+
+---
+
+## 🗂 ФАЙЛОВАЯ СТРУКТУРА (создать/обновить)
+presidium/ui/
+├── design_system/
+│   ├── init.py
+│   ├── tokens.py          # ← ИТЕРАЦИЯ 1
+│   ├── animations.py      # ← ИТЕРАЦИЯ 1
+│   └── theme_engine.py    # ← ИТЕРАЦИЯ 5
+├── components/
+│   ├── chat_bubble.py     # ← ИТЕРАЦИЯ 2
+│   ├── chat_list.py       # ← ИТЕРАЦИЯ 2
+│   ├── sidebar.py         # ← ИТЕРАЦИЯ 3
+│   ├── glass_panel.py     # ← ИТЕРАЦИЯ 3
+│   ├── identicon.py       # ← ИТЕРАЦИЯ 4
+│   ├── virtual_list.py    # ← ИТЕРАЦИЯ 4
+│   └── input_bar.py       # ← ИТЕРАЦИЯ 4 (новый!)
+├── screens/
+│   ├── chat_room.py       # ← ИТЕРАЦИЯ 3
+│   ├── welcome_v2.py      # ← ИТЕРАЦИЯ 5
+│   └── settings.py        # ← ИТЕРАЦИЯ 5
+├── mobile/
+│   ├── navigation.py      # ← ИТЕРАЦИЯ 6
+│   ├── chat_room.py       # ← ИТЕРАЦИЯ 6
+│   └── swipe.py           # ← ИТЕРАЦИЯ 6
+├── tray.py                # ← ИТЕРАЦИЯ 4
+├── security_overlay.py    # ← ИТЕРАЦИЯ 4
+└── styles/
+├── dark_theme.py      # ← ИТЕРАЦИЯ 5
+└── light_theme.py     # ← ИТЕРАЦИЯ 5
+plain
+
+---
+
+## 🔧 ИТЕРАЦИЯ 1: Design System (Foundation)
+
+### Файл 1: `presidium/ui/design_system/tokens.py`
+
+Создай единый источник правды. ВСЕ цвета, шрифты, отступы, тени — только здесь.
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Tuple
+
+
+@dataclass(frozen=True)
+class Colors:
+    # === SURFACES ===
+    BG_PRIMARY: str = "#0F0F0F"           # Главный фон (OLED-safe)
+    BG_SECONDARY: str = "#18181B"        # Карточки, панели
+    BG_TERTIARY: str = "#27272A"         # Инпуты, hover
+    BG_ELEVATED: str = "#1C1C1F"         # Панели поверх контента
+    
+    # === ACCENT (Material You indigo) ===
+    ACCENT: str = "#6366F1"
+    ACCENT_HOVER: str = "#818CF8"
+    ACCENT_PRESSED: str = "#4F46E5"
+    ACCENT_GLOW: str = "rgba(99, 102, 241, 0.15)"
+    
+    # === TEXT ===
+    TEXT_PRIMARY: str = "#FAFAFA"        # Основной текст
+    TEXT_SECONDARY: str = "#A1A1AA"      # Превью, подписи
+    TEXT_TERTIARY: str = "#71717A"       # Метки, хинты
+    TEXT_MUTED: str = "#52525B"          # Disabled, timestamps
+    
+    # === SEMANTIC ===
+    SUCCESS: str = "#22C55E"
+    WARNING: str = "#F59E0B"
+    ERROR: str = "#EF4444"
+    INFO: str = "#3B82F6"
+    
+    # === CHAT ===
+    BUBBLE_OWN: str = "#312E81"          # Собственное сообщение (indigo-900)
+    BUBBLE_OTHER: str = "#27272A"        # Чужое сообщение
+    BUBBLE_OWN_TAIL: str = "#312E81"     # Хвостик bubble
+    BUBBLE_OTHER_TAIL: str = "#27272A"
+    
+    # === GLASS ===
+    GLASS_BG: str = "rgba(24, 24, 27, 0.85)"
+    GLASS_BORDER: str = "rgba(255, 255, 255, 0.08)"
+
+
+@dataclass(frozen=True)
+class Spacing:
+    XS: int = 4
+    SM: int = 8
+    MD: int = 12
+    LG: int = 16
+    XL: int = 24
+    XXL: int = 32
+    XXXL: int = 48
+
+
+@dataclass(frozen=True)
+class Typography:
+    FONT_FAMILY: str = "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+    
+    # (size_px, weight, letter_spacing_em)
+    H1: Tuple[str, int, float] = ("24px", 600, -0.02)
+    H2: Tuple[str, int, float] = ("18px", 600, -0.01)
+    H3: Tuple[str, int, float] = ("16px", 600, -0.01)
+    BODY: Tuple[str, int, float] = ("14px", 400, 0.0)
+    CAPTION: Tuple[str, int, float] = ("12px", 500, 0.01)
+    OVERLINE: Tuple[str, int, float] = ("10px", 600, 0.05)
+    BUTTON: Tuple[str, int, float] = ("14px", 500, 0.01)
+
+
+@dataclass(frozen=True)
+class Shadows:
+    SM: str = "0 1px 2px rgba(0,0,0,0.3)"
+    MD: str = "0 4px 12px rgba(0,0,0,0.4)"
+    LG: str = "0 8px 24px rgba(0,0,0,0.5)"
+    GLOW: str = "0 0 20px rgba(99,102,241,0.2)"
+
+
+@dataclass(frozen=True)
+class Radius:
+    SM: int = 6
+    MD: int = 10
+    LG: int = 16
+    XL: int = 20
+    FULL: int = 9999
+
+
+# === LIGHT THEME TOKENS ===
+@dataclass(frozen=True)
+class LightColors:
+    BG_PRIMARY: str = "#FFFFFF"
+    BG_SECONDARY: str = "#F4F4F5"
+    BG_TERTIARY: str = "#E4E4E7"
+    BG_ELEVATED: str = "#FAFAFA"
+    TEXT_PRIMARY: str = "#18181B"
+    TEXT_SECONDARY: str = "#52525B"
+    TEXT_TERTIARY: str = "#71717A"
+    TEXT_MUTED: str = "#A1A1AA"
+    BUBBLE_OWN: str = "#EEF2FF"          # indigo-50
+    BUBBLE_OTHER: str = "#F4F4F5"
+    GLASS_BG: str = "rgba(255, 255, 255, 0.85)"
+    GLASS_BORDER: str = "rgba(0, 0, 0, 0.08)"
+
+
+# Глобальные инстансы (импортируй отсюда)
+TOKENS = Colors()
+SPACE = Spacing()
+TYPE = Typography()
+SHADOW = Shadows()
+RADIUS = Radius()
+Файл 2: presidium/ui/design_system/animations.py
+Фабрика анимаций. ВСЕ анимации в проекте — через эти функции.
+Python
+from __future__ import annotations
+from PySide6.QtCore import QPropertyAnimation, QEasingCurve, QPoint, QSize, QParallelAnimationGroup, QSequentialAnimationGroup
+from PySide6.QtWidgets import QWidget
+from typing import Optional
+
+
+def fade_in(widget: QWidget, duration: int = 200, start: float = 0.0, end: float = 1.0) -> QPropertyAnimation:
+    """Плавное появление через opacity."""
+    widget.setWindowOpacity(start)
+    anim = QPropertyAnimation(widget, b"windowOpacity")
+    anim.setDuration(duration)
+    anim.setStartValue(start)
+    anim.setEndValue(end)
+    anim.setEasingCurve(QEasingCurve.OutCubic)
+    return anim
+
+
+def slide_up(widget: QWidget, distance: int = 20, duration: int = 250) -> QPropertyAnimation:
+    """Сдвиг снизу вверх с fade."""
+    widget.move(widget.x(), widget.y() + distance)
+    anim = QPropertyAnimation(widget, b"pos")
+    anim.setDuration(duration)
+    anim.setStartValue(QPoint(widget.x(), widget.y() + distance))
+    anim.setEndValue(QPoint(widget.x(), widget.y()))
+    anim.setEasingCurve(QEasingCurve.OutBack)
+    return anim
+
+
+def spring_scale(widget: QWidget, from_scale: float = 0.95, to_scale: float = 1.0, duration: int = 300) -> QPropertyAnimation:
+    """Spring-анимация масштаба (как на iOS)."""
+    # Для scale используем stylesheet transform или manual resize
+    # Здесь — анимация geometry для простоты
+    orig_size = widget.size()
+    start_size = QSize(int(orig_size.width() * from_scale), int(orig_size.height() * from_scale))
+    
+    anim = QPropertyAnimation(widget, b"size")
+    anim.setDuration(duration)
+    anim.setStartValue(start_size)
+    anim.setEndValue(orig_size)
+    anim.setEasingCurve(QEasingCurve.OutBack)  # Spring!
+    return anim
+
+
+def shimmer(widget: QWidget, duration: int = 1500) -> QPropertyAnimation:
+    """Skeleton loading effect — градиентное смещение."""
+    # Реализация через stylesheet animation или QPainter
+    # Для PySide6: используем QPropertyAnimation на custom property
+    anim = QPropertyAnimation(widget, b"styleSheet")
+    anim.setDuration(duration)
+    # Здесь placeholder — реальная реализация через QPainter в виджете
+    return anim
+
+
+def press_button(widget: QWidget, duration: int = 100) -> QPropertyAnimation:
+    """Уменьшение при нажатии (0.96)."""
+    anim = QPropertyAnimation(widget, b"geometry")
+    # Сохраняем оригинал, уменьшаем на 4%
+    # Реализация через stylesheet transform: scale
+    anim.setDuration(duration)
+    anim.setEasingCurve(QEasingCurve.InQuad)
+    return anim
+
+
+class AnimationGroup(QParallelAnimationGroup):
+    """Группа анимаций для сложных transitions."""
+    pass
+✅ КРИТЕРИИ ПРИЁМКИ ИТЕРАЦИИ 1:
+[ ] tokens.py импортируется без ошибок, все dataclass frozen
+[ ] animations.py — все функции возвращают QPropertyAnimation (не None)
+[ ] Тест: python -c "from presidium.ui.design_system.tokens import TOKENS; print(TOKENS.ACCENT)" → #6366F1
+🔧 ИТЕРАЦИЯ 2: Core Chat Components
+Файл 3: presidium/ui/components/chat_bubble.py
+Полный редизайн bubble. Требования:
+Визуал:
+Own bubble: справа, BG = BUBBLE_OWN, радиус 18px, но top-right = 4px (хвостик), остальные 18px. Subtle glow: box-shadow: 0 0 12px rgba(99,102,241,0.12).
+Other bubble: слева, BG = BUBBLE_OTHER, top-left = 4px (хвостик).
+Reply preview (внутри bubble): тонкая линия 3px слева ACCENT, имя автора ACCENT 12px, текст превью TEXT_SECONDARY 12px, max 2 строки, ellipsis.
+Status: кастомный QPainter (не emoji!):
+Одна галочка: TEXT_MUTED (отправлено)
+Две галочки: TEXT_MUTED (доставлено)
+Две галочки SUCCESS (прочитано)
+Размер 12px, позиция bottom-right внутри bubble, padding 8px.
+Timestamp: CAPTION (12px, weight 500), TEXT_MUTED, bottom-right, padding 8px от края.
+Reactions: row of pills под bubble. BG BG_TERTIARY, радиус FULL (9999px), padding 4px 8px. Emoji + count CAPTION.
+Hover: подсветка rgba(255,255,255,0.03), появление кнопок Reply/Forward/More (fade in 150ms) СПРАВА от bubble (для own) или СЛЕВА (для other).
+Selection: при клике с Shift — BG + rgba(99,102,241,0.15) overlay.
+Анимация:
+Появление нового сообщения: slide_up(distance=16, duration=250) + fade_in.
+Отправка: spring_scale(from_scale=0.97, duration=200).
+Код (структура):
+Python
+from __future__ import annotations
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QLabel, QGraphicsDropShadowEffect
+from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve
+from PySide6.QtGui import QPainter, QColor, QFont, QFontMetrics, QLinearGradient, QPen, QBrush, QPainterPath
+from typing import Optional, List
+from presidium.ui.design_system.tokens import TOKENS, SPACE, TYPE, SHADOW, RADIUS
+from presidium.ui.design_system.animations import slide_up, fade_in, spring_scale
+
+
+class ChatBubble(QWidget):
+    """Единый виджет сообщения с Material You дизайном."""
+    
+    def __init__(self, is_own: bool, text: str, timestamp: str, 
+                 status: str = "sent", reply_to: Optional[dict] = None,
+                 reactions: Optional[List[dict]] = None,
+                 parent=None):
+        super().__init__(parent)
+        self.is_own = is_own
+        self.text = text
+        self.timestamp = timestamp
+        self.status = status  # "sent", "delivered", "read"
+        self.reply_to = reply_to
+        self.reactions = reactions or []
+        
+        self._setup_ui()
+        self._apply_styling()
+        self._setup_animations()
+    
+    def _setup_ui(self):
+        # Layout: VBox (reply + text + reactions) inside styled container
+        pass
+    
+    def _apply_styling(self):
+        # QSS + inline styles
+        # Shadow effect via QGraphicsDropShadowEffect
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(16)
+        shadow.setColor(QColor(0, 0, 0, 40))
+        shadow.setOffset(0, 2)
+        self.setGraphicsEffect(shadow)
+    
+    def _setup_animations(self):
+        # Entry animation
+        pass
+    
+    def paintEvent(self, event):
+        """Кастомный отрисовщик для скруглений с хвостиком."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Draw rounded rect with custom tail
+        path = QPainterPath()
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        
+        if self.is_own:
+            # Tail on top-right
+            path.addRoundedRect(rect, RADIUS.LG, RADIUS.LG)
+            # Override top-right to be sharper (4px)
+            # ... tail drawing logic
+        else:
+            # Tail on top-left
+            pass
+        
+        painter.fillPath(path, QColor(TOKENS.BUBBLE_OWN if self.is_own else TOKENS.BUBBLE_OTHER))
+        
+        # Glow effect for own
+        if self.is_own:
+            painter.setPen(QPen(QColor(TOKENS.ACCENT_GLOW), 1))
+            painter.drawPath(path)
+    
+    def _draw_status(self, painter: QPainter):
+        """Кастомные галочки через QPainter (не emoji)."""
+        # Two checkmarks for delivered/read
+        # Color depends on status
+        pass
+Файл 4: presidium/ui/components/chat_list.py
+Визуал:
+Item: Avatar 40px (радиус 10px, не круг!) + Name (BODY, TEXT_PRIMARY) + Preview (CAPTION, TEXT_SECONDARY, ellipsis) + Time (CAPTION, TEXT_MUTED) + Unread badge (pill, ACCENT, белый текст, CAPTION).
+Active: левая граница 3px ACCENT, фон BG_ELEVATED.
+Hover: фон rgba(255,255,255,0.03), transition 150ms.
+Context menu: right-click — GlassPanel (blur + rounded 12px), items: Mark Read, Mute, Archive, Delete. Анимация: fade_in + scale 0.95→1.0.
+Typing indicator: 3 dots (ACCENT), stagger fade 150ms, вместо preview текста.
+Search bar: sticky top, BG_TERTIARY, радиус 10px, иконка лупы 16px TEXT_MUTED, placeholder "Search" TEXT_MUTED.
+Код:
+Используй QListWidget или QListView с custom QStyledItemDelegate.
+Или QScrollArea + QVBoxLayout с виджетами (проще для анимаций).
+✅ КРИТЕРИИ ПРИЁМКИ ИТЕРАЦИИ 2:
+[ ] ChatBubble отрисовывается без артефактов, хвостик на правильной стороне
+[ ] Status галочки — QPainter, не emoji, цвет меняется по статусу
+[ ] Reply preview — линия + имя + текст, max 2 строки
+[ ] ChatListItem — avatar 40px радиус 10px, unread pill, hover effect
+[ ] Context menu — glassmorphism, rounded 12px, fade animation
+[ ] Анимация появления сообщения — slide_up + fade_in
+🔧 ИТЕРАЦИЯ 3: Layout Screens
+Файл 5: presidium/ui/components/sidebar.py
+Визуал:
+Collapsed: 64px wide. Иконки 24px, TEXT_SECONDARY, active ACCENT. Tooltip on hover (200ms delay).
+Expanded: 280px.
+Top: Profile (avatar 48px радиус 12px + имя H3 + статус CAPTION зелёный/серый).
+Middle: Navigation (Chats, Contacts, Calls, Settings) — item height 44px, иконка 20px + label BODY, active ACCENT pill background, hover BG_TERTIARY.
+Bottom: Storage bar (прогресс ACCENT), Network status dot + label.
+Glassmorphism: если sidebar поверх контента (mobile) — blur 20px + GLASS_BG.
+FAB: 48px круг, ACCENT, + 24px белый, shadow LG, spring animation при появлении.
+Файл 6: presidium/ui/screens/chat_room.py
+Визуал:
+Header: 56px height. Avatar 32px + имя BODY + статус CAPTION (online/last seen/typing...) + кнопки (voice call, video, search, more) 32px круглые, BG_TERTIARY, hover BG_ELEVATED.
+Background: BG_PRIMARY + subtle noise texture (2% opacity, generated via Pillow, cached as QPixmap).
+Message area: VirtualList (lazy loading), smooth scroll с inertia (custom scrollbar).
+Input bar: 64px height. BG_ELEVATED, радиус 24px (pill shape).
+Left: attachment (paperclip 20px), emoji (smile 20px).
+Center: QLineEdit borderless, placeholder "Message..." TEXT_MUTED, BODY.
+Right: voice button (microphone 20px, hold to record — press animation) ИЛИ send button (paper plane 20px, ACCENT круг 36px, появляется при вводе текста, spring_scale).
+Reply mode: панель 48px над input. Превью сообщения (текст + автор) + крестик. Slide down animation (200ms).
+Date separators: sticky, centered, OVERLINE, TEXT_MUTED, "Today", "Yesterday", "Monday 12 June".
+✅ КРИТЕРИИ ПРИЁМКИ ИТЕРАЦИИ 3:
+[ ] Sidebar — collapsed 64px, expanded 280px, FAB spring animation
+[ ] ChatRoom header — 56px, кнопки 32px круглые с hover
+[ ] Input bar — pill shape 64px, send button spring появление
+[ ] Reply panel — slide down, крестик закрывает
+[ ] Date separators — sticky, OVERLINE стиль
+🔧 ИТЕРАЦИЯ 4: Polish Components
+Файл 7: presidium/ui/components/glass_panel.py
+Python
+class GlassPanel(QWidget):
+    """Frosted glass panel для context menus, modals, dropdowns."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        
+        # Blur effect
+        self.blur = QGraphicsBlurEffect()
+        self.blur.setBlurRadius(20)
+        self.setGraphicsEffect(self.blur)
+        
+        # Border + bg
+        self.setStyleSheet(f"""
+            GlassPanel {{
+                background-color: {TOKENS.GLASS_BG};
+                border: 1px solid {TOKENS.GLASS_BORDER};
+                border-radius: {RADIUS.MD}px;
+            }}
+        """)
+Файл 8: presidium/ui/components/identicon.py
+Gradient mesh из 3-4 цветов (derived from user_id hash).
+Радиус 10px (не круглый!).
+Inner shadow (QPainter).
+Fallback: 2 буквы имени, ACCENT BG, белый текст Inter 600.
+Файл 9: presidium/ui/tray.py
+Monochrome SVG icon (white, adaptive).
+Menu: GlassPanel style, rounded 12px.
+Rich notification: avatar + name + preview + inline reply field (QLineEdit внутри notification).
+Файл 10: presidium/ui/security_overlay.py
+Blurred screenshot behind (QGraphicsBlurEffect on grabbed pixmap).
+Large lock icon (48px, TEXT_MUTED).
+PIN numpad (iOS-style): 6 точек сверху, кнопки 64px круглые BG_TERTIARY, цифры BODY.
+Blur radius animates 0→20px при блокировке (QPropertyAnimation).
+✅ КРИТЕРИИ ПРИЁМКИ ИТЕРАЦИИ 4:
+[ ] GlassPanel — blur 20px, border, translucent background
+[ ] Identicon — gradient mesh, радиус 10px, fallback initials
+[ ] Tray — monochrome icon, glassmorphism menu
+[ ] SecurityOverlay — blur animation, PIN numpad
+🔧 ИТЕРАЦИЯ 5: Screens & Themes
+Файл 11: presidium/ui/screens/welcome_v2.py
+5-step wizard, full-screen, BG_PRIMARY.
+Logo: centered, scale 0.8→1.0 spring, fade in. Tagline "Private. Decentralized. Yours." H2, TEXT_SECONDARY.
+Key Gen: spinner (rotating arc QPainter) + "Generating your identity..." BODY + hex rain (random hex chars falling, 10% opacity).
+PIN: 6 dots (36px circles, BG_TERTIARY, filled ACCENT when entered). Numpad: 3x4 grid, кнопки 72px, BG_TERTIARY, радиус 16px, цифры H3. Face ID/Touch ID label CAPTION.
+Recovery: BIP39 words в grid 3x4. Каждое слово — pill BG_TERTIARY, BODY. Copy button, checkbox "I've written it down".
+First Contact: QR frame (4 уголка анимированные, ACCENT, 2px линии). Manual input field под ним.
+Transitions: slide horizontal, QStackedWidget + QPropertyAnimation on pos, 300ms, InOutCubic.
+Файл 12: presidium/ui/screens/settings.py
+Layout: 2-pane. Left: categories list 240px. Right: content.
+Categories: icon 20px + name BODY + chevron. Active — ACCENT pill background, белый текст.
+Toggles: custom QSwitch (iOS style: 52x32px, круг 28px, ACCENT when ON, spring animation 200ms).
+Inputs: BG_TERTIARY, радиус 10px, focus — border 2px ACCENT.
+Danger zone: красные кнопки (ERROR), отдельная секция с warning icon.
+Файл 13: presidium/ui/styles/dark_theme.py + light_theme.py
+QSS-файлы как Python strings (для hot reload).
+Dark: OLED option (#000000 BG).
+Light: BG_PRIMARY = #FFFFFF.
+System auto-switch via QStyleHints.colorScheme().
+✅ КРИТЕРИИ ПРИЁМКИ ИТЕРАЦИИ 5:
+[ ] Welcome — 5 шагов, spring logo, hex rain, PIN numpad, QR frame
+[ ] Settings — 2-pane, QSwitch spring, danger zone
+[ ] Themes — dark/light/OLED, system auto-switch
+🔧 ИТЕРАЦИЯ 6: Mobile & Final Integration
+Файл 14: presidium/ui/mobile/navigation.py
+Bottom nav: 56px height, BG_ELEVATED + top border 1px GLASS_BORDER.
+4 таба: Chats, Contacts, Calls, Settings. Иконка 24px + label CAPTION.
+Active: ACCENT иконка + label, spring animation (scale 1.0→1.1→1.0).
+FAB: 56px круг, ACCENT, + 24px, shadow LG, anchored above nav (16px offset).
+Файл 15: presidium/ui/mobile/chat_room.py
+Full-screen. Header compact 44px.
+Input attached to keyboard (resize on QInputMethodEvent).
+Swipe from left edge = back (navigation stack pop).
+Файл 16: presidium/ui/mobile/swipe.py
+Python
+class SwipeGestureRecognizer:
+    """Распознавание свайпов для мобильного UI."""
+    
+    def __init__(self, widget: QWidget):
+        self.widget = widget
+        self.start_pos = None
+        self.threshold = 80  # px
+    
+    def mousePressEvent(self, event):
+        self.start_pos = event.pos()
+    
+    def mouseReleaseEvent(self, event):
+        if not self.start_pos:
+            return
+        delta = event.pos().x() - self.start_pos.x()
+        if abs(delta) > self.threshold:
+            if delta > 0:
+                self.on_swipe_right()
+            else:
+                self.on_swipe_left()
+    
+    def on_swipe_left(self):
+        # Reply mode
+        pass
+    
+    def on_swipe_right(self):
+        # Forward or back
+        pass
+Файл 17: presidium/ui/design_system/theme_engine.py
+Runtime theme switching без перезапуска.
+Emits theme_changed signal → все виджеты перерисовываются.
+Accent color extraction from wallpaper (simplified: dominant color via Pillow resize to 1x1 + getpixel).
+✅ КРИТЕРИИ ПРИЁМКИ ИТЕРАЦИИ 6:
+[ ] Mobile nav — 56px, 4 tabs, spring active, FAB
+[ ] Swipe — left=reply, right=back, threshold 80px
+[ ] Theme engine — runtime switch, accent extraction
+🧪 ФИНАЛЬНЫЙ ИНТЕГРАЦИОННЫЙ ТЕСТ
+Создай tests/ui/test_design_system.py:
+Python
+import pytest
+from PySide6.QtWidgets import QApplication
+from presidium.ui.design_system.tokens import TOKENS, LightColors
+from presidium.ui.components.chat_bubble import ChatBubble
+from presidium.ui.components.chat_list import ChatListItem
+
+@pytest.fixture(scope="session")
+def app():
+    return QApplication([])
+
+def test_tokens_immutable():
+    with pytest.raises(FrozenInstanceError):
+        TOKENS.ACCENT = "#000000"
+
+def test_chat_bubble_render(app):
+    bubble = ChatBubble(is_own=True, text="Hello", timestamp="12:00", status="read")
+    assert bubble.minimumWidth() > 100
+    # Check that paintEvent doesn't crash
+    bubble.show()
+    bubble.hide()
+
+def test_contrast_ratio():
+    # WCAG AA: 4.5:1 for normal text
+    from presidium.ui.design_system.tokens import TOKENS
+    # BG_PRIMARY #0F0F0F vs TEXT_PRIMARY #FAFAFA
+    # Calculate luminance and verify ratio > 4.5
+    pass
+📋 ИНСТРУКЦИЯ ДЛЯ АГЕНТА
+Работай строго по итерациям. Не переходи к Итерации 2, пока не выполнены все критерии Итерации 1.
+Каждый файл — полный рабочий код. Не используй pass или # TODO. Если логика сложная — напиши минимально рабочую версию с комментарием # SIMPLIFIED.
+Type hints everywhere. from __future__ import annotations.
+Тестируй после каждой итерации: python -m pytest tests/ui/ -v или python presidium/ui/components/chat_bubble.py (если есть if __name__ == "__main__" demo).
+Если не уверен — спроси, не додумывай. Но лучше сделай минимальную рабочую версию, чем оставь заглушку.

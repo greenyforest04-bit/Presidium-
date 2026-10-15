@@ -1,18 +1,9 @@
-"""Chat list widget for Presidium.
-
-Displays a scrollable list of conversation previews:
-- Peer avatar (identicon)
-- Peer display name
-- Last message preview
-- Relative timestamp
-- Unread count badge
-- Active state indicator
-"""
-
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QSize
-from PySide6.QtGui import QFont, QPixmap
+from typing import Optional
+
+from PySide6.QtCore import Qt, Signal, QTimer, QPropertyAnimation, QEasingCurve, QSize
+from PySide6.QtGui import QFont, QPixmap, QCursor
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -21,156 +12,205 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QFrame,
     QSizePolicy,
+    QLineEdit,
+    QMenu,
 )
 
 from presidium.core.messaging.chat import ChatSession
 from presidium.ui.components.identicon import generate_identicon_pixmap
+from presidium.ui.design_system.tokens import TOKENS, SPACE, TYPE, SHADOW, RADIUS
+from presidium.ui.design_system.animations import fade_in
 
 
 class ChatListItem(QWidget):
-    """A single chat session preview in the list.
-
-    Signals:
-        clicked(str): Emitted with peer_user_id when the item is clicked.
-    """
-
     clicked = Signal(str)
+    context_requested = Signal(str, QCursor)
 
     def __init__(
         self,
         session: ChatSession,
-        parent: QWidget | None = None,
+        parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._session = session
+        self._hovered = False
+        self._selected = False
         self.setObjectName("chat-list-item")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setMinimumHeight(72)
+        self.setMinimumHeight(64)
+        self.setMaximumHeight(72)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
-        """Build the item layout."""
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(12)
+        layout.setContentsMargins(SPACE.LG, SPACE.SM, SPACE.LG, SPACE.SM)
+        layout.setSpacing(SPACE.MD)
 
-        # Avatar
         avatar_label = QLabel()
-        avatar_label.setFixedSize(48, 48)
+        avatar_label.setFixedSize(40, 40)
         avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         try:
             if self._session.peer_public_key:
-                pixmap = generate_identicon_pixmap(self._session.peer_public_key, 48)
+                pixmap = generate_identicon_pixmap(self._session.peer_public_key, 40)
                 avatar_label.setPixmap(pixmap)
             else:
-                avatar_label.setText("\U0001f464")
+                avatar_label.setText("👤")
+                avatar_label.setStyleSheet(f"color: {TOKENS.TEXT_MUTED}; font-size: 18px;")
         except Exception:
-            avatar_label.setText("\U0001f464")
+            avatar_label.setText("👤")
         layout.addWidget(avatar_label)
 
-        # Text content
         text_layout = QVBoxLayout()
-        text_layout.setSpacing(4)
+        text_layout.setSpacing(2)
 
-        # Top row: name + timestamp
         top_row = QHBoxLayout()
-        name_label = QLabel(self._session.display_name)
-        name_font = QFont()
-        name_font.setPointSize(13)
-        name_font.setWeight(QFont.Weight.Medium)
-        name_label.setFont(name_font)
-        top_row.addWidget(name_label, 1)
+        self._name_label = QLabel(self._session.display_name)
+        self._name_label.setStyleSheet(
+            f"color: {TOKENS.TEXT_PRIMARY}; font-size: 14px; font-weight: 500;"
+        )
+        top_row.addWidget(self._name_label, 1)
 
-        from presidium.ui.components.chat_bubble import format_timestamp
-        if self._session.last_message_timestamp > 0:
-            time_label = QLabel(format_timestamp(self._session.last_message_timestamp))
-            time_label.setObjectName("caption")
-            time_font = QFont()
-            time_font.setPointSize(10)
-            time_label.setFont(time_font)
-            top_row.addWidget(time_label)
-
+        self._time_label = QLabel()
+        self._time_label.setStyleSheet(
+            f"color: {TOKENS.TEXT_MUTED}; font-size: 12px; font-weight: 500;"
+        )
+        top_row.addWidget(self._time_label)
         text_layout.addLayout(top_row)
 
-        # Bottom row: last message preview + unread badge
-        bottom_row = QHBoxLayout()
+        self._preview_label = QLabel()
+        self._preview_label.setStyleSheet(
+            f"color: {TOKENS.TEXT_SECONDARY}; font-size: 12px;"
+        )
+        self._preview_label.setMaximumWidth(260)
+        text_layout.addWidget(self._preview_label)
 
-        preview = self._session.last_message_preview or "No messages yet"
-        preview_label = QLabel(preview)
-        preview_label.setObjectName("subtitle")
-        preview_font = QFont()
-        preview_font.setPointSize(12)
-        preview_label.setFont(preview_font)
-        preview_label.setMaximumWidth(300)
-        bottom_row.addWidget(preview_label, 1)
+        self._badge_label = QLabel()
+        self._badge_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._badge_label.setFixedSize(20, 20)
+        self._badge_label.setStyleSheet(
+            f"background-color: {TOKENS.ACCENT}; color: white; border-radius: 10px; font-size: 11px; font-weight: bold;"
+        )
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addWidget(self._preview_label, 1)
+        bottom_row.addWidget(self._badge_label)
+        text_layout.addLayout(bottom_row)
+
+        layout.addLayout(text_layout, 1)
+        self._update_display()
+
+    def _update_display(self) -> None:
+        if self._session.last_message_timestamp > 0:
+            self._time_label.setText(format_timestamp(self._session.last_message_timestamp))
+
+        self._preview_label.setText(self._session.last_message_preview or "No messages yet")
 
         if self._session.unread_count > 0:
-            badge = QLabel(str(self._session.unread_count))
-            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            badge.setFixedSize(24, 24)
-            badge.setStyleSheet("""
-                background-color: #6366F1;
-                color: white;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: bold;
-            """)
-            bottom_row.addWidget(badge)
+            self._badge_label.setText(str(self._session.unread_count))
+            self._badge_label.show()
+        else:
+            self._badge_label.hide()
 
-        text_layout.addLayout(bottom_row)
-        layout.addLayout(text_layout, 1)
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        bg = TOKENS.BG_ELEVATED if self._selected else TOKENS.BG_PRIMARY
+        if self._hovered and not self._selected:
+            bg = "rgba(255, 255, 255, 0.03)"
+
+        painter.fillRect(self.rect(), QColor(bg))
+
+        if self._selected:
+            painter.fillRect(0, 0, 3, self.height(), QColor(TOKENS.ACCENT))
+
+        super().paintEvent(event)
 
     def mousePressEvent(self, event) -> None:
-        """Handle click to emit the peer user ID."""
-        self.clicked.emit(self._session.peer_user_id)
+        if event.button() == Qt.MouseButton.RightButton:
+            self.context_requested.emit(self._session.peer_user_id, QCursor.pos())
+        else:
+            self.clicked.emit(self._session.peer_user_id)
         super().mousePressEvent(event)
 
     def update_session(self, session: ChatSession) -> None:
-        """Update the displayed session data."""
         self._session = session
-        # SIMPLIFIED: in production, update all child widgets
+        self._name_label.setText(session.display_name)
+        self._update_display()
+        self.update()
+
+
+class SearchBar(QWidget):
+    search_changed = Signal(str)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(SPACE.LG, SPACE.SM, SPACE.LG, SPACE.SM)
+        layout.setSpacing(SPACE.SM)
+
+        self._input = QLineEdit()
+        self._input.setPlaceholderText("Search")
+        self._input.setStyleSheet(
+            f"background-color: {TOKENS.BG_TERTIARY}; color: {TOKENS.TEXT_MUTED}; "
+            f"border-radius: {RADIUS.MD}px; padding: 8px 12px; border: none;"
+        )
+        self._input.textChanged.connect(self.search_changed.emit)
+        layout.addWidget(self._input, 1)
 
 
 class ChatListWidget(QScrollArea):
-    """Scrollable list of chat session previews.
-
-    Signals:
-        chat_selected(str): Emitted with peer_user_id when a chat is selected.
-    """
-
     chat_selected = Signal(str)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setStyleSheet(f"background-color: {TOKENS.BG_PRIMARY};")
 
         self._container = QWidget()
         self._layout = QVBoxLayout(self._container)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(0)
+
+        self._search_bar = SearchBar()
+        self._layout.addWidget(self._search_bar)
+
+        self._list_layout = QVBoxLayout()
+        self._list_layout.setSpacing(0)
+        self._layout.addLayout(self._list_layout)
         self._layout.addStretch()
 
         self.setWidget(self._container)
 
         self._items: dict[str, ChatListItem] = {}
+        self._typing_users: dict[str, QWidget] = {}
 
     def set_sessions(self, sessions: list[ChatSession]) -> None:
-        """Replace all chat list items with the given sessions."""
-        # Clear existing
         for item in self._items.values():
-            self._layout.removeWidget(item)
+            self._list_layout.removeWidget(item)
             item.deleteLater()
         self._items.clear()
 
-        # Add new items
         for session in sessions:
             self.add_session(session)
 
     def add_session(self, session: ChatSession) -> None:
-        """Add or update a chat session in the list."""
         existing = self._items.get(session.peer_user_id)
         if existing:
             existing.update_session(session)
@@ -178,24 +218,59 @@ class ChatListWidget(QScrollArea):
 
         item = ChatListItem(session, self._container)
         item.clicked.connect(self.chat_selected.emit)
-        # Insert before the stretch
-        self._layout.insertWidget(self._layout.count() - 1, item)
+        item.context_requested.connect(self._show_context_menu)
+        self._list_layout.addWidget(item)
         self._items[session.peer_user_id] = item
 
     def remove_session(self, peer_user_id: str) -> None:
-        """Remove a chat session from the list."""
         item = self._items.pop(peer_user_id, None)
         if item:
-            self._layout.removeWidget(item)
+            self._list_layout.removeWidget(item)
             item.deleteLater()
 
     def highlight_session(self, peer_user_id: str) -> None:
-        """Highlight a specific chat session (e.g., when a new message arrives)."""
         item = self._items.get(peer_user_id)
         if item:
-            # Bring to top
-            self._layout.removeWidget(item)
-            self._layout.insertWidget(0, item)
+            self._list_layout.removeWidget(item)
+            self._list_layout.insertWidget(0, item)
+
+    def _show_context_menu(self, peer_user_id: str, pos: QCursor) -> None:
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {TOKENS.GLASS_BG};
+                color: {TOKENS.TEXT_PRIMARY};
+                border: 1px solid {TOKENS.GLASS_BORDER};
+                border-radius: {RADIUS.MD}px;
+                padding: 4px;
+            }}
+            QMenu::item:selected {{
+                background-color: rgba(255, 255, 255, 0.05);
+                border-radius: {RADIUS.SM}px;
+            }}
+        """)
+
+        for label in ("Mark Read", "Mute", "Archive", "Delete"):
+            menu.addAction(label)
+
+        target_pos = self.mapFromGlobal(pos)
+        menu.exec(self.mapToGlobal(target_pos))
 
     def sizeHint(self) -> QSize:
         return QSize(360, 600)
+
+
+def format_timestamp(ts: float) -> str:
+    import time
+    from datetime import datetime
+    now = time.time()
+    diff = now - ts
+    if diff < 60:
+        return "just now"
+    elif diff < 3600:
+        return f"{int(diff / 60)}m ago"
+    elif diff < 86400:
+        return f"{int(diff / 3600)}h ago"
+    else:
+        dt = datetime.fromtimestamp(ts)
+        return dt.strftime("%H:%M")

@@ -1,58 +1,105 @@
-version: "3.8"
-
 services:
-  bootstrap1:
-    build: .
-    container_name: presidium-bootstrap1
-    ports:
-      - "9478:9478/udp"
-      - "9478:9478/tcp"
+  postgres:
+    image: postgres:16-alpine
+    container_name: presidium-postgres
+    restart: unless-stopped
     environment:
-      - PRESIDIUM_NET_LISTEN_PORT=9478
-      - PRESIDIUM_NET_BOOTSTRAP_NODES=bootstrap2:9479,bootstrap3:9480
-      - PRESIDIUM_NET_MDNS_ENABLED=false
-      - PRESIDIUM_LOG_LEVEL=INFO
+      POSTGRES_DB: presidium
+      POSTGRES_USER: presidium
+      POSTGRES_PASSWORD: presidium_dev_password
+    ports:
+      - "5432:5432"
     volumes:
-      - bootstrap1_data:/data/presidium
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U presidium -d presidium"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
     networks:
       - presidium
 
-  bootstrap2:
-    build: .
-    container_name: presidium-bootstrap2
-    ports:
-      - "9479:9479/udp"
-      - "9479:9479/tcp"
+  minio:
+    profiles: ["media"]
+    image: minio/minio:latest
+    container_name: presidium-minio
+    command: server /data --console-address ":9001"
     environment:
-      - PRESIDIUM_NET_LISTEN_PORT=9479
-      - PRESIDIUM_NET_BOOTSTRAP_NODES=bootstrap1:9478,bootstrap3:9480
-      - PRESIDIUM_NET_MDNS_ENABLED=false
-      - PRESIDIUM_LOG_LEVEL=INFO
+      MINIO_ROOT_USER: presidium
+      MINIO_ROOT_PASSWORD: presidium_minio_secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     volumes:
-      - bootstrap2_data:/data/presidium
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - presidium
 
-  bootstrap3:
-    build: .
-    container_name: presidium-bootstrap3
+  tuwunel:
+    image: ghcr.io/matrix-construct/tuwunel:latest
+    container_name: presidium-tuwunel
+    restart: unless-stopped
     ports:
-      - "9480:9480/udp"
-      - "9480:9480/tcp"
-    environment:
-      - PRESIDIUM_NET_LISTEN_PORT=9480
-      - PRESIDIUM_NET_BOOTSTRAP_NODES=bootstrap1:9478,bootstrap2:9479
-      - PRESIDIUM_NET_MDNS_ENABLED=false
-      - PRESIDIUM_LOG_LEVEL=INFO
+      - "8008:8008"
     volumes:
-      - bootstrap3_data:/data/presidium
+      - tuwunel_data:/var/lib/tuwunel
+      - ./docker/tuwunel/tuwunel.toml:/etc/tuwunel/tuwunel.toml:ro
+    command: ["-c", "/etc/tuwunel/tuwunel.toml"]
+    networks:
+      - presidium
+    healthcheck:
+      test: ["CMD", "tuwunel", "--health-check"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  presidium-api:
+    profiles: ["api"]
+    build: .
+    container_name: presidium-api
+    working_dir: /app
+    command: python -m presidium.api
+    environment:
+      PRESIDIUM_MATRIX_HOMESERVER_URL: http://tuwunel:8008
+      PRESIDIUM_DATABASE_URL: postgresql://presidium:presidium_dev_password@postgres:5432/presidium
+      PRESIDIUM_LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      tuwunel:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    networks:
+      - presidium
+
+  presidium-web:
+    profiles: ["web"]
+    image: node:22-alpine
+    container_name: presidium-web
+    working_dir: /app
+    volumes:
+      - ./web:/app
+    command: sh -lc "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    environment:
+      VITE_MATRIX_HOMESERVER_URL: http://localhost:8008
+    ports:
+      - "5173:5173"
+    depends_on:
+      tuwunel:
+        condition: service_healthy
     networks:
       - presidium
 
 volumes:
-  bootstrap1_data:
-  bootstrap2_data:
-  bootstrap3_data:
+  postgres_data:
+  minio_data:
+  tuwunel_data:
 
 networks:
   presidium:

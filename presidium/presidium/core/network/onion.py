@@ -250,11 +250,9 @@ class OnionLayerCrypto:
             + plaintext
         )
 
-        # Encrypt with this hop's key
-        nonce = os.urandom(NONCE_SIZE)
-        ciphertext = AES256GCM.encrypt(inner, key, nonce)
-
-        return nonce + ciphertext
+        # Encrypt with this hop's key (AES256GCM.encrypt returns nonce+ciphertext)
+        ciphertext = AES256GCM.encrypt(key, inner)
+        return ciphertext
 
     @staticmethod
     def peel_layer(
@@ -281,11 +279,9 @@ class OnionLayerCrypto:
         if len(encrypted) < NONCE_SIZE + 16:  # nonce + minimal GCM tag
             raise DecryptionError("Encrypted data too short.")
 
-        nonce = encrypted[:NONCE_SIZE]
-        ciphertext = encrypted[NONCE_SIZE:]
-
         try:
-            inner = AES256GCM.decrypt(ciphertext, key, nonce)
+            # AES256GCM.decrypt expects (key, data_with_nonce[, aad])
+            inner = AES256GCM.decrypt(key, encrypted)
         except CryptoError as exc:
             raise DecryptionError(f"Layer decryption failed: {exc}") from exc
 

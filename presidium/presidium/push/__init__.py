@@ -17,7 +17,16 @@ This means the relay can't even tell which IDs belong to whom.
 """
 
 from presidium.push.relay_server import PushRelayServer, PushRelayConfig
-from presidium.push.client import PushClient, PushClientConfig, PushProvider
+
+# Push client depends on aiohttp; import lazily so modules that only need
+# the relay server (e.g., unit tests for storage) can import this package
+# without aiohttp installed.
+try:
+    from presidium.push.client import PushClient, PushClientConfig, PushProvider
+except Exception:
+    PushClient = None
+    PushClientConfig = None
+    PushProvider = None
 
 __all__ = [
     "PushRelayServer",

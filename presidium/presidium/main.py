@@ -10,6 +10,7 @@ Initializes:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -96,8 +97,6 @@ def main() -> int:
 
         loop = QEventLoop(app)
         asyncio.set_event_loop(loop)
-
-        import asyncio
 
         # Create main window
         from presidium.ui.app import MainWindow

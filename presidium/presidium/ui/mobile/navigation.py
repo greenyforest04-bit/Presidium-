@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QPoint, QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QSize, Qt, Signal, QPropertyAnimation, QEasingCurve, QTimer, QRect
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame,
@@ -223,6 +223,34 @@ class FloatingActionButton(QPushButton):
 
         self._tokens = tokens
         self._apply_style()
+        self._setup_spring_animation()
+
+    def _setup_spring_animation(self) -> None:
+        self.setGraphicsEffect(None)
+        anim = QPropertyAnimation(self, b"geometry")
+        orig = self.geometry()
+        anim.setDuration(400)
+        anim.setStartValue(QRect(orig.x() - 4, orig.y() - 4,
+                                  orig.width() + 8, orig.height() + 8))
+        anim.setEndValue(orig)
+        anim.setEasingCurve(QEasingCurve.Type.OutBack)
+        QTimer.singleShot(200, anim.start)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        orig = self.geometry()
+        anim = QPropertyAnimation(self, b"geometry")
+        anim.setDuration(400)
+        start_scale = 0.7
+        anim.setStartValue(QRect(
+            int(orig.x() + orig.width() * (1 - start_scale) / 2),
+            int(orig.y() + orig.height() * (1 - start_scale) / 2),
+            int(orig.width() * start_scale),
+            int(orig.height() * start_scale),
+        ))
+        anim.setEndValue(orig)
+        anim.setEasingCurve(QEasingCurve.Type.OutBack)
+        anim.start()
 
     def _apply_style(self) -> None:
         tokens = self._tokens

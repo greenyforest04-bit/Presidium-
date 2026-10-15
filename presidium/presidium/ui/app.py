@@ -152,9 +152,7 @@ class MainWindow(QMainWindow):
 
     def _deferred_init(self) -> None:
         """Initialize core services after the UI is shown."""
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(self._async_init())
-        loop.close()
+        asyncio.create_task(self._async_init())
 
     async def _async_init(self) -> None:
         """Asynchronous initialization of all core services."""
@@ -350,23 +348,38 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------
 
     def cleanup(self) -> None:
-        """Clean up resources before exit."""
-        loop = asyncio.new_event_loop()
+        """Clean up resources before exit.
+
+        If an asyncio event loop is already running (e.g. qasync), schedule
+        the async cleanup task on that loop. Otherwise, run the async
+        cleanup to completion on a new loop.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Schedule async cleanup on the running loop and return.
+                asyncio.create_task(self._cleanup_async())
+            else:
+                # No running loop: run cleanup synchronously.
+                loop.run_until_complete(self._cleanup_async())
+        except Exception as exc:
+            logger.error("Cleanup error: %s", exc)
+
+    async def _cleanup_async(self) -> None:
+        """Async cleanup executed within the application's event loop."""
         try:
             if self._transport:
-                loop.run_until_complete(self._transport.stop())
+                await self._transport.stop()
             if self._dht:
-                loop.run_until_complete(self._dht.stop())
+                await self._dht.stop()
             if self._discovery:
-                loop.run_until_complete(self._discovery.stop())
+                await self._discovery.stop()
             if self._db_manager:
-                loop.run_until_complete(self._db_manager.close())
+                await self._db_manager.close()
             if self._identity_manager:
                 self._identity_manager.lock()
         except Exception as exc:
             logger.error("Cleanup error: %s", exc)
-        finally:
-            loop.close()
 
     def closeEvent(self, event) -> None:
         """Handle window close event."""

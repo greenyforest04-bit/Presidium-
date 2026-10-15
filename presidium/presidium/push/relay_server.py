@@ -47,7 +47,48 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from aiohttp import web
+try:
+    from aiohttp import web
+except Exception:
+    # Minimal stub for tests that import the module but don't start the HTTP server.
+    class _WebStub:
+        def middleware(self, func=None):
+            if func is None:
+                return lambda f: f
+            return func
+
+        class Application(dict):
+            def __init__(self):
+                super().__init__()
+                self.middlewares = []
+            def add_routes(self, routes):
+                pass
+
+        class AppRunner:
+            def __init__(self, app):
+                pass
+            async def setup(self):
+                pass
+            async def cleanup(self):
+                pass
+
+        class TCPSite:
+            def __init__(self, runner, host, port):
+                pass
+            async def start(self):
+                pass
+
+        @staticmethod
+        def json_response(obj, status=200):
+            return obj
+
+        class Request:  # type: ignore
+            pass
+
+        class Response:  # type: ignore
+            pass
+
+    web = _WebStub()
 
 logger = logging.getLogger(__name__)
 

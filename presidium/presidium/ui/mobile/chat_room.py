@@ -16,8 +16,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal, Slot
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, Signal, Slot, QPropertyAnimation, QEasingCurve, QTimer
+from PySide6.QtGui import QFont, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from presidium.ui.design_system.tokens import TOKENS, RADIUS, SPACE
 from presidium.ui.mobile.navigation import MobileTokens
 from presidium.ui.mobile.swipe import SwipeContainer, SwipeableItem
 
@@ -132,12 +133,12 @@ class MobileChatBubble(QWidget):
         bubble_layout.addWidget(ts_label)
 
         # Style the bubble
-        bg_color = "#37306B" if self._is_mine else "#2C2B30"
-        text_color = "#E6E0E9"
+        bg_color = TOKENS.BUBBLE_OWN if self._is_mine else TOKENS.BUBBLE_OTHER
+        text_color = TOKENS.TEXT_PRIMARY
         bubble.setStyleSheet(f"""
             QFrame#chatBubble {{
                 background-color: {bg_color};
-                border-radius: 18px;
+                border-radius: {RADIUS.LG}px;
             }}
             QLabel {{
                 color: {text_color};
@@ -145,15 +146,15 @@ class MobileChatBubble(QWidget):
                 border: none;
             }}
             QLabel#replyPreview {{
-                color: #938F99;
-                border-left: 3px solid #6750A4;
+                color: {TOKENS.TEXT_SECONDARY};
+                border-left: 3px solid {TOKENS.ACCENT};
                 padding-left: 6px;
             }}
             QLabel#senderName {{
-                color: {tokens.NAV_ACTIVE};
+                color: {TOKENS.ACCENT};
             }}
             QLabel#timestamp {{
-                color: #938F99;
+                color: {TOKENS.TEXT_MUTED};
             }}
         """)
 
@@ -226,29 +227,29 @@ class MobileInputBar(QWidget):
         tokens = self._tokens
         self.setStyleSheet(f"""
             QWidget {{
-                background-color: #1C1B1F;
-                border-top: 1px solid #2C2B30;
+                background-color: {TOKENS.BG_SECONDARY};
+                border-top: 1px solid {TOKENS.GLASS_BORDER};
             }}
             QLineEdit {{
-                background-color: #2C2B30;
-                color: #E6E0E9;
-                border: 1px solid #49454F;
+                background-color: {TOKENS.BG_TERTIARY};
+                color: {TOKENS.TEXT_PRIMARY};
+                border: 1px solid {TOKENS.GLASS_BORDER};
                 border-radius: 24px;
                 padding: 8px 16px;
                 font-size: 15px;
             }}
             QLineEdit:focus {{
-                border-color: {tokens.NAV_ACTIVE};
+                border-color: {TOKENS.ACCENT};
             }}
             QPushButton {{
-                background-color: #2C2B30;
-                color: #938F99;
+                background-color: {TOKENS.BG_TERTIARY};
+                color: {TOKENS.TEXT_MUTED};
                 border: none;
                 border-radius: 24px;
                 font-size: 18px;
             }}
             QPushButton:hover {{
-                background-color: #49454F;
+                background-color: {TOKENS.BG_ELEVATED};
             }}
         """)
 
@@ -355,19 +356,19 @@ class MobileChatRoom(QWidget):
         menu_btn.setFixedSize(self._tokens.MIN_TOUCH_TARGET, self._tokens.MIN_TOUCH_TARGET)
         header_layout.addWidget(menu_btn)
 
-        header.setStyleSheet("""
-            QWidget {
-                background-color: #1C1B1F;
-                border-bottom: 1px solid #2C2B30;
-            }
-            QLabel { color: #E6E0E9; }
-            QPushButton {
+        header.setStyleSheet(f"""
+            QWidget {{
+                background-color: {TOKENS.BG_SECONDARY};
+                border-bottom: 1px solid {TOKENS.GLASS_BORDER};
+            }}
+            QLabel {{ color: {TOKENS.TEXT_PRIMARY}; }}
+            QPushButton {{
                 background: transparent;
-                color: #938F99;
+                color: {TOKENS.TEXT_MUTED};
                 border: none;
                 font-size: 20px;
-            }
-            QPushButton:hover { color: #E6E0E9; }
+            }}
+            QPushButton:hover {{ color: {TOKENS.TEXT_PRIMARY}; }}
         """)
         layout.addWidget(header)
 
@@ -375,20 +376,20 @@ class MobileChatRoom(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("""
-            QScrollArea {
-                background-color: #141218;
+        scroll.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: {TOKENS.BG_PRIMARY};
                 border: none;
-            }
-            QScrollBar:vertical {
+            }}
+            QScrollBar:vertical {{
                 width: 4px;
                 background: transparent;
-            }
-            QScrollBar::handle:vertical {
-                background: #49454F;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {TOKENS.BG_TERTIARY};
                 border-radius: 2px;
                 min-height: 30px;
-            }
+            }}
         """)
 
         self._messages_widget = QWidget()

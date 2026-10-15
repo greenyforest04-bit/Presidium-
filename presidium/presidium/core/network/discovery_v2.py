@@ -180,21 +180,37 @@ class BlindSignatureProtocol:
             Tuple of (modulus n, public exponent e, private exponent d,
             prime p, prime q).
         """
-        from sympy import nextprime, randprime
+        # Prefer sympy for fast prime generation, but fall back to
+        # cryptography's secure RSA generation if sympy is not available
+        try:
+            from sympy import randprime
 
-        half = bits // 2
-        while True:
-            p = randprime(2 ** (half - 1), 2 ** half)
-            q = randprime(2 ** (half - 1), 2 ** half)
-            if p == q:
-                continue
-            n = p * q
-            phi = (p - 1) * (q - 1)
-            e = 65537
-            from math import gcd
-            if gcd(e, phi) != 1:
-                continue
-            d = pow(e, -1, phi)
+            half = bits // 2
+            while True:
+                p = randprime(2 ** (half - 1), 2 ** half)
+                q = randprime(2 ** (half - 1), 2 ** half)
+                if p == q:
+                    continue
+                n = p * q
+                phi = (p - 1) * (q - 1)
+                e = 65537
+                from math import gcd
+                if gcd(e, phi) != 1:
+                    continue
+                d = pow(e, -1, phi)
+                return (n, e, d, p, q)
+        except Exception:
+            # Use cryptography to generate a proper RSA keypair
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.hazmat.primitives import serialization
+
+            priv = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+            nums = priv.private_numbers()
+            p = nums.p
+            q = nums.q
+            d = nums.d
+            e = nums.public_numbers.e
+            n = nums.public_numbers.n
             return (n, e, d, p, q)
 
     @staticmethod

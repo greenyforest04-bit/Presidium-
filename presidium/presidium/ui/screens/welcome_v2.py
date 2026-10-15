@@ -54,8 +54,10 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QEasingCurve,
     QSize,
+    QTimer,
+    QRect,
 )
-from PySide6.QtGui import QFont, QPixmap, QColor
+from PySide6.QtGui import QFont, QPixmap, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -236,6 +238,63 @@ def generate_recovery_phrase(word_count: int = RECOVERY_WORD_COUNT) -> list[str]
 
 
 # ---------------------------------------------------------------------------
+# Hex rain overlay
+# ---------------------------------------------------------------------------
+
+class _HexRainOverlay(QWidget):
+    """Falling hex characters animation for key generation screen."""
+
+    CHARS = "0123456789ABCDEF"
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._drops: list[dict] = []
+        self._timer = QTimer(self)
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._tick)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._drops = []
+        import random
+        for i in range(60):
+            self._drops.append({
+                "x": random.randint(0, 600),
+                "y": random.randint(-400, 0),
+                "speed": random.uniform(1, 4),
+                "char": random.choice(self.CHARS),
+                "opacity": random.uniform(0.03, 0.1),
+            })
+        self._timer.start()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._timer.stop()
+
+    def _tick(self) -> None:
+        for drop in self._drops:
+            drop["y"] += drop["speed"]
+            if drop["y"] > self.height():
+                import random
+                drop["y"] = random.randint(-20, -5)
+                drop["x"] = random.randint(0, max(1, self.width() - 10))
+                drop["char"] = random.choice(self.CHARS)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = QFont("monospace", 10)
+        painter.setFont(font)
+        for drop in self._drops:
+            color = QColor(99, 102, 241)
+            color.setAlphaF(drop["opacity"])
+            painter.setPen(QPen(color, 1))
+            painter.drawText(int(drop["x"]), int(drop["y"]), drop["char"])
+
+
+# ---------------------------------------------------------------------------
 # Welcome Wizard
 # ---------------------------------------------------------------------------
 
@@ -348,7 +407,7 @@ class WelcomeWizard(QWidget):
         layout.setSpacing(20)
         layout.setContentsMargins(48, 48, 48, 48)
 
-        # Logo
+        # Logo with spring animation
         logo = QLabel("P")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo.setFixedSize(96, 96)
@@ -361,7 +420,18 @@ class WelcomeWizard(QWidget):
             "border-radius: 24px;"
         )
         logo.setAccessibleName(_("Presidium logo"))
+        logo.setGraphicsEffect(None)
         layout.addWidget(logo, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        orig_geo = QRect(logo.pos(), logo.size())
+        logo_anim = QPropertyAnimation(logo, b"geometry")
+        logo_anim.setDuration(600)
+        logo_anim.setStartValue(QRect(orig_geo.x() + 20, orig_geo.y() + 20,
+                                       int(orig_geo.width() * 0.8),
+                                       int(orig_geo.height() * 0.8)))
+        logo_anim.setEndValue(orig_geo)
+        logo_anim.setEasingCurve(QEasingCurve.Type.OutBack)
+        QTimer.singleShot(100, logo_anim.start)
 
         # Title
         title = QLabel(_("Welcome to Presidium"))
@@ -500,6 +570,11 @@ class WelcomeWizard(QWidget):
         self._progress_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._progress_label.setAccessibleName(_("Progress label"))
         layout.addWidget(self._progress_label)
+
+        self._hex_rain = _HexRainOverlay(page)
+        self._hex_rain.setVisible(False)
+        self._hex_rain.setGeometry(0, 0, 640, 400)
+        layout.addWidget(self._hex_rain, alignment=Qt.AlignmentFlag.AlignCenter)
 
         layout.addSpacing(16)
 
@@ -860,6 +935,7 @@ class WelcomeWizard(QWidget):
         self._progress.setVisible(True)
         self._progress_label.setText(_("Generating Ed25519 key pair..."))
         self._generate_btn.setEnabled(False)
+        self._hex_rain.setVisible(True)
 
         nickname = self._nickname_input.text() if hasattr(self, "_nickname_input") else ""
 

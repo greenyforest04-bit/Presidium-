@@ -18,9 +18,11 @@ from __future__ import annotations
 import enum
 from typing import Optional
 
-from PySide6.QtCore import QPoint, QPointF, Qt, Signal
-from PySide6.QtGui import QTouchEvent
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QWidget
+from PySide6.QtCore import QPoint, QPointF, Qt, Signal, QPropertyAnimation, QEasingCurve
+from PySide6.QtGui import QTouchEvent, QColor
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QWidget, QGraphicsOpacityEffect
+
+from presidium.ui.design_system.tokens import TOKENS, RADIUS
 
 
 # ---------------------------------------------------------------------------
@@ -43,14 +45,14 @@ class SwipeDetector:
     """Detects swipe gestures from touch/mouse events.
 
     Tracks touch points and determines if a swipe occurred based on:
-    - Minimum distance threshold (default: 50px)
+    - Minimum distance threshold (default: 80px)
     - Maximum time threshold (default: 300ms)
     - Direction (horizontal or vertical)
     """
 
     def __init__(
         self,
-        min_distance: int = 50,
+        min_distance: int = 80,
         max_duration_ms: int = 300,
         edge_zone_width: int = 20,
     ) -> None:
@@ -261,6 +263,11 @@ class SwipeableItem(QWidget):
         for action_id, label in self._left_actions:
             btn = QPushButton(label)
             btn.setFixedSize(70, 40)
+            btn.setStyleSheet(
+                f"QPushButton {{ background-color: {TOKENS.ACCENT}; color: white; "
+                f"border: none; border-radius: {RADIUS.SM}px; font-size: 12px; }}"
+                f"QPushButton:hover {{ background-color: {TOKENS.ACCENT_HOVER}; }}"
+            )
             btn.clicked.connect(lambda checked, a=action_id: self.action_triggered.emit(a))
             left_layout.addWidget(btn)
 
@@ -272,6 +279,19 @@ class SwipeableItem(QWidget):
         for action_id, label in self._right_actions:
             btn = QPushButton(label)
             btn.setFixedSize(70, 40)
+            if action_id == "delete":
+                btn.setStyleSheet(
+                    f"QPushButton {{ background-color: {TOKENS.ERROR}; color: white; "
+                    f"border: none; border-radius: {RADIUS.SM}px; font-size: 12px; }}"
+                    f"QPushButton:hover {{ background-color: #DC2626; }}"
+                )
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background-color: {TOKENS.BG_TERTIARY}; "
+                    f"color: {TOKENS.TEXT_PRIMARY}; border: none; "
+                    f"border-radius: {RADIUS.SM}px; font-size: 12px; }}"
+                    f"QPushButton:hover {{ background-color: {TOKENS.BG_ELEVATED}; }}"
+                )
             btn.clicked.connect(lambda checked, a=action_id: self.action_triggered.emit(a))
             right_layout.addWidget(btn)
 

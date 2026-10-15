@@ -535,17 +535,24 @@ class ChatManager:
     async def send_typing(self, peer_user_id: str, is_typing: bool) -> None:
         """Send a typing indicator to a peer."""
         from presidium.core.network.protocol import (
-            TypingIndicatorPayload,
+            TypingStartPayload,
+            TypingStopPayload,
         )
-        # PHASE2: TypingIndicator is a new protocol message type
-        # For now we use a simple approach
+
         peer = self._peer_manager.get_peer(peer_user_id)
         if not peer or not peer.addr:
             return
 
-        # SIMPLIFIED: actual typing indicator protocol message
-        # Would need to add TYPING_START/TYPING_STOP to protocol.py
-        pass
+        sender_id = bytes.fromhex(self._local_user_id)
+        if is_typing:
+            payload = TypingStartPayload(sender_user_id=sender_id, session_id=b"")
+            await self._peer_manager._transport.send(MessageType.TYPING_START, payload, peer.addr)
+        else:
+            payload = TypingStopPayload(sender_user_id=sender_id, session_id=b"")
+            await self._peer_manager._transport.send(MessageType.TYPING_STOP, payload, peer.addr)
+
+        if self._on_typing_indicator:
+            await self._on_typing_indicator(peer_user_id, is_typing)
 
     # -------------------------------------------------------------------
     # History loading
@@ -561,8 +568,4 @@ class ChatManager:
             if session and not session.messages:
                 session.messages = messages
                 if messages:
-                    last = messages[-1]
-                    session.last_message_preview = last.content[:80]
-                    session.last_message_timestamp = last.timestamp
-        except Exception as exc:
-            logger.error("Failed to load message history for %s: %s", peer_user_id, exc)
+        /

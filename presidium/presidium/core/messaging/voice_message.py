@@ -152,7 +152,7 @@ class VoiceMessageData:
             flags |= 0x01
 
         header = struct.pack(
-            "!BHBH",
+            "!BHBI",
             self.version,
             self.duration_ms,
             flags,
@@ -176,7 +176,7 @@ class VoiceMessageData:
         if len(data) < 8:
             raise EncodingError(f"Voice message data too short: {len(data)} bytes.")
 
-        version, duration_ms, flags, waveform_len = struct.unpack("!BHBH", data[:8])
+        version, duration_ms, flags, waveform_len = struct.unpack("!BHBI", data[:8])
 
         if version != VOICE_MSG_VERSION:
             raise EncodingError(f"Unsupported voice message version: {version}.")

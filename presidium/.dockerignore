@@ -1,0 +1,23 @@
+# Local environment and caches
+.git
+.gitignore
+.pytest_cache
+.mypy_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Tooling and generated artifacts
+web/
+download/
+tool-results/
+docs/
+README.md
+worklog.md
+pytest_output.txt
+pytest_report.txt
+
+# Keep only the runtime app
+!presidium/

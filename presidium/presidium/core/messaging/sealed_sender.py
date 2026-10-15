@@ -55,6 +55,9 @@ from presidium.core.crypto import (
     secure_zero,
 )
 
+# Local cryptography helpers
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 logger = logging.getLogger(__name__)
 
 
@@ -354,6 +357,7 @@ class HPKEContext:
             # Reconstruct key pair from private key
             from cryptography.hazmat.primitives.asymmetric.x25519 import (
                 X25519PrivateKey,
+                X25519PublicKey,
             )
             priv_key = X25519PrivateKey.from_private_bytes(recipient_private_key)
             pub_key = X25519PublicKey.from_public_bytes(ephemeral_pk)
