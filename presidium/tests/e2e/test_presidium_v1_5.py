@@ -325,18 +325,11 @@ class TestDHT:
         assert xor_distance(node_id, node_id) == 0
 
     def test_bucket_index_for_distance(self) -> None:
-        """Bucket index should reflect the position of the highest set bit.
-
-        Implementation uses bit_length() - 1:
-            0 → 0, 1 → 0, 2 → 1, 3 → 1, 4 → 2, 255 → 7
-        """
+        """Bucket zero is reserved for self; other buckets are one-based."""
         from presidium.core.network.dht import bucket_index_for_distance
-        assert bucket_index_for_distance(0) == 0
-        assert bucket_index_for_distance(1) == 0  # 1.bit_length()-1 = 0
-        assert bucket_index_for_distance(2) == 1  # 2.bit_length()-1 = 1
-        assert bucket_index_for_distance(3) == 1
-        assert bucket_index_for_distance(4) == 2
-        assert bucket_index_for_distance(255) == 7
+        for distance, index in [(0, 0), (1, 1), (2, 2), (3, 2), (4, 3), (255, 8), (1 << 127, 128)]:
+            assert bucket_index_for_distance(distance) == index
+
 
     def test_kbucket_insert(self) -> None:
         """KBucket should insert nodes up to its capacity."""

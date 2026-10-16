@@ -1,33 +1,9 @@
-"""Auto-updater for Presidium.
+"""Release updater with pinned Ed25519 trust and full ZIP packages.
 
-Provides automatic update checking, downloading, and installation
-with support for:
-    - Multiple update channels (stable, beta, nightly)
-    - Delta updates (binary diff patches for smaller downloads)
-    - Rollback on failed updates
-    - Signature verification of update packages
-    - Background checking with configurable intervals
-    - User notifications for available updates
-
-Security model:
-    - Update packages are signed with Ed25519 by the release key
-    - The public release key is embedded in the application
-    - Signature verification occurs before any file operations
-    - Updates are applied atomically (all-or-nothing)
-    - Previous version is kept for rollback
-
-Update flow:
-    1. Background check: compare local version with remote latest
-    2. Download: fetch update manifest + package
-    3. Verify: check Ed25519 signature on package
-    4. Stage: extract to temporary directory
-    5. Apply: move staged files over current installation
-    6. Cleanup: remove old files and temporary data
-
-Delta updates:
-    For minor version bumps, a bsdiff-style binary diff is provided
-    alongside the full package. The updater preferentially downloads
-    the smaller delta patch and applies it to the local binary.
+Configure the trusted public key in the constructor or via
+PRESIDIUM_UPDATE_PUBLIC_KEY (base64). Unsigned or untrusted packages
+are rejected. Installation keeps a backup for rollback; delta packages
+are not supported.
 """
 
 from __future__ import annotations
@@ -48,18 +24,15 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# Public release signing key (embedded in application)
-RELEASE_PUBLIC_KEY = (
-    "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
-)
-
 
 # ---------------------------------------------------------------------------
 # Update channel
 # ---------------------------------------------------------------------------
 
+
 class UpdateChannel(enum.Enum):
     """Update release channel."""
+
     STABLE = "stable"
     BETA = "beta"
     NIGHTLY = "nightly"
@@ -69,9 +42,11 @@ class UpdateChannel(enum.Enum):
 # Update manifest
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class UpdateManifest:
     """Metadata about an available update."""
+
     version: str = ""
     channel: UpdateChannel = UpdateChannel.STABLE
     release_notes: str = ""
@@ -123,6 +98,7 @@ class UpdateManifest:
 # Auto-updater
 # ---------------------------------------------------------------------------
 
+
 class AutoUpdater:
     """Handles automatic update checking and installation.
 
@@ -145,7 +121,15 @@ class AutoUpdater:
         channel: UpdateChannel = UpdateChannel.STABLE,
         update_url: str = "",
         install_dir: Optional[Path] = None,
+        release_public_key: bytes | None = None,
     ) -> None:
+        self._release_public_key = release_public_key
+        if self._release_public_key is None and os.environ.get("PRESIDIUM_UPDATE_PUBLIC_KEY"):
+            import base64
+
+            self._release_public_key = base64.b64decode(
+                os.environ["PRESIDIUM_UPDATE_PUBLIC_KEY"], validate=True
+            )
         self._current_version = current_version
         self._channel = channel
         self._update_url = update_url or self.UPDATE_CHECK_URL
@@ -182,9 +166,7 @@ class AutoUpdater:
     def update_available(self) -> bool:
         if self._latest_manifest is None:
             return False
-        return self._compare_versions(
-            self._latest_manifest.version, self._current_version
-        ) > 0
+        return self._compare_versions(self._latest_manifest.version, self._current_version) > 0
 
     # -------------------------------------------------------------------
     # Callback setters
@@ -213,9 +195,7 @@ class AutoUpdater:
     async def start_background_check(self, interval_hours: int = 24) -> None:
         """Start periodic background update checks."""
         self._running = True
-        self._background_task = asyncio.create_task(
-            self._check_loop(interval_hours * 3600)
-        )
+        self._background_task = asyncio.create_task(self._check_loop(interval_hours * 3600))
 
     async def stop_background_check(self) -> None:
         """Stop background update checking."""
@@ -276,6 +256,7 @@ class AutoUpdater:
         """Fetch the latest update manifest from the update server."""
         try:
             import aiohttp
+
             system = platform.system().lower()
             arch = platform.machine().lower()
 
@@ -348,22 +329,17 @@ class AutoUpdater:
 
     async def _download_package(self, manifest: UpdateManifest) -> Optional[Path]:
         """Download the update package."""
-        # Prefer delta if available and applicable
+        # Only full packages are supported
         url = manifest.full_package_url
         expected_size = manifest.full_package_size
         expected_sha256 = manifest.full_package_sha256
 
-        if (manifest.delta_package_url
-                and manifest.delta_from_version == self._current_version):
-            url = manifest.delta_package_url
-            expected_size = manifest.delta_package_size
-            expected_sha256 = manifest.delta_package_sha256
-            logger.info("Using delta update (%d bytes)", expected_size)
-
+        # Delta application is not implemented; download only complete packages.
         try:
             import aiohttp
+
             tmp_dir = tempfile.mkdtemp(prefix="presidium_update_")
-            package_path = Path(tmp_dir) / f"presidium-{manifest.version}.pkg"
+            package_path = Path(tmp_dir) / "presidium-update.zip"
 
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
@@ -387,7 +363,8 @@ class AutoUpdater:
             if actual_sha256 != expected_sha256:
                 logger.error(
                     "SHA-256 mismatch: expected %s, got %s",
-                    expected_sha256[:16], actual_sha256[:16],
+                    expected_sha256[:16],
+                    actual_sha256[:16],
                 )
                 return None
 
@@ -399,16 +376,49 @@ class AutoUpdater:
             return None
 
     async def _verify_package(self, package_path: Path, manifest: UpdateManifest) -> bool:
-        """Verify the package signature.
+        """Authenticate release metadata and package digest using a pinned Ed25519 key.
 
-        In production, this would use Ed25519 signature verification
-        with the embedded release public key. For now, SHA-256
-        verification is performed.
+        The release signer signs signature_payload(manifest); the key comes from
+        trusted installation configuration, never from the downloaded manifest.
         """
-        # TODO: Implement Ed25519 signature verification
-        # For now, we rely on SHA-256 hash verification (done in download)
-        logger.info("Package verification passed (SHA-256)")
-        return True
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        import base64
+
+        try:
+            if not self._release_public_key or not manifest.full_package_signature:
+                logger.error("Update rejected: release key or signature is missing")
+                return False
+            if self._compute_file_sha256(package_path) != manifest.full_package_sha256:
+                return False
+            if package_path.stat().st_size != manifest.full_package_size:
+                return False
+            if self._compare_versions(manifest.version, self._current_version) <= 0:
+                return False
+            signature = base64.b64decode(manifest.full_package_signature, validate=True)
+            Ed25519PublicKey.from_public_bytes(self._release_public_key).verify(
+                signature, self.signature_payload(manifest)
+            )
+            return True
+        except Exception:
+            logger.error("Update rejected: invalid release signature or metadata")
+            return False
+
+    @staticmethod
+    def signature_payload(manifest: UpdateManifest) -> bytes:
+        """Canonical release-signing format, version 1."""
+        return json.dumps(
+            {
+                "format": "presidium-release-v1",
+                "version": manifest.version,
+                "channel": manifest.channel.value,
+                "platform": manifest.platform,
+                "architecture": manifest.architecture,
+                "sha256": manifest.full_package_sha256,
+                "size": manifest.full_package_size,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
     async def _install_package(self, package_path: Path, manifest: UpdateManifest) -> bool:
         """Install the update package.
@@ -419,6 +429,8 @@ class AutoUpdater:
         3. Swapping the directories
         4. Removing the old backup on success
         """
+        if not await self._verify_package(package_path, manifest):
+            return False
         install_dir = self._install_dir
         if not install_dir or not install_dir.exists():
             logger.error("Install directory not found: %s", install_dir)
@@ -438,7 +450,15 @@ class AutoUpdater:
             # For PyInstaller bundles, we replace the entire directory
             if package_path.suffix == ".zip":
                 import zipfile
+
                 with zipfile.ZipFile(str(package_path), "r") as zf:
+                    for entry in zf.infolist():
+                        target = (staging_dir / entry.filename).resolve()
+                        if (
+                            not target.is_relative_to(staging_dir.resolve())
+                            or (entry.external_attr >> 16) & 0o170000 == 0o120000
+                        ):
+                            raise ValueError("Unsafe path in update archive")
                     zf.extractall(str(staging_dir))
             else:
                 # Assume it's a complete replacement
@@ -477,6 +497,7 @@ class AutoUpdater:
         Returns:
             Positive if v1 > v2, negative if v1 < v2, zero if equal.
         """
+
         def parse(v: str) -> list[int]:
             parts = v.lstrip("v").split(".")
             result = []

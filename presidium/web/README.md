@@ -1,32 +1,32 @@
-# React + TypeScript + Vite
+# Presidium frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Основной интерфейс — исходное приложение Argon на Next App Router: `app/layout.tsx` → `app/page.tsx`. Каталоги `components`, `hooks`, `lib`, `public` и стили восстановлены из проверенной ревизии. Старый Vite-интерфейс сохранён в `src/App.tsx` для истории изменений и не обслуживает основной маршрут.
 
-Currently, two official plugins are available:
+Из корня `Presidium`:
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```powershell
+cd presidium
+docker compose up -d tuwunel
+.\.venv\Scripts\python.exe scripts/run-local.py
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Открыть http://127.0.0.1:5173/. Главная страница показывает «Войти» и «Создать аккаунт». Регистрация: логин, пароль от 12 символов, отображаемое имя. В «Сообщениях» → «Новый разговор» укажите точный логин собеседника. «Аккаунт» открывает редактирование профиля, устройства, смену пароля и настоящий выход с отзывом Matrix-сеанса.
+
+Для двух устройств в одной Wi-Fi сети: `scripts/run-local.py --lan-host <IPv4-ПК>`. HTTPS URL, настройка доверия локальному CA и ограничения восстановления E2EE описаны в [AUTH_IMPLEMENTATION.md](../../AUTH_IMPLEMENTATION.md). Ключи зависят от origin; используйте прежний http://127.0.0.1:5173 для установленной истории. Телефонный браузер требует доверенного HTTPS, localhost телефона не ведёт на ПК.
+
+Для отдельного запуска клиента из этой папки:
+
+```powershell
+npm ci
+npm run dev
+```
+
+Production: `npm run build`, затем `npm start`. Node.js 24+ и npm; Python API и Matrix должны быть запущены. `PRESIDIUM_API_PROXY_URL` задаётся только серверу Next, по умолчанию `http://127.0.0.1:8000`.
+
+`lib/local-matrix.ts` и `lib/matrix-connection.ts` подключают исходные экраны к единственному существующему `src/core/messaging/MatrixTransport.ts`. Сохраняются его сеансы, device ID, Matrix-история и Rust crypto IndexedDB. `argon-matrix-contract.d.ts` содержит только типы исходного UI. Второй транспорт не запускается. Next передаёт тот же Matrix-токен FastAPI через HttpOnly cookie.
+
+Проверки: `npm run typecheck`, `npm test`, `npm run test:argon`, `npm run test:e2e`, `npm run build`. Браузерные тесты требуют доступных API8000 и Matrix8008; регистрируют отдельные тестовые аккаунты. Результаты визуального сравнения и сетевые доказательства сохраняются в `../.cache/frontend-correction-browser`.
+
+Сетевые вложения, голосовые, видеокружки, редактирование сообщений и UI восстановления/верификации ключей пока недоступны. Локальные записи Capsule и действия ленты, помеченные «локально», остаются локальными. Существующие серверные API публикаций, каналов, тарифов, Комиссионки и AI сохранены. Облачному AI нужен серверный провайдер из `.env.example`; настоящая оплата не подключена. Sandbox-заказы обозначаются как имитация.
+
+Полный тест авторизации и шифрованной переписки: `npm run test:e2e` (четыре сценария, в том числе исходная навигация и локальная Capsule). Доказательства авторизации: `../.cache/auth-browser`, предыдущего визуального переноса: `../.cache/frontend-correction-browser`.

@@ -1,0 +1,58 @@
+[
+  {
+    "id": "camera",
+    "author": "Aps1729",
+    "license": "CC0",
+    "url": "http://creativecommons.org/publicdomain/zero/1.0/deed.en",
+    "source": "https://commons.wikimedia.org/wiki/File:Fujifilm-X-100V.jpg",
+    "changes": "Изменён размер, применена ориентация EXIF, сохранено в WebP; содержание фотографии сохранено."
+  },
+  {
+    "id": "headphones",
+    "author": "www.digitalpush.net",
+    "license": "CC BY 4.0",
+    "url": "https://creativecommons.org/licenses/by/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Sony-WH-1000XM3-kabellose-Bluetooth-Noise-Cancelling-Kopfhoerer.jpg",
+    "changes": "Изменён размер, применена ориентация EXIF, сохранено в WebP; содержание фотографии сохранено."
+  },
+  {
+    "id": "headphones-detail",
+    "author": "www.digitalpush.net",
+    "license": "CC BY 4.0",
+    "url": "https://creativecommons.org/licenses/by/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Sony-WH-1000XM3-kabellose-Bluetooth-Noise-Cancelling-Kopfhoerer.3.jpg",
+    "changes": "Изменён размер, применена ориентация EXIF, сохранено в WebP; содержание фотографии сохранено."
+  },
+  {
+    "id": "chair",
+    "author": "Hiart",
+    "license": "CC0",
+    "url": "http://creativecommons.org/publicdomain/zero/1.0/deed.en",
+    "source": "https://commons.wikimedia.org/wiki/File:LCW%20(Lounge%20Chair%20Wood)%20Chair%20by%20Charles%20and%20Ray%20Eames%2C%20Honolulu%20Museum%20of%20Art%204410.1.JPG",
+    "changes": "Изменён размер, применена ориентация EXIF, сохранено в WebP; содержание фотографии сохранено."
+  },
+  {
+    "id": "drill",
+    "author": "Santeri Viinamäki",
+    "license": "CC BY-SA 4.0",
+    "url": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Makita%20LXT%20drill.jpg",
+    "changes": "Изменён размер, применена ориентация EXIF, сохранено в WebP; содержание фотографии сохранено."
+  },
+  {
+    "id": "watch",
+    "author": "— aconcagua (talk)",
+    "license": "CC BY-SA 4.0",
+    "url": "https://creativecommons.org/licenses/by-sa/4.0",
+    "source": "https://commons.wikimedia.org/wiki/File:Apple%20Watch%20Series%204%2040mm%20space%20gray%20Aluminum.jpg",
+    "changes": "Изменён размер, применена ориентация EXIF, сохранено в WebP; содержание фотографии сохранено."
+  },
+  {
+    "id": "bicycle",
+    "author": "Matti Blume",
+    "license": "CC BY-SA 4.0",
+    "url": "https://creativecommons.org/licenses/by-sa/4.0/deed.en",
+    "source": "https://commons.wikimedia.org/wiki/File:Brompton%2C%20Velo%2024%2C%20Berlin%20(VB243556).jpg",
+    "changes": "Изменён размер, применена ориентация EXIF, сохранено в WebP; содержание фотографии сохранено."
+  }
+]

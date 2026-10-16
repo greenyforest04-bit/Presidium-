@@ -10,7 +10,13 @@ __pycache__
 *.pyd
 
 # Tooling and generated artifacts
-web/
+web/node_modules/
+web/dist/
+web/artifacts/
+web/playwright-report/
+web/tests/
+argon/tests/
+.data/
 download/
 tool-results/
 docs/
@@ -21,3 +27,9 @@ pytest_report.txt
 
 # Keep only the runtime app
 !presidium/
+
+.venv/
+.cache/
+*.log
+.env
+.env.*

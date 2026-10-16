@@ -16,6 +16,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
+import uuid
+import aiohttp
 
 
 @dataclass(slots=True)
@@ -26,7 +29,7 @@ class MatrixTransportConfig:
     access_token: str = ""
     username: str = ""
     password: str = ""
-    device_id: str = "presidium-device"
+    device_id: str = ""
     encryption_algorithm: str = "m.megolm.v1.aes-sha2"
     rotation_period_ms: int = 86_400_000
     default_room_preset: str = "trusted_private_chat"
@@ -47,7 +50,7 @@ class MessagingTransport(ABC):
         """Stop the transport."""
 
     @abstractmethod
-    def send_message(self, conversation_id: str, body: str, **kwargs: Any) -> dict[str, Any]:
+    async def send_message(self, conversation_id: str, body: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         """Send a message to a conversation."""
 
     @abstractmethod
@@ -55,7 +58,7 @@ class MessagingTransport(ABC):
         """Edit an existing message."""
 
     @abstractmethod
-    def delete_message(self, event_id: str) -> dict[str, Any]:
+    async def delete_message(self, event_id: str, *, conversation_id: str) -> dict[str, Any]:
         """Delete a message."""
 
     @abstractmethod
@@ -67,11 +70,11 @@ class MessagingTransport(ABC):
         """Send a file attachment."""
 
     @abstractmethod
-    def create_conversation(self, *, participants: list[str], title: str = "") -> dict[str, Any]:
+    async def create_conversation(self, *, participants: list[str], title: str = "") -> dict[str, Any]:
         """Create or resolve a conversation."""
 
     @abstractmethod
-    def create_group(self, *, members: list[str], title: str) -> dict[str, Any]:
+    async def create_group(self, *, members: list[str], title: str) -> dict[str, Any]:
         """Create a group conversation."""
 
     @abstractmethod
@@ -79,19 +82,19 @@ class MessagingTransport(ABC):
         """Subscribe to conversation updates."""
 
     @abstractmethod
-    def mark_read(self, conversation_id: str, event_id: str) -> dict[str, Any]:
+    async def mark_read(self, conversation_id: str, event_id: str) -> dict[str, Any]:
         """Mark a message as read."""
 
     @abstractmethod
-    def set_typing(self, conversation_id: str, is_typing: bool) -> dict[str, Any]:
+    async def set_typing(self, conversation_id: str, is_typing: bool) -> dict[str, Any]:
         """Set or clear typing indicator."""
 
     @abstractmethod
-    def get_history(self, conversation_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    async def get_history(self, conversation_id: str, limit: int = 50) -> list[dict[str, Any]]:
         """Fetch recent conversation history."""
 
     @abstractmethod
-    def sync(self) -> dict[str, Any]:
+    async def sync(self) -> dict[str, Any]:
         """Synchronize transport state."""
 
 
@@ -117,93 +120,159 @@ class MatrixTransport(MessagingTransport):
     def stop(self) -> None:
         self._started = False
 
-    def create_conversation(self, *, participants: list[str], title: str = "") -> dict[str, Any]:
-        local_user_id = participants[0] if participants else "@user:example.com"
-        remote_user_id = participants[1] if len(participants) > 1 else participants[0]
-        return self.build_dm_creation_payload(
-            local_user_id=local_user_id,
-            remote_user_id=remote_user_id,
-            room_name=title or f"{local_user_id} / {remote_user_id}",
+    async def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+        headers = (
+            {"Authorization": f"Bearer {self.config.access_token}"}
+            if self.config.access_token
+            else {}
+        )
+        url = f"{self.config.homeserver_url.rstrip('/')}/_matrix/client/{self.config.api_version}/{path}"
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                async with session.request(method, url, json=payload, headers=headers) as response:
+                    result = await response.json()
+                    if response.status >= 400:
+                        raise MatrixRequestError(
+                            response.status,
+                            result.get("errcode", "M_UNKNOWN")
+                            if isinstance(result, dict)
+                            else "M_UNKNOWN",
+                        )
+                    return result
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise MatrixRequestError(503, "M_UNAVAILABLE") from exc
+
+    async def create_conversation(
+        self, *, participants: list[str], title: str = ""
+    ) -> dict[str, Any]:
+        if len(participants) != 2 or len(set(participants)) != 2:
+            raise ValueError("A direct conversation requires two distinct participants.")
+        payload = self.build_dm_creation_payload(
+            local_user_id=participants[0], remote_user_id=participants[1], room_name=title
+        )
+        return await self.request("POST", "createRoom", payload)
+
+    async def create_group(self, *, members: list[str], title: str) -> dict[str, Any]:
+        return await self.request(
+            "POST",
+            "createRoom",
+            {
+                "name": title,
+                "preset": "private_chat",
+                "invite": members,
+                "initial_state": [
+                    {
+                        "type": "m.room.encryption",
+                        "state_key": "",
+                        "content": {
+                            "algorithm": self.config.encryption_algorithm,
+                            "rotation_period_ms": self.config.rotation_period_ms,
+                            "rotation_period_msgs": 100,
+                        },
+                    }
+                ],
+            },
         )
 
-    def create_group(self, *, members: list[str], title: str) -> dict[str, Any]:
-        return {
-            "name": title,
-            "preset": "trusted_private_chat",
-            "invite": members,
-            "is_direct": False,
-            "initial_state": [
-                {
-                    "type": "m.room.encryption",
-                    "content": {
-                        "algorithm": self.config.encryption_algorithm,
-                        "rotation_period_ms": self.config.rotation_period_ms,
-                        "rotation_period_msgs": 100,
-                    },
-                }
-            ],
-        }
-
     def subscribe_conversation(self, conversation_id: str) -> None:
-        return None
+        raise NotImplementedError("Use sync() or a client SDK to receive room updates.")
 
-    def send_message(self, conversation_id: str, body: str, **kwargs: Any) -> dict[str, Any]:
-        event = self.build_message_event(body, **kwargs)
-        return {
-            "conversation_id": conversation_id,
-            "event": event,
+    async def assert_direct_conversation(
+        self, room_id: str, local_user: str, recipient: str
+    ) -> None:
+        # The endpoint returns an array, rather than the usual Matrix object.
+        state = await self.request("GET", f"rooms/{quote(room_id, safe='')}/state")
+        encryption = next(
+            (e for e in state if e["type"] == "m.room.encryption" and e.get("state_key") == ""), {}
+        )
+        members = {
+            e.get("state_key")
+            for e in state
+            if e["type"] == "m.room.member"
+            and e.get("content", {}).get("membership") in ("join", "invite")
         }
+        if (
+            encryption.get("content", {}).get("algorithm") != self.config.encryption_algorithm
+            or members != {local_user, recipient}
+            or local_user == recipient
+            or any(
+                e["type"] == "m.room.member"
+                and e.get("state_key") not in {local_user, recipient}
+                for e in state
+            )
+        ):
+            raise ValueError("Room must be encrypted and contain only the sender and recipient.")
+
+    async def send_message(
+        self, conversation_id: str, body: dict[str, Any], **kwargs: Any
+    ) -> dict[str, Any]:
+        required = ("ciphertext", "sender_key", "session_id", "device_id")
+        if (
+            not isinstance(body, dict)
+            or body.get("algorithm") != self.config.encryption_algorithm
+            or any(not isinstance(body.get(k), str) or not body[k] for k in required)
+        ):
+            raise ValueError("Messages must be encrypted by the client SDK before submission.")
+        if set(body) != {"algorithm", *required}:
+            raise ValueError("Unexpected fields in encrypted event.")
+        identity = await self.request("GET", "account/whoami")
+        if body["device_id"] != identity.get("device_id"):
+            raise ValueError("Encrypted event device does not match the authenticated session.")
+        state = await self.request(
+            "GET", f"rooms/{quote(conversation_id, safe='')}/state/m.room.encryption/"
+        )
+        if state.get("algorithm") != self.config.encryption_algorithm:
+            raise ValueError("Room encryption is not enabled.")
+        return await self.request(
+            "PUT",
+            f"rooms/{quote(conversation_id, safe='')}/send/m.room.encrypted/{uuid.uuid4().hex}",
+            body,
+        )
 
     def edit_message(self, event_id: str, new_body: str) -> dict[str, Any]:
-        return {
-            "event_id": event_id,
-            "body": new_body,
-            "msgtype": "m.text",
-            "m.new_content": {"msgtype": "m.text", "body": new_body},
-            "m.relates_to": {"rel_type": "m.replace", "event_id": event_id},
-        }
+        raise NotImplementedError(
+            "Encrypt edits on the client and submit them with send_message()."
+        )
 
-    def delete_message(self, event_id: str) -> dict[str, Any]:
-        return {"event_id": event_id, "type": "m.room.redaction"}
+    async def delete_message(self, event_id: str, *, conversation_id: str) -> dict[str, Any]:
+        return await self.request(
+            "PUT",
+            f"rooms/{quote(conversation_id, safe='')}/redact/{quote(event_id, safe='')}/{uuid.uuid4().hex}",
+            {},
+        )
 
     def send_reaction(self, event_id: str, emoji: str) -> dict[str, Any]:
-        return {
-            "m.relates_to": {
-                "rel_type": "m.annotation",
-                "event_id": event_id,
-                "key": emoji,
-            },
-            "msgtype": "m.reaction",
-        }
+        raise NotImplementedError(
+            "Encrypt reactions on the client and submit them with send_message()."
+        )
 
     def send_file(self, conversation_id: str, file_path: str, **kwargs: Any) -> dict[str, Any]:
-        return {
-            "conversation_id": conversation_id,
-            "file_path": file_path,
-            "msgtype": "m.file",
-            "body": file_path.split("/")[-1],
-            "org.matrix.msc1767.text": file_path.split("/")[-1],
-        }
+        raise NotImplementedError("Encrypt and upload attachments with the client SDK.")
 
-    def mark_read(self, conversation_id: str, event_id: str) -> dict[str, Any]:
-        return {"conversation_id": conversation_id, "event_id": event_id, "read": True}
+    async def mark_read(self, conversation_id: str, event_id: str) -> dict[str, Any]:
+        return await self.request(
+            "POST",
+            f"rooms/{quote(conversation_id, safe='')}/read_markers",
+            {"m.fully_read": event_id, "m.read": event_id},
+        )
 
-    def set_typing(self, conversation_id: str, is_typing: bool) -> dict[str, Any]:
-        return {"conversation_id": conversation_id, "typing": is_typing}
+    async def set_typing(self, conversation_id: str, is_typing: bool) -> dict[str, Any]:
+        identity = await self.request("GET", "account/whoami")
+        return await self.request(
+            "PUT",
+            f"rooms/{quote(conversation_id, safe='')}/typing/{quote(identity['user_id'], safe='')}",
+            {"typing": is_typing, "timeout": 1000},
+        )
 
-    def get_history(self, conversation_id: str, limit: int = 50) -> list[dict[str, Any]]:
-        return [
-            {
-                "conversation_id": conversation_id,
-                "event_id": "event_001",
-                "body": "history placeholder",
-                "type": "m.room.message",
-                "limit": limit,
-            }
-        ]
+    async def get_history(self, conversation_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        result = await self.request(
+            "GET",
+            f"rooms/{quote(conversation_id, safe='')}/messages?dir=b&limit={max(1, min(limit, 100))}",
+        )
+        return result.get("chunk", [])
 
-    def sync(self) -> dict[str, Any]:
-        return {"sync": "ok", "started": self._started}
+    async def sync(self) -> dict[str, Any]:
+        return await self.request("GET", "sync?timeout=0")
 
     def build_dm_creation_payload(
         self,
@@ -233,16 +302,11 @@ class MatrixTransport(MessagingTransport):
                         "rotation_period_msgs": 100,
                     },
                 },
-                {
-                    "type": "m.room.member",
-                    "content": {"membership": "join", "displayname": local_user_id},
-                    "state_key": local_user_id,
-                },
             ],
         }
 
     def build_message_event(self, body: str, **kwargs: Any) -> dict[str, Any]:
-        """Build a Matrix message event payload for text messages."""
+        """Build plaintext content for a client SDK to encrypt; this is not a wire event."""
         event = {
             "msgtype": "m.text",
             "body": body,
@@ -270,9 +334,18 @@ class MatrixTransport(MessagingTransport):
 
     def build_login_payload(self, *, username: str, password: str) -> dict[str, Any]:
         """Build Matrix login payload for real authentication."""
-        return {
+        payload = {
             "type": "m.login.password",
             "identifier": {"type": "m.id.user", "user": username},
             "password": password,
-            "device_id": self.config.device_id,
         }
+        if self.config.device_id:
+            payload["device_id"] = self.config.device_id
+        return payload
+
+
+class MatrixRequestError(Exception):
+    def __init__(self, status: int, code: str) -> None:
+        super().__init__(code)
+        self.status = status
+        self.code = code

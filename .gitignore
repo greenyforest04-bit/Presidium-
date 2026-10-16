@@ -1,2 +1,7 @@
 skills/
 node_modules/
+presidium-argon-68/
+.env
+.env.*
+!.env.example
+presidium/web/artifacts/

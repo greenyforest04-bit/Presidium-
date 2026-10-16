@@ -60,3 +60,14 @@ models/
 
 # Docker volumes
 /data/
+
+.cache/
+.data/
+!.env.example
+web/playwright-report/
+presidium/features/argon-runtime.mjs
+
+# Next frontend build and type artifacts
+web/.next/
+web/next-env.d.ts
+web/*.tsbuildinfo

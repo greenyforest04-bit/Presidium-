@@ -1,0 +1,1 @@
+ALTER TABLE `market_listings` ADD `right_to_sell` text DEFAULT 'unverified' NOT NULL;

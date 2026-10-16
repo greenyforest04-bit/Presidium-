@@ -1,0 +1,4 @@
+'use client';
+import {useEffect,useRef} from 'react';
+import type {MatrixTransport,NetworkMessage} from '@/lib/matrix-transport';
+export function MediaCacheWarmup({engine,roomId,message}:{engine:MatrixTransport;roomId:string;message:NetworkMessage}){const root=useRef<HTMLSpanElement>(null),policy=engine.efficiency(),phase=engine.snapshot().phase;useEffect(()=>{const node=root.current;if(!node||!engine.canAutoload(message)||typeof IntersectionObserver==='undefined')return;const controller=new AbortController(),observer=new IntersectionObserver(entries=>{if(entries.some(e=>e.isIntersecting)){observer.disconnect();void engine.preloadMedia(roomId,message,controller.signal).catch(()=>{})}});observer.observe(node);return()=>{observer.disconnect();controller.abort()}},[engine,roomId,message.id,message.editRevision,policy.autoPhotos,policy.autoVideos,policy.wifiOnly,phase]);return <span ref={root} aria-hidden="true" style={{display:'block',width:1,height:1}}/>}

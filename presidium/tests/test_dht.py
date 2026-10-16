@@ -188,9 +188,10 @@ class TestRoutingTable:
         assert any(n.user_id == node.user_id and n.is_stale for n in all_nodes)
 
     def test_many_nodes_across_buckets(self) -> None:
-        local_id = random_node_id()
+        local_id = bytes(16)
         rt = RoutingTable(local_id)
-        # Add 50 nodes — they should distribute across buckets
-        for _ in range(50):
-            rt.add_node(make_node())
+        # Deliberately cover distinct buckets; random IDs concentrate in the
+        # farthest buckets and correctly hit their capacity of k=20.
+        for bit in range(50):
+            rt.add_node(make_node(uid=(1 << bit).to_bytes(16, "big")))
         assert rt.total_nodes == 50

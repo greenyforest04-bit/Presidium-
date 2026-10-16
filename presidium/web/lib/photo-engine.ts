@@ -1,0 +1,6 @@
+import type {MediaMode} from './efficiency-config';
+import type {OptimizedPhoto} from './photo-codec';
+export async function optimizePhoto(file:File,mode:MediaMode,signal:AbortSignal):Promise<OptimizedPhoto>{
+ if(signal.aborted)throw new DOMException('Операция отменена','AbortError');if(!['image/jpeg','image/png','image/webp'].includes(file.type))return {file,changed:false};
+ try{if(typeof Worker==='undefined'||typeof OffscreenCanvas==='undefined')return await (await import('./photo-codec')).encodePhoto(file,mode);return await new Promise((resolve,reject)=>{const worker=new Worker(new URL('./photo-worker.ts',import.meta.url),{type:'module'});const done=()=>{clearTimeout(timer);worker.terminate();signal.removeEventListener('abort',abort)},abort=()=>{done();reject(new DOMException('Операция отменена','AbortError'))},timer=setTimeout(()=>{done();resolve({file,changed:false})},15000);signal.addEventListener('abort',abort,{once:true});worker.onmessage=e=>{done();resolve(e.data.error?{file,changed:false}:e.data.result)};worker.onerror=()=>{done();resolve({file,changed:false})};worker.postMessage({file,mode})})}catch(e){if(signal.aborted)throw new DOMException('Операция отменена','AbortError');return {file,changed:false}}
+}

@@ -80,11 +80,11 @@ def bucket_index_for_distance(distance: int) -> int:
     Index 0 = distance 0 (same node, never stored).
     Index 1 = distance in [1, 1] (only bit 0 differs).
     Index i = distance in [2^(i-1), 2^i - 1].
-    Index 127 = most distant bucket.
+    Index 128 = most distant bucket.
     """
     if distance == 0:
         return 0
-    return distance.bit_length() - 1
+    return distance.bit_length()
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +226,7 @@ class KBucket:
 class RoutingTable:
     """Kademlia routing table with 128 k-buckets (ID_BITS = 128).
 
-    Bucket i covers the XOR distance range [2^i, 2^(i+1) - 1].
+    Bucket i covers the XOR distance range [2^(i-1), 2^i - 1].
     Bucket 0 is for the local node (distance 0, never used).
     In practice, most buckets will be empty — only buckets
     corresponding to actual network distances will be populated.
@@ -236,14 +236,14 @@ class RoutingTable:
         self._local_id = local_id
         self._k = k
         self._verify_fn = verify_fn  # PoW verification callback passed to KBuckets
-        # 128 buckets (0..127), bucket 0 is unused
-        self._buckets: list[KBucket] = [KBucket(k, verify_fn=verify_fn) for _ in range(ID_BITS)]
+        # 129 entries (0..128), bucket 0 is unused
+        self._buckets: list[KBucket] = [KBucket(k, verify_fn=verify_fn) for _ in range(ID_BITS + 1)]
 
     def _bucket_for(self, node_id: bytes) -> KBucket:
         """Get the appropriate bucket for a node ID."""
         dist = xor_distance(self._local_id, node_id)
         idx = bucket_index_for_distance(dist)
-        return self._buckets[min(idx, ID_BITS - 1)]
+        return self._buckets[min(idx, ID_BITS)]
 
     def add_node(self, node: DHTNode) -> Optional[DHTNode]:
         """Add or update a node in the routing table.

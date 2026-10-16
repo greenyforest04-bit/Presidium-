@@ -789,6 +789,8 @@ def xmpp_stanza_to_bridged(
     # Check for body text
     body_el = stanza.find(f"{{{XMPP_NS_CLIENT}}}body")
     if body_el is None:
+        body_el = stanza.find("body")
+    if body_el is None:
         # Could be a chat state notification (composing/paused)
         return None
 

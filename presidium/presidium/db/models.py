@@ -7,7 +7,7 @@ Schema version is tracked in a metadata table for future migrations.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # ---------------------------------------------------------------------------
 # SQL: Schema creation
@@ -179,10 +179,6 @@ ALL_CREATE_STATEMENTS = [
     CREATE_MESSAGES,
     CREATE_INDEX_MESSAGES_SESSION,
     CREATE_INDEX_MESSAGES_TIMESTAMP,
-    CREATE_MESSAGES_FTS,
-    CREATE_MESSAGES_FTS_INSERT_TRIGGER,
-    CREATE_MESSAGES_FTS_DELETE_TRIGGER,
-    CREATE_MESSAGES_FTS_UPDATE_TRIGGER,
     CREATE_FILE_TRANSFERS,
     CREATE_DHT_ROUTING,
     CREATE_SETTINGS,

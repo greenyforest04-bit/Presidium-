@@ -16,7 +16,7 @@ import time
 from typing import Optional, Callable
 
 from PySide6.QtCore import Qt, QTimer, QObject, Signal
-from PySide6.QtGui import QIcon, QPixmap, QImage, QAction
+from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QFont
 from PySide6.QtWidgets import (
     QSystemTrayIcon,
     QMenu,

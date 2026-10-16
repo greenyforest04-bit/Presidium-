@@ -568,4 +568,9 @@ class ChatManager:
             if session and not session.messages:
                 session.messages = messages
                 if messages:
-        /
+                    session.last_message_preview = messages[-1].content[:80]
+                    session.last_message_timestamp = messages[-1].timestamp
+                if self._on_session_updated:
+                    await self._on_session_updated(session)
+        except Exception as exc:
+            logger.error("Failed to load chat history: %s", exc)
