@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal, QTimer, QPropertyAnimation, QEasingCurve, QSize
-from PySide6.QtGui import QFont, QPixmap, QCursor
+from PySide6.QtGui import QFont, QPixmap, QCursor, QPainter, QColor
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,

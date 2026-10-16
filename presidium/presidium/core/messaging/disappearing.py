@@ -2,7 +2,7 @@
 
 Provides:
 - TTL-based message deletion (5 min, 1 hour, 1 day, 1 week)
-- Background scheduler for secure deletion
+- Background scheduler for logical deletion
 - UI countdown badge on bubbles
 """
 
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from enum import IntEnum
 from dataclasses import dataclass
@@ -58,8 +57,8 @@ class DisappearingMessage:
 class DisappearingMessageScheduler:
     """Background scheduler that deletes expired messages.
 
-    Performs secure wipe before deletion: overwrites message content
-    with random data before deleting from the database.
+    Storage deletion is delegated to the callback. Physical erasure of
+    database pages or backups cannot be guaranteed by this scheduler.
 
     Usage:
         scheduler = DisappearingMessageScheduler(delete_callback)
@@ -74,11 +73,16 @@ class DisappearingMessageScheduler:
     def __init__(
         self,
         delete_callback: Callable[[str, str], Awaitable[None]],
-        secure_wipe: bool = True,
+        secure_wipe: bool = False,
+        wipe_callback: Optional[Callable[[str, str], Awaitable[None]]] = None,
     ) -> None:
+        if secure_wipe and wipe_callback is None:
+            raise ValueError("secure_wipe requires a storage-specific wipe_callback")
         self._delete_callback = delete_callback
         self._secure_wipe = secure_wipe
+        self._wipe_callback = wipe_callback
         self._scheduled: dict[str, DisappearingMessage] = {}
+        self._changed = asyncio.Event()
         self._running = False
         self._bg_task: Optional[asyncio.Task] = None
 
@@ -88,6 +92,8 @@ class DisappearingMessageScheduler:
 
     async def start(self) -> None:
         """Start the scheduler background loop."""
+        if self._running:
+            return
         self._running = True
         self._bg_task = asyncio.create_task(self._scheduler_loop())
         logger.info("Disappearing message scheduler started.")
@@ -124,11 +130,13 @@ class DisappearingMessageScheduler:
             ttl=ttl,
         )
         self._scheduled[message_id] = msg
+        self._changed.set()
         logger.debug("Scheduled message %s for deletion in %d seconds", message_id[:8], ttl)
 
     def cancel(self, message_id: str) -> None:
         """Cancel a scheduled deletion."""
         self._scheduled.pop(message_id, None)
+        self._changed.set()
 
     def get_remaining(self, message_id: str) -> float:
         """Get remaining seconds for a scheduled message."""
@@ -142,7 +150,7 @@ class DisappearingMessageScheduler:
     async def _scheduler_loop(self) -> None:
         """Periodically check and delete expired messages."""
         while self._running:
-            now = time.time()
+            self._changed.clear()
             expired = [
                 msg for msg in self._scheduled.values()
                 if msg.is_expired
@@ -158,19 +166,17 @@ class DisappearingMessageScheduler:
                 except Exception as exc:
                     logger.error("Failed to delete disappearing message %s: %s", msg.message_id[:8], exc)
 
-            await asyncio.sleep(5.0)  # Check every 5 seconds
+            delay = min((msg.remaining_seconds for msg in self._scheduled.values()), default=60.0)
+            try:
+                await asyncio.wait_for(self._changed.wait(), timeout=max(0.05, delay))
+            except asyncio.TimeoutError:
+                pass
 
     async def _secure_delete(self, msg: DisappearingMessage) -> None:
-        """Secure wipe: overwrite content with random data before deletion.
-
-        PHASE3: simplified — in a full implementation, this would:
-        1. Overwrite the message content in the database with random data
-        2. Force a flush/sync
-        3. Then delete the row
-        """
-        # The actual overwrite happens in the delete_callback implementation
-        # which should be aware of secure wipe mode
-        pass
+        """Run the explicitly configured storage wipe before logical deletion."""
+        if self._wipe_callback is None:
+            raise RuntimeError("Storage wipe callback is not configured")
+        await self._wipe_callback(msg.message_id, msg.peer_user_id)
 
     # -------------------------------------------------------------------
     # Stats

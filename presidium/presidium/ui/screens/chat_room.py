@@ -309,6 +309,10 @@ class MessageInput(QWidget):
             self._input.clear()
             self._reply_panel.clear_reply()
 
+    def clear(self) -> None:
+        self._input.clear()
+        self.clear_reply()
+
     def set_enabled(self, enabled: bool) -> None:
         self._input.setEnabled(enabled)
 
@@ -415,6 +419,20 @@ class ChatRoomScreen(QWidget):
         layout.addWidget(self._input)
 
         self._input.set_enabled(False)
+
+    @property
+    def current_peer(self) -> str | None:
+        return self._session.peer_user_id if self._session else None
+
+    def clear_session(self) -> None:
+        self._session = None
+        self._message_area.clear_bubbles()
+        self._bubble_map.clear()
+        self._message_by_id.clear()
+        self._input.clear()
+        self._input.set_enabled(False)
+        self._peer_name.clear()
+        self._avatar_label.clear()
 
     def set_session(self, session: ChatSession) -> None:
         """Set the active chat session and load messages."""

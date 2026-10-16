@@ -356,7 +356,7 @@ class HybridKeyExchange:
             combined = HKDF(X25519_shared ⊕ ML-KEM_shared, "presidium-pq-hybrid-v1")
         """
         # Classical component
-        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
         priv_key = X25519PrivateKey.from_private_bytes(local_x25519_sk)
         pub_key = X25519PublicKey.from_public_bytes(ciphertext.x25519_ephemeral_pk)
         classical_secret = priv_key.exchange(pub_key)
@@ -415,8 +415,9 @@ class LMSSigner:
     on hash functions. It is stateful — each signature consumes a
     one-time key, and the counter must never decrease.
 
-    This is a simplified implementation. Production use requires
-    a full RFC-compliant LMS implementation (e.g., hash-sigs library).
+    Signing and verification are disabled until a vetted RFC 8554 backend
+    with persistent one-time-key state is integrated. The reservation-counter
+    utility is retained, but is not a cryptographic implementation.
 
     The LMS signer is used for the master identity key, which signs
     infrequently (device registration, key rotation announcements).
@@ -555,102 +556,14 @@ class LMSSigner:
         return self._counter >= self._max_signatures
 
     def generate(self, key_id: str = "default") -> tuple[bytes, bytes]:
-        """Generate an LMS key pair.
-
-        Args:
-            key_id: Unique identifier for state persistence.
-                Used as primary key in the SQLite state database.
-
-        Returns:
-            Tuple of (public_key, private_key).
-
-        Raises:
-            LMSError: If generation fails.
-        """
-        self._key_id = key_id
-
-        try:
-            # Try hash-sigs library
-            from hss import Hss
-            keypair = Hss.generate(height=10)
-            self._public_key = keypair.public_key
-            self._private_key = keypair.private_key
-            return self._public_key, self._private_key
-        except ImportError:
-            pass
-
-        # Fallback: generate placeholder keys with SHA-256
-        # In production, this MUST use a proper LMS implementation
-        seed = os.urandom(32)
-        I = os.urandom(16)
-        self._private_key = seed + I
-        self._public_key = (
-            struct.pack("!I", LMS_TYPE)
-            + struct.pack("!I", LM_OTS_TYPE)
-            + I
-            + hashlib.sha256(seed + I).digest()
-            + struct.pack("!I", LMS_TYPE)
-        )
-        logger.warning(
-            "Using placeholder LMS implementation. "
-            "Install hash-sigs for production: pip install hash-sigs"
-        )
-        return self._public_key, self._private_key
+        """Refuse key generation until a vetted, persistent LMS backend is integrated."""
+        raise LMSError("LMS signing is unavailable: no audited RFC 8554 backend is integrated.")
 
     def sign(self, message: bytes) -> tuple[bytes, int]:
-        """Sign a message using the next LMS one-time key.
-
-        The counter is atomically incremented using SQLite BEGIN IMMEDIATE
-        to prevent counter reuse in concurrent scenarios.
-
-        Args:
-            message: Data to sign.
-
-        Returns:
-            Tuple of (signature, counter_used).
-
-        Raises:
-            LMSStateExhaustedError: If no signatures remain.
-            LMSError: If key pair not generated or state error occurs.
-        """
-        if self._private_key is None:
-            raise LMSError("LMS key pair not generated.")
-
-        key_id = getattr(self, "_key_id", "default")
-        q = self._atomic_increment_counter(key_id)
-
-        # Placeholder: compute a deterministic "signature" using SHA-256
-        # Real implementation uses LM-OTS one-time signature
-        seed = self._private_key[:32]
-        I = self._private_key[32:48]
-
-        sig_data = (
-            struct.pack("!I", q)
-            + hashlib.sha256(seed + I + struct.pack("!I", q) + message).digest()
-        )
-
-        logger.debug("LMS signature #%d/%d", q, self._max_signatures)
-        return sig_data, q
+        """Never substitute hashes for a real LMS signature."""
+        raise LMSError("LMS signing is unavailable: no audited RFC 8554 backend is integrated.")
 
     @staticmethod
     def verify(public_key: bytes, message: bytes, signature: bytes, q: int) -> bool:
-        """Verify an LMS signature.
-
-        Args:
-            public_key: LMS public key.
-            message: Original message.
-            signature: LMS signature.
-            q: Signature counter value.
-
-        Returns:
-            True if the signature is valid.
-        """
-        # Placeholder verification
-        # Real implementation verifies the Merkle tree path
-        try:
-            from hss import Hss
-            return Hss.verify(public_key, message, signature)
-        except ImportError:
-            # Fallback: basic check using constant-time comparison
-            # for the signature data to avoid timing leaks
-            return len(signature) >= 32
+        """Fail closed. Signature length is not proof of authenticity."""
+        return False

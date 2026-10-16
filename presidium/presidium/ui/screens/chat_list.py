@@ -35,6 +35,7 @@ class ChatListScreen(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._sessions: list[ChatSession] = []
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -113,17 +114,25 @@ class ChatListScreen(QWidget):
 
     def set_sessions(self, sessions: list[ChatSession]) -> None:
         """Update the displayed chat sessions."""
+        self._sessions = list(sessions)
+        self._on_search(self._search_input.text())
+
+    def _show_sessions(self, sessions: list[ChatSession]) -> None:
         self._chat_list.set_sessions(sessions)
         self._empty_state.setVisible(len(sessions) == 0)
         self._chat_list.setVisible(len(sessions) > 0)
 
     def add_session(self, session: ChatSession) -> None:
         """Add or update a chat session."""
-        self._chat_list.add_session(session)
-        self._empty_state.setVisible(False)
-        self._chat_list.setVisible(True)
+        self.set_sessions(
+            [s for s in self._sessions if s.peer_user_id != session.peer_user_id] + [session]
+        )
 
     def _on_search(self, text: str) -> None:
         """Filter the chat list by search text."""
-        # SIMPLIFIED: in production, filter the list model
-        pass
+        query = text.casefold().strip()
+        self._show_sessions([
+            session for session in self._sessions
+            if not query or query in session.peer_user_id.casefold()
+            or query in session.peer_nickname.casefold()
+        ])

@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from presidium.core.crypto import AES256GCM, CryptoError, derive_key_from_password
+from presidium.core.crypto import AES256GCM, CryptoError, derive_key_from_password, generate_salt
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +49,11 @@ BACKUP_VERSION = 1
 # Backup data collector
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class BackupData:
     """Structured representation of all data to be backed up."""
+
     identity: dict[str, Any] = None  # type: ignore[assignment]
     contacts: list[dict[str, Any]] = None  # type: ignore[assignment]
     messages: list[dict[str, Any]] = None  # type: ignore[assignment]
@@ -85,16 +87,18 @@ class BackupData:
 # Backup file format
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class BackupFile:
     """Represents an encrypted backup file on disk."""
+
     version: int = BACKUP_VERSION
     created_at: str = ""
     presidium_version: str = "0.4.0"
-    salt: str = ""        # Base64-encoded Argon2id salt
-    nonce: str = ""       # Base64-encoded AES-GCM nonce
-    data: str = ""        # Base64-encoded ciphertext
-    checksum: str = ""    # SHA-256 hex of plaintext
+    salt: str = ""  # Base64-encoded Argon2id salt
+    nonce: str = ""  # Base64-encoded AES-GCM nonce
+    data: str = ""  # Base64-encoded ciphertext
+    checksum: str = ""  # SHA-256 hex of plaintext
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +127,7 @@ class BackupFile:
 # ---------------------------------------------------------------------------
 # Backup manager
 # ---------------------------------------------------------------------------
+
 
 class BackupManager:
     """Creates encrypted backups of all Presidium user data.
@@ -166,8 +171,14 @@ class BackupManager:
         try:
             # Collect data from providers
             backup_data = BackupData()
-            for attr_name in ["identity", "contacts", "messages",
-                              "ratchet_states", "settings", "plugin_data"]:
+            for attr_name in [
+                "identity",
+                "contacts",
+                "messages",
+                "ratchet_states",
+                "settings",
+                "plugin_data",
+            ]:
                 provider = data_providers.get(attr_name)
                 if provider and callable(provider):
                     result = provider()
@@ -181,22 +192,24 @@ class BackupManager:
 
             # Compute checksum
             import hashlib
+
             checksum = hashlib.sha256(plaintext_bytes).hexdigest()
 
             # Derive encryption key from password
-            salt, key = derive_key_from_password(
-                password,
-                salt=None,  # Generate new salt
-                time_cost=3,
-                memory_cost=65536,
-                parallelism=4,
-            )
-
-            # Encrypt with AES-256-GCM
-            nonce, ciphertext = AES256GCM.encrypt(plaintext_bytes, key)
+            salt = generate_salt()
+            key = derive_key_from_password(password, salt)
+            try:
+                encrypted = AES256GCM.encrypt(key, plaintext_bytes)
+                nonce, ciphertext = (
+                    encrypted[: AES256GCM.NONCE_SIZE],
+                    encrypted[AES256GCM.NONCE_SIZE :],
+                )
+            finally:
+                key.zero()
 
             # Build backup file
             import base64
+
             backup = BackupFile(
                 created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 salt=base64.b64encode(salt).decode("ascii"),
@@ -212,7 +225,9 @@ class BackupManager:
 
             logger.info(
                 "Backup created: %s (%d bytes, checksum: %s...)",
-                output_path, len(ciphertext), checksum[:16],
+                output_path,
+                len(ciphertext),
+                checksum[:16],
             )
             return output_path
 
@@ -225,6 +240,7 @@ class BackupManager:
 # ---------------------------------------------------------------------------
 # Restore manager
 # ---------------------------------------------------------------------------
+
 
 class RestoreManager:
     """Restores user data from an encrypted backup file.
@@ -271,22 +287,19 @@ class RestoreManager:
 
             # Derive decryption key
             import base64
-            salt = base64.b64decode(backup.salt)
-            _, key = derive_key_from_password(
-                password,
-                salt=salt,
-                time_cost=3,
-                memory_cost=65536,
-                parallelism=4,
-            )
 
-            # Decrypt
-            nonce = base64.b64decode(backup.nonce)
-            ciphertext = base64.b64decode(backup.data)
-            plaintext_bytes = AES256GCM.decrypt(ciphertext, key, nonce)
+            salt = base64.b64decode(backup.salt)
+            key = derive_key_from_password(password, salt)
+            try:
+                nonce = base64.b64decode(backup.nonce, validate=True)
+                ciphertext = base64.b64decode(backup.data, validate=True)
+                plaintext_bytes = AES256GCM.decrypt(key, nonce + ciphertext)
+            finally:
+                key.zero()
 
             # Verify checksum
             import hashlib
+
             actual_checksum = hashlib.sha256(plaintext_bytes).hexdigest()
             if actual_checksum != backup.checksum:
                 raise BackupChecksumError(
@@ -308,9 +321,7 @@ class RestoreManager:
             return backup_data
 
         except CryptoError:
-            raise BackupError(
-                "Decryption failed. Wrong password?"
-            )
+            raise BackupError("Decryption failed. Wrong password?")
         except BackupChecksumError:
             raise
         except json.JSONDecodeError as exc:
@@ -336,14 +347,15 @@ class RestoreManager:
 
             # Try to derive key and decrypt just to verify
             import base64, hashlib
+
             salt = base64.b64decode(backup.salt)
-            _, key = derive_key_from_password(
-                password, salt=salt,
-                time_cost=3, memory_cost=65536, parallelism=4,
-            )
-            nonce = base64.b64decode(backup.nonce)
-            ciphertext = base64.b64decode(backup.data)
-            plaintext_bytes = AES256GCM.decrypt(ciphertext, key, nonce)
+            key = derive_key_from_password(password, salt)
+            try:
+                nonce = base64.b64decode(backup.nonce, validate=True)
+                ciphertext = base64.b64decode(backup.data, validate=True)
+                plaintext_bytes = AES256GCM.decrypt(key, nonce + ciphertext)
+            finally:
+                key.zero()
 
             actual_checksum = hashlib.sha256(plaintext_bytes).hexdigest()
             valid = actual_checksum == backup.checksum
@@ -365,6 +377,7 @@ class RestoreManager:
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
+
 
 class BackupError(Exception):
     """Base exception for backup operations."""

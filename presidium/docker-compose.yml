@@ -1,14 +1,15 @@
 services:
   postgres:
+    profiles: ["storage"]
     image: postgres:16-alpine
     container_name: presidium-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: presidium
       POSTGRES_USER: presidium
-      POSTGRES_PASSWORD: presidium_dev_password
+      POSTGRES_PASSWORD: ${PRESIDIUM_POSTGRES_PASSWORD:-}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -26,10 +27,10 @@ services:
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: presidium
-      MINIO_ROOT_PASSWORD: presidium_minio_secret
+      MINIO_ROOT_PASSWORD: ${PRESIDIUM_MINIO_PASSWORD:-}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio_data:/data
     healthcheck:
@@ -41,11 +42,11 @@ services:
       - presidium
 
   tuwunel:
-    image: ghcr.io/matrix-construct/tuwunel:latest
+    image: ghcr.io/matrix-construct/tuwunel@sha256:678b7f5350e06a41614444497c587da9dddf66767e4068a27480402f3c1367d0
     container_name: presidium-tuwunel
     restart: unless-stopped
     ports:
-      - "8008:8008"
+      - "127.0.0.1:8008:8008"
     volumes:
       - tuwunel_data:/var/lib/tuwunel
       - ./docker/tuwunel/tuwunel.toml:/etc/tuwunel/tuwunel.toml:ro
@@ -53,7 +54,7 @@ services:
     networks:
       - presidium
     healthcheck:
-      test: ["CMD", "tuwunel", "--health-check"]
+      test: ["CMD", "tuwunel", "-c", "/etc/tuwunel/tuwunel.toml", "--health-check"]
       interval: 15s
       timeout: 5s
       retries: 20
@@ -63,40 +64,61 @@ services:
     build: .
     container_name: presidium-api
     working_dir: /app
-    command: python -m presidium.api
+    command: ["python", "-m", "presidium.api"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
     environment:
       PRESIDIUM_MATRIX_HOMESERVER_URL: http://tuwunel:8008
-      PRESIDIUM_DATABASE_URL: postgresql://presidium:presidium_dev_password@postgres:5432/presidium
       PRESIDIUM_LOG_LEVEL: INFO
+      PRESIDIUM_PRODUCT_DATA_DIR: /data/presidium/product
+      PRESIDIUM_MATRIX_PUBLIC_URL: http://localhost:8008
+      COMMISSIONKA_SANDBOX_ORDERS: ${COMMISSIONKA_SANDBOX_ORDERS:-0}
+      COMMISSIONKA_VAT_MODE: ${COMMISSIONKA_VAT_MODE:-none}
+      COMMISSIONKA_DELIVERY_KOPECKS: ${COMMISSIONKA_DELIVERY_KOPECKS:-0}
+      COMMISSIONKA_PAYMENT_OPERATOR_KOPECKS: ${COMMISSIONKA_PAYMENT_OPERATOR_KOPECKS:-0}
+      PRESIDIUM_MODERATOR_IDS: ${PRESIDIUM_MODERATOR_IDS:-}
+      PRESIDIUM_BILLING_WEBHOOK_SECRET: ${PRESIDIUM_BILLING_WEBHOOK_SECRET:-}
+      CAPSULE_AGENT_URL: ${CAPSULE_AGENT_URL:-}
+      CAPSULE_AGENT_TOKEN: ${CAPSULE_AGENT_TOKEN:-}
+    volumes:
+      - product_data:/data/presidium/product
     depends_on:
-      postgres:
-        condition: service_healthy
       tuwunel:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     networks:
       - presidium
 
   presidium-web:
     profiles: ["web"]
-    image: node:22-alpine
+    image: node:24-alpine
     container_name: presidium-web
     working_dir: /app
     volumes:
       - ./web:/app
-    command: sh -lc "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+      - ./argon:/argon:ro
+      - web_node_modules:/app/node_modules
+    command: sh -lc "npm ci && node node_modules/next/dist/bin/next dev --hostname 0.0.0.0 --port 5173 --webpack"
     environment:
-      VITE_MATRIX_HOMESERVER_URL: http://localhost:8008
+      PRESIDIUM_MATRIX_PROXY_URL: http://tuwunel:8008
+      PRESIDIUM_API_PROXY_URL: http://presidium-api:8000
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
     depends_on:
+      presidium-api:
+        condition: service_healthy
       tuwunel:
         condition: service_healthy
     networks:
       - presidium
 
 volumes:
+  product_data:
+  web_node_modules:
   postgres_data:
   minio_data:
   tuwunel_data:

@@ -383,18 +383,11 @@ class TestPostQuantum:
         assert decoded.x25519_pk == pk.x25519_pk
         assert decoded.ml_kem_pk == pk.ml_kem_pk
 
-    def test_lms_signer_counter(self):
-        """LMS signer should track signature counter."""
-        from presidium.core.crypto.pq_crypto import LMSSigner
-
-        signer = LMSSigner(state_counter=0)
-        signer.generate()
-
-        for i in range(3):
-            _, q = signer.sign(f"msg_{i}".encode())
-            assert q == i
-
-        assert signer.remaining_signatures == 1021
+    def test_lms_is_explicitly_unavailable(self):
+        from presidium.core.crypto.pq_crypto import LMSSigner, LMSError
+        with pytest.raises(LMSError, match="unavailable"):
+            LMSSigner().generate()
+        assert not LMSSigner.verify(b"key", b"message", b"x" * 64, 0)
 
 
 # ---------------------------------------------------------------------------

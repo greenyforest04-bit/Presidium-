@@ -21,10 +21,10 @@ from __future__ import annotations
 import enum
 import struct
 import time
-from dataclasses import field
 from typing import Any, Optional
 
 import msgspec
+from msgspec import field
 
 
 # ---------------------------------------------------------------------------

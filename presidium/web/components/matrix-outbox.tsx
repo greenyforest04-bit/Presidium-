@@ -1,0 +1,9 @@
+'use client';
+import {useState} from 'react';
+import {Clock3,RefreshCw,Trash2,Lock} from 'lucide-react';
+import type {MatrixTransport,TransportState} from '@/lib/matrix-transport';
+export function MatrixOutboxPanel({engine,state,roomId,busy,run}:{engine:MatrixTransport;state:TransportState;roomId?:string;busy:boolean;run:(action:()=>Promise<void>)=>Promise<void>}){
+ const [confirm,setConfirm]=useState('');const items=(state.outbox||[]).filter(item=>!roomId||item.roomId===roomId);
+ if(!items.length)return null;
+ return <section className="matrix-outbox" aria-label="Очередь зашифрованных сообщений"><header><Clock3 size={18}/><h3>Ожидают отправки <span>{items.length}</span></h3></header><p>Сохранены на этом устройстве в зашифрованном виде. Повторите отправку после восстановления связи.</p>{items.map(item=><article key={item.id}><Lock size={18}/><div><b>{state.rooms.find(room=>room.id===item.roomId)?.name||'Matrix-комната'}</b><small>{new Date(item.createdAt).toLocaleString('ru-RU')}</small><small>Зашифрованное сообщение</small></div><button className="glass-action" disabled={busy||state.phase!=='online'} aria-label="Повторить отправку сохранённого сообщения" onClick={()=>run(async()=>{await engine.retryQueued(item.txnId)})}><RefreshCw size={18}/></button><button className="glass-action" disabled={busy} aria-label="Удалить сообщение из очереди" onClick={()=>setConfirm(item.txnId)}><Trash2 size={18}/></button></article>)}{confirm&&<div className="people-confirm"><h3>Убрать из очереди?</h3><p>Локальная копия будет удалена. Если сервер уже принял сообщение до обрыва связи, оно останется в чате.</p><button className="secondary-btn" disabled={busy} onClick={()=>setConfirm('')}>Оставить</button><button className="pw-danger" disabled={busy} onClick={()=>run(async()=>{await engine.discardQueued(confirm);setConfirm('')})}>Убрать из очереди</button></div>}</section>;
+}

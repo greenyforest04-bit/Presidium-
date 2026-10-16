@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import abc
 import enum
+from enum import auto
 import time
 import uuid
 from dataclasses import dataclass, field

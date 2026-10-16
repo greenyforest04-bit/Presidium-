@@ -11,10 +11,12 @@ Provides async access to the SQLite database via aiosqlite:
 from __future__ import annotations
 
 import logging
+import base64
 from pathlib import Path
 from typing import Optional
 
 import aiosqlite
+from presidium.core.crypto import AES256GCM, SecureBytes
 
 from presidium.core.messaging.chat import ChatMessage, MessageStatus
 from presidium.db.models import ALL_CREATE_STATEMENTS, SCHEMA_VERSION
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Custom exceptions
 # ---------------------------------------------------------------------------
+
 
 class DatabaseError(Exception):
     """Base database error."""
@@ -41,6 +44,7 @@ class RecordNotFoundError(DatabaseError):
 # ---------------------------------------------------------------------------
 # Contact data class
 # ---------------------------------------------------------------------------
+
 
 class ContactRecord:
     """Represents a contact record from the database."""
@@ -66,6 +70,7 @@ class ContactRecord:
 # Database Manager
 # ---------------------------------------------------------------------------
 
+
 class DatabaseManager:
     """Async SQLite database manager.
 
@@ -79,6 +84,7 @@ class DatabaseManager:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
         self._db: Optional[aiosqlite.Connection] = None
+        self._history_key: SecureBytes | None = None
 
     # -------------------------------------------------------------------
     # Lifecycle
@@ -88,6 +94,8 @@ class DatabaseManager:
         """Open the database connection and create tables if needed."""
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
+        async with self._db.execute("PRAGMA secure_delete = ON") as cursor:
+            await cursor.fetchall()
 
         # Create all tables
         for stmt in ALL_CREATE_STATEMENTS:
@@ -103,10 +111,106 @@ class DatabaseManager:
 
     async def close(self) -> None:
         """Close the database connection."""
+        self.lock_history()
         if self._db:
             await self._db.close()
             self._db = None
             logger.info("Database connection closed.")
+
+    def lock_history(self) -> None:
+        if self._history_key is not None:
+            self._history_key.zero()
+            self._history_key = None
+
+    async def unlock_history(self, key: bytes | SecureBytes) -> None:
+        """Unlock history and migrate legacy plaintext without retaining a search index."""
+        db = self._require_db()
+        candidate = SecureBytes(bytes(key))
+        try:
+            async with db.execute(
+                "SELECT value FROM metadata WHERE key = 'history_key_check'"
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is not None:
+                if (
+                    AES256GCM.decrypt(
+                        candidate, base64.b64decode(row[0]), b"presidium-history-check-v1"
+                    )
+                    != b"history"
+                ):
+                    raise DatabaseError("Incorrect history key")
+            else:
+                await db.execute("BEGIN IMMEDIATE")
+                try:
+                    for trigger in (
+                        "messages_fts_insert",
+                        "messages_fts_delete",
+                        "messages_fts_update",
+                    ):
+                        await db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                    await db.execute("DROP TABLE IF EXISTS messages_fts")
+                    async with db.execute(
+                        "SELECT message_id, sender_user_id, recipient_user_id, content FROM messages"
+                    ) as cursor:
+                        rows = await cursor.fetchall()
+                    for message in rows:
+                        aad = self._message_aad(message[0], message[1], message[2])
+                        encrypted = base64.b64encode(
+                            AES256GCM.encrypt(candidate, message[3].encode(), aad)
+                        ).decode()
+                        await db.execute(
+                            "UPDATE messages SET content = ? WHERE message_id = ?",
+                            ("enc:v1:" + encrypted, message[0]),
+                        )
+                    check = base64.b64encode(
+                        AES256GCM.encrypt(candidate, b"history", b"presidium-history-check-v1")
+                    ).decode()
+                    await db.execute(
+                        "INSERT INTO metadata(key, value) VALUES ('history_key_check', ?)", (check,)
+                    )
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    raise
+                async with db.execute("PRAGMA wal_checkpoint(TRUNCATE)") as cursor:
+                    await cursor.fetchall()
+                await db.execute("VACUUM")
+            self.lock_history()
+            self._history_key = candidate
+        except Exception:
+            candidate.zero()
+            raise
+
+    @staticmethod
+    def _message_aad(message_id: str, sender: str, recipient: str) -> bytes:
+        import json
+
+        return json.dumps(
+            ["presidium-message-v1", message_id, sender, recipient], separators=(",", ":")
+        ).encode()
+
+    def _encrypt_content(self, message: ChatMessage) -> str:
+        if self._history_key is None:
+            raise DatabaseError("History is locked")
+        aad = self._message_aad(
+            message.message_id_hex, message.sender_user_id, message.recipient_user_id
+        )
+        return (
+            "enc:v1:"
+            + base64.b64encode(
+                AES256GCM.encrypt(self._history_key, message.content.encode(), aad)
+            ).decode()
+        )
+
+    def _decrypt_content(self, row) -> str:
+        if self._history_key is None:
+            raise DatabaseError("History is locked")
+        if not row["content"].startswith("enc:v1:"):
+            raise DatabaseError("Unencrypted history record requires migration")
+        aad = self._message_aad(row["message_id"], row["sender_user_id"], row["recipient_user_id"])
+        return AES256GCM.decrypt(
+            self._history_key, base64.b64decode(row["content"][7:], validate=True), aad
+        ).decode()
 
     def _require_db(self) -> aiosqlite.Connection:
         """Get the database connection or raise if not initialized."""
@@ -126,6 +230,7 @@ class DatabaseManager:
     ) -> None:
         """Add or update a contact."""
         import time
+
         db = self._require_db()
         await db.execute(
             """INSERT OR REPLACE INTO contacts
@@ -139,9 +244,7 @@ class DatabaseManager:
     async def get_contact(self, user_id: str) -> Optional[ContactRecord]:
         """Get a contact by user ID."""
         db = self._require_db()
-        cursor = await db.execute(
-            "SELECT * FROM contacts WHERE user_id = ?", (user_id,)
-        )
+        cursor = await db.execute("SELECT * FROM contacts WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
         if row is None:
             return None
@@ -212,7 +315,7 @@ class DatabaseManager:
                 message.message_id_hex,
                 message.sender_user_id,
                 message.recipient_user_id,
-                message.content,
+                self._encrypt_content(message),
                 message.timestamp,
                 int(message.status),
                 message.reply_to.hex() if message.reply_to else "",
@@ -252,7 +355,7 @@ class DatabaseManager:
                 message_id=bytes.fromhex(row["message_id"]),
                 sender_user_id=row["sender_user_id"],
                 recipient_user_id=row["recipient_user_id"],
-                content=row["content"],
+                content=self._decrypt_content(row),
                 timestamp=row["timestamp"],
                 status=MessageStatus(row["status"]),
                 reply_to=reply_to,
@@ -295,7 +398,7 @@ class DatabaseManager:
             message_id=bytes.fromhex(row["message_id"]),
             sender_user_id=row["sender_user_id"],
             recipient_user_id=row["recipient_user_id"],
-            content=row["content"],
+            content=self._decrypt_content(row),
             timestamp=row["timestamp"],
             status=MessageStatus(row["status"]),
             reply_to=reply_to,
@@ -329,14 +432,23 @@ class DatabaseManager:
     ) -> None:
         """Save a file transfer record."""
         import time
+
         db = self._require_db()
         await db.execute(
             """INSERT OR REPLACE INTO file_transfers
                (session_id, peer_user_id, file_name, file_size, file_sha256,
                 direction, status, local_path, created_at, completed_at)
                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0)""",
-            (session_id, peer_user_id, file_name, file_size, file_sha256,
-             direction, local_path, time.time()),
+            (
+                session_id,
+                peer_user_id,
+                file_name,
+                file_size,
+                file_sha256,
+                direction,
+                local_path,
+                time.time(),
+            ),
         )
         await db.commit()
 
@@ -362,6 +474,7 @@ class DatabaseManager:
     ) -> None:
         """Save or update a DHT routing table entry."""
         import time
+
         db = self._require_db()
         await db.execute(
             """INSERT OR REPLACE INTO dht_routing

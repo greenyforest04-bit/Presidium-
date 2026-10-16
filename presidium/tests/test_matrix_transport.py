@@ -25,7 +25,7 @@ def test_matrix_transport_builds_encrypted_dm_room_payload() -> None:
     assert payload["name"] == "Alice and Bob"
 
 
-def test_matrix_transport_builds_encrypted_message_payload() -> None:
+def test_matrix_transport_builds_plaintext_content_for_client_encryption() -> None:
     transport = MatrixTransport(
         MatrixTransportConfig(
             homeserver_url="https://matrix.example.com",

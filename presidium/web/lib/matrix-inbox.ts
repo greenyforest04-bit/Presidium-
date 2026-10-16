@@ -1,0 +1,2 @@
+import type {NetworkRoom} from './matrix-transport';
+export function filterMatrixRooms(rooms:NetworkRoom[],search:string,tab:string){const query=search.trim().toLocaleLowerCase('ru');return rooms.filter(room=>(!query||(room.name+' '+room.preview).toLocaleLowerCase('ru').includes(query))&&(tab!=='unread'||room.unread>0||room.membership==='invite')&&tab!=='channels'&&(tab!=='personal'||room.kind==='chat')&&(tab!=='groups'||room.kind==='group'))}

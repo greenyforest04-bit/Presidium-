@@ -90,41 +90,23 @@ def main() -> int:
     font.setPointSize(15)
     app.setFont(font)
 
-    # Try qasync for asyncio integration
+    # Async networking and cleanup require the Qt/asyncio integration.
     try:
-        import qasync
         from qasync import QEventLoop
-
-        loop = QEventLoop(app)
-        asyncio.set_event_loop(loop)
-
-        # Create main window
-        from presidium.ui.app import MainWindow
-        window = MainWindow(config)
-        window.show()
-
-        with loop:
-            loop.run_until_complete(_async_main(window, config))
     except ImportError:
-        # Fallback: run without qasync (limited async support)
-        logger.warning("qasync not available. Running with limited async support.")
+        logger.error("qasync is required. Install the locked project dependencies.")
+        return 1
 
-        from presidium.ui.app import MainWindow
-        window = MainWindow(config)
-        window.show()
+    from presidium.ui.app import MainWindow
 
-        ret = app.exec()
-        window.cleanup()
-        return ret
-
+    loop = QEventLoop(app)
+    asyncio.set_event_loop(loop)
+    window = MainWindow(config)
+    window.show()
+    with loop:
+        app.aboutToQuit.connect(loop.stop)
+        loop.run_forever()
     return 0
-
-
-async def _async_main(window, config: AppConfig) -> None:
-    """Async main coroutine (used when qasync is available)."""
-    # The main window is already shown; just keep the event loop alive.
-    # Cleanup is handled by the window's closeEvent.
-    await asyncio.Future()  # Never completes, keeps the loop running
 
 
 if __name__ == "__main__":

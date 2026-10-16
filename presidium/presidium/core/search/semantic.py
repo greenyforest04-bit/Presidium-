@@ -369,18 +369,16 @@ class VectorStore:
         if self._index is None:
             self.initialize()
 
-        import numpy as np
-        vector = np.array([embedding], dtype=np.float32)
-
-        # Normalize for cosine similarity via inner product
-        magnitude = np.linalg.norm(vector)
-        if magnitude > 0:
-            vector = vector / magnitude
-
+        if len(embedding) != self._dimension:
+            raise ValueError("Embedding dimension does not match the index.")
+        import math
+        magnitude = math.sqrt(sum(value * value for value in embedding))
+        normalized = [value / magnitude for value in embedding] if magnitude else list(embedding)
         if self._use_faiss:
-            self._index.add(vector)
+            import numpy as np
+            self._index.add(np.array([normalized], dtype=np.float32))
         else:
-            self._index.append(vector[0])  # type: ignore
+            self._index.append(normalized)
 
         self._metadata.append(message)
 
@@ -393,26 +391,10 @@ class VectorStore:
             messages: List of indexed messages.
             embeddings: List of embedding vectors.
         """
-        if not messages or not embeddings:
-            return
-
-        if self._index is None:
-            self.initialize()
-
-        import numpy as np
-        vectors = np.array(embeddings, dtype=np.float32)
-
-        # Normalize
-        magnitudes = np.linalg.norm(vectors, axis=1, keepdims=True)
-        magnitudes = np.maximum(magnitudes, 1e-8)
-        vectors = vectors / magnitudes
-
-        if self._use_faiss:
-            self._index.add(vectors)
-        else:
-            self._index.extend(vectors.tolist())  # type: ignore
-
-        self._metadata.extend(messages)
+        if len(messages) != len(embeddings):
+            raise ValueError("Each message must have an embedding.")
+        for message, embedding in zip(messages, embeddings):
+            self.add(message, embedding)
 
     def search(
         self, query_embedding: list[float], top_k: int = 20
@@ -429,27 +411,17 @@ class VectorStore:
         if self._index is None or self.size == 0:
             return []
 
-        import numpy as np
-        query = np.array([query_embedding], dtype=np.float32)
-
-        # Normalize query
-        magnitude = np.linalg.norm(query)
-        if magnitude > 0:
-            query = query / magnitude
-
+        if len(query_embedding) != self._dimension:
+            raise ValueError("Query dimension does not match the index.")
+        import math
+        magnitude = math.sqrt(sum(value * value for value in query_embedding))
+        query = [value / magnitude for value in query_embedding] if magnitude else list(query_embedding)
         if self._use_faiss:
-            scores, indices = self._index.search(query, min(top_k, self.size))
-            results = []
-            for i, score in zip(indices[0], scores[0]):
-                if i >= 0:
-                    results.append((int(i), float(score)))
-            return results
-
-        # Fallback: brute-force numpy search
-        all_vectors = np.array(self._index, dtype=np.float32)  # type: ignore
-        similarities = np.dot(all_vectors, query[0])
-        top_indices = np.argsort(similarities)[::-1][:top_k]
-        return [(int(i), float(similarities[i])) for i in top_indices]
+            import numpy as np
+            scores, indices = self._index.search(np.array([query], dtype=np.float32), min(top_k, self.size))
+            return [(int(i), float(score)) for i, score in zip(indices[0], scores[0]) if i >= 0]
+        scores = [(i, sum(a * b for a, b in zip(vector, query))) for i, vector in enumerate(self._index)]
+        return sorted(scores, key=lambda item: item[1], reverse=True)[:max(0, top_k)]
 
     def save(self) -> None:
         """Persist the index and metadata to disk."""

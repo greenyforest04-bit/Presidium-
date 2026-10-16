@@ -102,12 +102,14 @@ class TestConstantTimeComparison:
         """Verify ratchet module imports constant_time_compare from crypto."""
         # The ratchet module should use the same function
         from presidium.core.messaging.ratchet import constant_time_compare as rctc
+
         # Both should be the same underlying function
         assert rctc is constant_time_compare
 
     def test_sealed_sender_uses_constant_time_compare(self) -> None:
         """Verify sealed_sender module imports constant_time_compare."""
         from presidium.core.messaging.sealed_sender import constant_time_compare as ssctc
+
         assert ssctc is constant_time_compare
 
 
@@ -143,8 +145,12 @@ class TestTimingAttackResistance:
         # (Cannot check __wrapped__ since it's a simple wrapper)
         # Just verify it returns the same result as hmac.compare_digest
         test_data = b"test data for comparison"
-        assert constant_time_compare(test_data, test_data) == hmac.compare_digest(test_data, test_data)
-        assert constant_time_compare(test_data, b"different data") == hmac.compare_digest(test_data, b"different data")
+        assert constant_time_compare(test_data, test_data) == hmac.compare_digest(
+            test_data, test_data
+        )
+        assert constant_time_compare(test_data, b"different data") == hmac.compare_digest(
+            test_data, b"different data"
+        )
 
         # The real test: verify no short-circuit behavior
         # Compare: diff at first byte vs diff at last byte
@@ -281,6 +287,7 @@ class TestSecureZeroing:
     def test_secure_bytes_mlock_on_linux(self) -> None:
         """On Linux, SecureBytes should attempt mlock."""
         import sys
+
         if sys.platform != "linux":
             pytest.skip("mlock only available on Linux")
 
@@ -338,10 +345,7 @@ class TestRandomSource:
 
         source = inspect.getsource(crypto_module)
         # Find all os.urandom calls
-        urandom_lines = [
-            line.strip() for line in source.split("\n")
-            if "os.urandom" in line
-        ]
+        urandom_lines = [line.strip() for line in source.split("\n") if "os.urandom" in line]
         # All os.urandom calls should be in crypto contexts:
         # - generate_salt (cryptographic random)
         # - AES256GCM.encrypt nonce (cryptographic random)
@@ -364,19 +368,16 @@ class TestArgon2idParameters:
     def test_default_params_meet_requirements(self) -> None:
         """Default Argon2id parameters should meet minimum requirements."""
         from presidium.core.crypto import _get_argon2_params
+
         time_cost, memory_cost, parallelism = _get_argon2_params()
         # Memory >= 64 MB (65536 KiB)
-        assert memory_cost >= 65536, (
-            f"Argon2id memory cost {memory_cost} KiB is below 64 MB minimum"
-        )
+        assert (
+            memory_cost >= 65536
+        ), f"Argon2id memory cost {memory_cost} KiB is below 64 MB minimum"
         # Iterations >= 3
-        assert time_cost >= 3, (
-            f"Argon2id time cost {time_cost} is below 3 minimum"
-        )
+        assert time_cost >= 3, f"Argon2id time cost {time_cost} is below 3 minimum"
         # Parallelism >= 1
-        assert parallelism >= 1, (
-            f"Argon2id parallelism {parallelism} is below 1 minimum"
-        )
+        assert parallelism >= 1, f"Argon2id parallelism {parallelism} is below 1 minimum"
 
     def test_env_var_overrides(self) -> None:
         """PRESIDIUM_ARGON_* env vars should override defaults."""
@@ -464,6 +465,7 @@ class TestHeaderEncryption:
             CHAIN_KEY_INFO,
             MESSAGE_KEY_INFO,
         )
+
         # All info strings should be unique
         info_strings = {HEADER_KEY_INFO, NEXT_HEADER_KEY_INFO, CHAIN_KEY_INFO, MESSAGE_KEY_INFO}
         assert len(info_strings) == 4, "HKDF info strings must be unique"
@@ -503,7 +505,8 @@ class TestHeaderEncryption:
 
         bob_ratchet = DoubleRatchet()
         bob_ratchet.init_as_responder(
-            shared_secret, alice.public_key,
+            shared_secret,
+            alice.public_key,
             local_prekey_private=bob.private_key_bytes,
         )
 
@@ -560,7 +563,8 @@ class TestSkippedKeyWindow:
 
         bob_ratchet = DoubleRatchet()
         bob_ratchet.init_as_responder(
-            shared_secret, alice.public_key,
+            shared_secret,
+            alice.public_key,
             local_prekey_private=bob.private_key_bytes,
         )
 
@@ -584,7 +588,8 @@ class TestSkippedKeyWindow:
 
         bob_ratchet = DoubleRatchet()
         bob_ratchet.init_as_responder(
-            shared_secret, alice.public_key,
+            shared_secret,
+            alice.public_key,
             local_prekey_private=bob.private_key_bytes,
         )
 
@@ -688,125 +693,49 @@ class TestPQHybridXOR:
 
 
 class TestLMSAtomicCounter:
-    """Audit 8: LMS counter increment uses SQLite BEGIN IMMEDIATE."""
+    """Counter storage is tested separately from unavailable LMS cryptography."""
 
-    def test_lms_signer_with_db(self) -> None:
-        """LMS signer should work with SQLite-backed counter."""
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-            db_path = f.name
-
-        try:
-            signer = LMSSigner(db_path=db_path)
-            pub, priv = signer.generate(key_id="test_key")
-            assert signer.counter == 0
-
-            # Sign a message
-            sig, q = signer.sign(b"test message")
-            assert q == 0
-            assert signer.counter == 1
-
-            # Sign again
-            sig2, q2 = signer.sign(b"another message")
-            assert q2 == 1
-            assert signer.counter == 2
-        finally:
-            os.unlink(db_path)
-
-    def test_lms_signer_without_db(self) -> None:
-        """LMS signer should work without SQLite (in-memory counter)."""
+    def test_counter_in_memory(self):
         signer = LMSSigner()
-        signer.generate()
-        sig, q = signer.sign(b"test")
-        assert q == 0
-        assert signer.counter == 1
+        assert [signer._atomic_increment_counter("key") for _ in range(3)] == [0, 1, 2]
+        assert signer.remaining_signatures == 1021
 
-    def test_lms_exhaustion_with_db(self) -> None:
-        """LMS signer should raise error when counter is exhausted (with DB)."""
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-            db_path = f.name
+    def test_counter_survives_reopening(self, tmp_path):
+        path = str(tmp_path / "state.db")
+        assert LMSSigner(db_path=path)._atomic_increment_counter("key") == 0
+        assert LMSSigner(db_path=path)._atomic_increment_counter("key") == 1
 
-        try:
-            signer = LMSSigner(
-                state_counter=LMSSigner._max_signatures - 1 if hasattr(LMSSigner, '_max_signatures') else 1023,
-                db_path=db_path,
-            )
-            signer.generate(key_id="exhaust_key")
-
-            # First sign should work (counter at 1023 -> 1024)
-            sig, q = signer.sign(b"last signature")
-
-            # Second sign should fail
-            with pytest.raises(LMSStateExhaustedError):
-                signer.sign(b"one too many")
-        finally:
-            os.unlink(db_path)
-
-    def test_lms_exhaustion_without_db(self) -> None:
-        """LMS signer should raise error when counter is exhausted (no DB)."""
+    @pytest.mark.parametrize("persistent", [False, True])
+    def test_exhausted_counter_is_not_reused(self, tmp_path, persistent):
         signer = LMSSigner(
-            state_counter=1023,  # LMS_MAX_SIGNATURES - 1
+            state_counter=1023, db_path=str(tmp_path / "state.db") if persistent else None
         )
-        signer.generate()
-
-        # First sign should work
-        sig, q = signer.sign(b"last signature")
-
-        # Second sign should fail
+        assert signer._atomic_increment_counter("key") == 1023
         with pytest.raises(LMSStateExhaustedError):
-            signer.sign(b"one too many")
+            signer._atomic_increment_counter("key")
 
-    def test_lms_db_uses_begin_immediate(self) -> None:
-        """Verify LMS DB operations use BEGIN IMMEDIATE for atomicity."""
-        import sqlite3
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-            db_path = f.name
+    def test_concurrent_reservations_are_unique(self, tmp_path):
+        from concurrent.futures import ThreadPoolExecutor
 
-        try:
-            signer = LMSSigner(db_path=db_path)
-            signer.generate(key_id="atomic_test")
+        path = str(tmp_path / "state.db")
+        # Initialize schema before starting concurrent writers.
+        LMSSigner(db_path=path)._init_db()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            values = list(
+                pool.map(
+                    lambda _: LMSSigner(db_path=path)._atomic_increment_counter("key"), range(16)
+                )
+            )
+        assert sorted(values) == list(range(16))
 
-            # The counter increment should be atomic
-            # We verify by checking the database directly
-            sig, q = signer.sign(b"test atomicity")
-            assert q == 0
+    def test_unavailable_signatures_fail_closed(self):
+        from presidium.core.crypto.pq_crypto import LMSError
 
-            # Check database state
-            conn = sqlite3.connect(db_path)
-            row = conn.execute(
-                "SELECT counter FROM lms_state WHERE key_id = ?",
-                ("atomic_test",),
-            ).fetchone()
-            assert row is not None
-            assert row[0] == 1
-            conn.close()
-        finally:
-            os.unlink(db_path)
-
-    def test_lms_db_concurrent_safety(self) -> None:
-        """Test that concurrent LMS signers don't corrupt the counter.
-
-        Note: This is a best-effort test; true concurrent safety
-        requires SQLite BEGIN IMMEDIATE which we verify in the code.
-        """
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-            db_path = f.name
-
-        try:
-            # Create two signers sharing the same DB
-            signer1 = LMSSigner(db_path=db_path)
-            signer1.generate(key_id="concurrent_test")
-
-            signer2 = LMSSigner(db_path=db_path)
-            signer2.generate(key_id="concurrent_test")
-
-            # Both should use the same counter via SQLite
-            sig1, q1 = signer1.sign(b"from signer 1")
-            sig2, q2 = signer2.sign(b"from signer 2")
-
-            # Counter values should be unique (q1=0, q2=1)
-            assert q1 != q2
-        finally:
-            os.unlink(db_path)
+        with pytest.raises(LMSError, match="unavailable"):
+            LMSSigner().generate()
+        with pytest.raises(LMSError, match="unavailable"):
+            LMSSigner().sign(b"message")
+        assert not LMSSigner.verify(b"fake key", b"message", b"x" * 36, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -855,7 +784,8 @@ class TestExistingCryptoStillWorks:
 
         bob_r = DoubleRatchet()
         bob_r.init_as_responder(
-            shared, alice.public_key,
+            shared,
+            alice.public_key,
             local_prekey_private=bob.private_key_bytes,
         )
 

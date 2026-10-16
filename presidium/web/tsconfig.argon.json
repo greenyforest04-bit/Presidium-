@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "target": "ES2023", "module": "ESNext", "moduleResolution": "bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"], "types": ["node"],
+    "noEmit": true, "skipLibCheck": true, "allowJs": true, "strict": true,
+    "baseUrl": ".", "paths": { "zod": ["node_modules/zod"] },
+    "ignoreDeprecations": "6.0"
+  },
+  "include": ["../argon/**/*.ts", "../argon/**/*.mjs"],
+  "exclude": ["../argon/tests"]
+}

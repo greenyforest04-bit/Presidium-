@@ -1,0 +1,11 @@
+'use client';
+import {useEffect,useRef,useState} from 'react';
+import {ChevronRight} from 'lucide-react';
+export type HomeTab='all'|'following'|'trends'|'commissionka';
+export const HOME_TABS=[['all','Для вас'],['following','Подписки'],['trends','Тренды'],['commissionka','Комиссионка']] as const;
+export function FeedNavigation({value,onChange}:{value:HomeTab;onChange:(tab:HomeTab)=>void}){
+ const track=useRef<HTMLDivElement>(null),[hint,setHint]=useState(false);
+ useEffect(()=>{const el=track.current;if(!el)return;const update=()=>setHint(el.scrollWidth-el.clientWidth-el.scrollLeft>12);const observer=new ResizeObserver(update);observer.observe(el);el.addEventListener('scroll',update,{passive:true});update();return()=>{observer.disconnect();el.removeEventListener('scroll',update)}},[]);
+ useEffect(()=>{const el=track.current,button=el?.querySelector<HTMLElement>('[aria-selected="true"]');if(!el||!button)return;const left=button.offsetLeft,right=left+button.offsetWidth;const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches||document.documentElement.dataset.reduceMotion==='true';if(left<el.scrollLeft)el.scrollTo({left:left-4,behavior:reduced?'instant':'smooth'});else if(right>el.scrollLeft+el.clientWidth)el.scrollTo({left:right-el.clientWidth+4,behavior:reduced?'instant':'smooth'})},[value]);
+ return <div className="home-tabs-shell" data-overflow={hint}><div ref={track} className="home-tabs" role="tablist" aria-label="Разделы главной" onKeyDown={e=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;e.preventDefault();const i=HOME_TABS.findIndex(([id])=>id===value),next=e.key==='Home'?0:e.key==='End'?3:(i+(e.key==='ArrowRight'?1:-1)+4)%4;onChange(HOME_TABS[next][0]);track.current?.querySelectorAll<HTMLElement>('[role=tab]')[next]?.focus()}}>{HOME_TABS.map(([id,label])=><button key={id} id={'home-tab-'+id} role="tab" aria-selected={id===value} aria-controls="home-tab-panel" tabIndex={id===value?0:-1} onClick={()=>onChange(id)}>{label}</button>)}</div>{hint&&<button className="home-tabs-more" tabIndex={-1} aria-label="Показать следующие вкладки" onClick={()=>track.current?.scrollBy({left:140,behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'})}><ChevronRight size={17}/></button>}</div>;
+}

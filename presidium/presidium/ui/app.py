@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import Qt, QTimer, Slot, QEvent
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -22,6 +23,11 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QApplication,
     QMessageBox,
+    QVBoxLayout,
+    QLineEdit,
+    QPushButton,
+    QLabel,
+    QInputDialog,
 )
 
 from presidium.core.identity import IdentityManager, IdentityNotFoundError
@@ -47,6 +53,7 @@ logger = logging.getLogger(__name__)
 # Screen indices
 # ---------------------------------------------------------------------------
 
+
 class ScreenIndex:
     WELCOME = 0
     CHAT_LIST = 1
@@ -58,6 +65,7 @@ class ScreenIndex:
 # ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
+
 
 class MainWindow(QMainWindow):
     """Main application window that ties together all components.
@@ -79,7 +87,11 @@ class MainWindow(QMainWindow):
         self._current_theme = config.ui.theme
 
         # Core services (initialized later)
-        self._identity_manager: Optional[IdentityManager] = None
+        self._identity_manager: Optional[IdentityManager] = IdentityManager(config)
+        self._last_activity = time.monotonic()
+        self._locking = False
+        self._closing = False
+        self._close_task = None
         self._db_manager: Optional[DatabaseManager] = None
         self._transport: Optional[UDPTransport] = None
         self._peer_manager: Optional[PeerManager] = None
@@ -96,7 +108,8 @@ class MainWindow(QMainWindow):
         self._lock_timer = QTimer(self)
         self._lock_timer.timeout.connect(self._check_auto_lock)
         if config.ui.auto_lock_timeout > 0:
-            self._lock_timer.start(config.ui.auto_lock_timeout * 1000)
+            self._lock_timer.start(1000)
+        QApplication.instance().installEventFilter(self)
 
         # Async init timer
         self._init_timer = QTimer(self)
@@ -116,7 +129,9 @@ class MainWindow(QMainWindow):
 
         # Try to set font
         font = QFont(self._config.ui.font_family)
-        font.setPointSize(self._config.ui.font_size if hasattr(self._config.ui, 'font_size') else 15)
+        font.setPointSize(
+            self._config.ui.font_size if hasattr(self._config.ui, "font_size") else 15
+        )
         self.setFont(font)
 
     # -------------------------------------------------------------------
@@ -139,10 +154,37 @@ class MainWindow(QMainWindow):
 
         # Screen stack
         self._stack = QStackedWidget()
-        self._stack.addWidget(WelcomeScreen(IdentityManager(self._config)))  # placeholder
+        self._stack.addWidget(WelcomeScreen(self._identity_manager))
         self._stack.addWidget(ChatListScreen())
         self._stack.addWidget(ChatRoomScreen())
         self._stack.addWidget(SettingsScreen())
+        lock_screen = QWidget()
+        lock_layout = QVBoxLayout(lock_screen)
+        lock_layout.addWidget(QLabel("Presidium is locked"))
+        self._unlock_password = QLineEdit()
+        self._unlock_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self._unlock_password.setPlaceholderText("Identity password")
+        lock_layout.addWidget(self._unlock_password)
+        self._unlock_error = QLabel()
+        lock_layout.addWidget(self._unlock_error)
+        self._unlock_button = QPushButton("Unlock")
+        lock_layout.addWidget(self._unlock_button)
+        self._stack.addWidget(lock_screen)
+        self._unlock_button.clicked.connect(lambda: asyncio.create_task(self._unlock_identity()))
+        self._unlock_password.returnPressed.connect(
+            lambda: asyncio.create_task(self._unlock_identity())
+        )
+        self._stack.widget(ScreenIndex.CHAT_LIST).chat_opened.connect(self._open_chat)
+        self._stack.widget(ScreenIndex.CHAT_LIST).new_chat_requested.connect(self._new_chat)
+        self._stack.widget(ScreenIndex.CHAT_ROOM).send_message.connect(
+            lambda peer, text, reply: asyncio.create_task(self._send_message(peer, text, reply))
+        )
+        self._stack.widget(ScreenIndex.CHAT_ROOM).back_requested.connect(
+            lambda: self._stack.setCurrentIndex(ScreenIndex.CHAT_LIST)
+        )
+        settings = self._stack.widget(ScreenIndex.SETTINGS)
+        settings.theme_changed.connect(self._on_theme_changed)
+        settings.logout_requested.connect(lambda: asyncio.create_task(self._lock_identity()))
 
         main_layout.addWidget(self._stack, 1)
 
@@ -162,7 +204,6 @@ class MainWindow(QMainWindow):
             await self._db_manager.initialize()
 
             # Identity
-            self._identity_manager = IdentityManager(self._config)
 
             if not self._identity_manager.is_initialized:
                 # Show welcome screen
@@ -174,11 +215,7 @@ class MainWindow(QMainWindow):
                 self._sidebar.hide()
                 logger.info("No identity found. Showing welcome screen.")
             else:
-                # Need to unlock — for now, show a simple prompt
-                # SIMPLIFIED: In production, show a proper unlock dialog
-                self._sidebar.show()
-                self._stack.setCurrentIndex(ScreenIndex.CHAT_LIST)
-                logger.info("Identity exists. Showing chat list.")
+                self._show_lock_screen()
 
         except Exception as exc:
             logger.error("Initialization failed: %s", exc)
@@ -191,6 +228,7 @@ class MainWindow(QMainWindow):
     def _on_identity_created(self, user_id: str) -> None:
         """Handle identity creation — start networking and show chats."""
         logger.info("Identity created: %s", user_id)
+        self._last_activity = time.monotonic()
         self._sidebar.show()
         self._sidebar.set_user_info(
             user_id,
@@ -198,8 +236,112 @@ class MainWindow(QMainWindow):
         )
         self._stack.setCurrentIndex(ScreenIndex.CHAT_LIST)
 
-        # Start networking in background
-        asyncio.ensure_future(self._start_networking())
+        asyncio.create_task(self._finish_unlock())
+
+    def _show_lock_screen(self) -> None:
+        self._sidebar.hide()
+        self._stack.setCurrentIndex(ScreenIndex.LOCK)
+        self._unlock_password.clear()
+        self._unlock_error.clear()
+
+    async def _finish_unlock(self) -> None:
+        from presidium.core.crypto import derive_session_key
+
+        key = derive_session_key(
+            self._identity_manager.key_pair.private_key_bytes, info=b"presidium-history-v1"
+        )
+        try:
+            await self._db_manager.unlock_history(key)
+            await self._start_networking()
+        except Exception as exc:
+            await self._lock_identity()
+            self._unlock_error.setText(str(exc))
+        finally:
+            key.zero()
+
+    async def _unlock_identity(self) -> None:
+        if self._locking or not self._unlock_button.isEnabled():
+            return
+        self._unlock_button.setEnabled(False)
+        password = self._unlock_password.text()
+        self._unlock_password.clear()
+        try:
+            await self._identity_manager.unlock(password)
+            await self._finish_unlock()
+            if self._identity_manager.is_unlocked:
+                self._last_activity = time.monotonic()
+                self._sidebar.show()
+                self._sidebar.set_user_info(
+                    self._identity_manager.user_id, self._identity_manager.nickname or ""
+                )
+                self._stack.setCurrentIndex(ScreenIndex.CHAT_LIST)
+        except Exception:
+            self._unlock_error.setText("Could not unlock identity. Check the password.")
+        finally:
+            self._unlock_button.setEnabled(True)
+
+    async def _lock_identity(self) -> None:
+        if self._locking:
+            return
+        self._locking = True
+        self._show_lock_screen()
+        self._unlock_button.setEnabled(False)
+        self._chat_manager = None
+        self._stack.widget(ScreenIndex.CHAT_LIST).set_sessions([])
+        self._stack.widget(ScreenIndex.CHAT_ROOM).clear_session()
+        self._sidebar.set_user_info("", "")
+        self._stack.widget(ScreenIndex.SETTINGS).set_user_info("", b"")
+        try:
+            if self._identity_manager:
+                self._identity_manager.lock()
+            if self._db_manager:
+                self._db_manager.lock_history()
+            for service in (self._discovery, self._dht, self._transport):
+                if service:
+                    await service.stop()
+        finally:
+            self._peer_manager = self._discovery = self._dht = self._transport = None
+            self._locking = False
+            self._unlock_button.setEnabled(True)
+
+    @Slot(str)
+    def _open_chat(self, peer_user_id: str) -> None:
+        if not self._chat_manager or not self._identity_manager.is_unlocked:
+            return
+        session = self._chat_manager.get_session(peer_user_id)
+        if session:
+            self._stack.widget(ScreenIndex.CHAT_ROOM).set_session(session)
+            self._stack.setCurrentIndex(ScreenIndex.CHAT_ROOM)
+            asyncio.create_task(self._chat_manager.mark_as_read(peer_user_id))
+
+    @Slot()
+    def _new_chat(self) -> None:
+        if not self._chat_manager or not self._peer_manager:
+            return
+        peers = self._peer_manager.get_all_peers()
+        if not peers:
+            QMessageBox.information(self, "New chat", "No peers discovered yet.")
+            return
+        choices = [f"{peer.nickname or 'Peer'} ({peer.user_id})" for peer in peers]
+        choice, accepted = QInputDialog.getItem(self, "New chat", "Peer", choices, 0, False)
+        if accepted:
+            peer = peers[choices.index(choice)]
+            self._chat_manager.get_or_create_session(peer.user_id, peer.nickname)
+            self._stack.widget(ScreenIndex.CHAT_LIST).set_sessions(
+                self._chat_manager.get_all_sessions()
+            )
+            self._open_chat(peer.user_id)
+
+    async def _send_message(self, peer: str, text: str, reply: bytes) -> None:
+        manager = self._chat_manager
+        if manager is None or not self._identity_manager.is_unlocked:
+            return
+        try:
+            await manager.send_message(peer, text, reply)
+            if manager is self._chat_manager:
+                self._stack.widget(ScreenIndex.CHAT_ROOM).set_session(manager.get_session(peer))
+        except Exception as exc:
+            QMessageBox.warning(self, "Message could not be sent", str(exc))
 
     # -------------------------------------------------------------------
     # Networking
@@ -249,6 +391,7 @@ class MainWindow(QMainWindow):
         # Chat manager
         self._chat_manager = ChatManager(self._peer_manager, user_id)
         self._chat_manager.set_on_message_received(self._on_message_received)
+        self._chat_manager.set_on_message_status_changed(self._on_message_status_changed)
         self._chat_manager.set_on_session_updated(self._on_session_updated)
         self._chat_manager.set_persist_message(self._persist_message)
         self._chat_manager.set_load_messages(self._load_messages)
@@ -267,6 +410,8 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_navigate(self, screen: str) -> None:
         """Handle sidebar navigation."""
+        if not self._identity_manager or not self._identity_manager.is_unlocked:
+            return
         if screen == Sidebar.CHATS:
             self._stack.setCurrentIndex(ScreenIndex.CHAT_LIST)
         elif screen == Sidebar.SETTINGS:
@@ -282,14 +427,25 @@ class MainWindow(QMainWindow):
     async def _on_peer_connected(self, peer_user_id: str) -> None:
         """Handle peer connection event."""
         logger.info("Peer connected: %s", peer_user_id[:8])
-        # Update UI on the main thread
-        # SIMPLIFIED: update peer status in chat list
+        if self._chat_manager and self._identity_manager.is_unlocked:
+            session = self._chat_manager.get_or_create_session(peer_user_id)
+            await self._on_session_updated(session)
 
     async def _on_message_received(self, message: ChatMessage) -> None:
         """Handle incoming chat message — update UI."""
         # This runs in the async context; we need to update Qt widgets safely
         # SIMPLIFIED: in production, use signals/slots for thread-safe UI updates
-        logger.debug("Message received from %s: %s", message.sender_user_id[:8], message.content[:30])
+        if not self._chat_manager or not self._identity_manager.is_unlocked:
+            return
+        screen = self._stack.widget(ScreenIndex.CHAT_ROOM)
+        if screen.current_peer == message.sender_user_id:
+            screen.add_message(message)
+
+    async def _on_message_status_changed(self, message_id: bytes, status: MessageStatus) -> None:
+        if self._chat_manager:
+            self._stack.widget(ScreenIndex.CHAT_ROOM).update_message_status(
+                message_id.hex(), status
+            )
 
     async def _on_session_updated(self, session) -> None:
         """Handle chat session update."""
@@ -340,8 +496,25 @@ class MainWindow(QMainWindow):
 
     def _check_auto_lock(self) -> None:
         """Check if the application should auto-lock due to inactivity."""
-        # SIMPLIFIED: in production, track last user activity timestamp
-        pass
+        timeout = self._config.ui.auto_lock_timeout
+        if (
+            timeout > 0
+            and self._identity_manager
+            and self._identity_manager.is_unlocked
+            and time.monotonic() - self._last_activity >= timeout
+        ):
+            asyncio.create_task(self._lock_identity())
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() in (
+            QEvent.Type.KeyPress,
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseMove,
+            QEvent.Type.Wheel,
+            QEvent.Type.TouchBegin,
+        ):
+            self._last_activity = time.monotonic()
+        return super().eventFilter(watched, event)
 
     # -------------------------------------------------------------------
     # Cleanup
@@ -368,12 +541,7 @@ class MainWindow(QMainWindow):
     async def _cleanup_async(self) -> None:
         """Async cleanup executed within the application's event loop."""
         try:
-            if self._transport:
-                await self._transport.stop()
-            if self._dht:
-                await self._dht.stop()
-            if self._discovery:
-                await self._discovery.stop()
+            await self._lock_identity()
             if self._db_manager:
                 await self._db_manager.close()
             if self._identity_manager:
@@ -381,7 +549,22 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             logger.error("Cleanup error: %s", exc)
 
+    async def _close_async(self) -> None:
+        await self._cleanup_async()
+        self._closing = True
+        self.close()
+
     def closeEvent(self, event) -> None:
-        """Handle window close event."""
-        self.cleanup()
-        super().closeEvent(event)
+        if self._closing:
+            QApplication.instance().removeEventFilter(self)
+            event.accept()
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.cleanup()
+            event.accept()
+            return
+        event.ignore()
+        if self._close_task is None:
+            self._close_task = loop.create_task(self._close_async())

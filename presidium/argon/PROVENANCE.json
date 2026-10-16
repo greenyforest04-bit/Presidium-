@@ -1,0 +1,20 @@
+{
+  "head": "5ad57e23788b5add024b48591ba65d98d600b557",
+  "files": {
+    "lib/account.ts": "54c40cb493dcb1ac7a8012a2483ab2e795382e2eccafe07dc295b97074aefcfe",
+    "lib/capsule-agent.ts": "3be3b5fc8e8939292ae0d4c9ad5806af95d007a103844772833fe74abf607ccb",
+    "lib/commissionka-schema.ts": "2309d39b710e3c1f25cd5085978e4746e4c61be501bcd8cd65dce6b9c764947b",
+    "lib/commissionka.ts": "d503e0f443ab70488ac26d29c45b6d8d6798f2bba57c7ed1f4d2be809b5d1807",
+    "lib/domain.ts": "6c17975e5da42199c018834b3f421bfa097789b1eb348a769ac61300778ad840",
+    "lib/entitlements.ts": "7620b310e9ea9114a010fce36d1ab80483d2c5bd4b102a8fcee1d0c3b8a8b36f",
+    "lib/social-sync.ts": "32bf2eee1d292ad698178449ee07a55eb694c90ae617d9ef2d26f78943d82b3e",
+    "lib/spaces.ts": "158301e84804add26f8bf89679ca3e7e938f90636ece514ace00106ea6711488",
+    "lib/storage.ts": "f117a529db466a4e90d504062426500d223d4750c08ef50c962042e2be028718",
+    "server/account-service.ts": "cc073e9959948cdb0e2e1df47b51ae1cc0e0f93396214baaacef64f50ede05eb",
+    "server/billing-webhook.ts": "ec9a46cc1ec9d1ba840fedf811f0ad815d8c15652e798d6e31f520793e416fbc",
+    "server/marketplace-service.ts": "1ed7d0e6cb4e09fcf050243e6c7a7849a54bd79cf6f97ac07f7c1bb7f651f3a1",
+    "server/social-service.ts": "a0b60ccb249a12d88225ba4a78a25f25e599e1577d95412f1befc0a0ed117ea9",
+    "server/spaces-service.ts": "23e6ce2381fab0488442224288f23ba1ca64948afe25acd6bee263f99c532c3e",
+    "server/subscription-service.ts": "de769925d86f5cc66d0ae35d34d30aa57a965590da3949d79c6e5c360cebd436"
+  }
+}

@@ -108,7 +108,7 @@ class SafetyNumber:
 
         # Take first 30 bytes and convert to decimal
         truncated = combined[:30]
-        number_int = int.from_bytes(truncated, byteorder="big")
+        number_int = int.from_bytes(truncated, byteorder="big") % (10 ** 60)
 
         # Format as 60-digit string (pad with leading zeros)
         number_str = f"{number_int:060d}"

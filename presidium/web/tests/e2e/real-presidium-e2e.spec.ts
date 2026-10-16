@@ -72,7 +72,7 @@ async function waitForHomeserver() {
 
 async function getSession(page: Page, username: string) {
   return page.evaluate((user) => {
-    const key = `presidium_matrix_session_${user}`
+    const key = `presidium_matrix_session_${encodeURIComponent('http://localhost:8008')}_${encodeURIComponent(user)}`
     const value = window.localStorage.getItem(key)
     if (!value) {
       throw new Error(`Missing persisted session for ${user}`)
@@ -106,6 +106,7 @@ async function verifyEncryptedEvent(
 }
 
 test('real Presidium UI proves Alice/Bob client-side E2EE', async ({ browser }) => {
+  test.skip(process.env.PRESIDIUM_RUN_RESTART_E2E !== '1', 'Requires seeded Alice/Bob accounts and permission to restart the local homeserver.')
   mkdirSync(artifactDir, { recursive: true })
 
   const aliceContext = await browser.newContext()
