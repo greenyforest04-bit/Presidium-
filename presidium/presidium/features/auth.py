@@ -280,6 +280,7 @@ async def password(data: SecurityAction, request: Request, auth=Depends(identity
 async def lookup(request: Request, auth=Depends(identity)):
     token, _ = auth
     username = normalize(request.query_params.get("login", ""))
+    rate_limit(request, "lookup")
     uid = "@" + username + ":" + os.environ.get("PRESIDIUM_MATRIX_SERVER_NAME", "presidium.local")
     profile = await matrix("GET", "profile/" + quote(uid, safe=""), token)
     return {"user_id": uid, "login": username, "display_name": profile.get("displayname") or username}

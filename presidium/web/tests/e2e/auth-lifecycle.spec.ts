@@ -12,12 +12,12 @@ async function sign(page:Page,login:string,password:string,register=false){
  await page.getByLabel('Пароль',{exact:true}).fill(password);
  await page.getByRole('button',{name:register?'Зарегистрироваться':'Войти',exact:true}).click();
 }
-async function online(page:Page){await expect(page.locator('.auth-account-shortcut')).toBeVisible({timeout:60000});await page.getByRole('button',{name:'Сообщения',exact:true}).click();await expect(page.locator('.matrix-inbox-entry')).toContainText('подключено',{timeout:45000})}
+async function online(page:Page){await expect(page.locator('.nav-profile')).toBeVisible({timeout:60000});await page.getByRole('button',{name:'Сообщения',exact:true}).click();await expect(page.locator('.matrix-inbox-entry')).toContainText('подключено',{timeout:45000})}
 async function session(page:Page){return page.evaluate(()=>fetch('/api/auth/session').then(r=>r.json()))}
-async function account(page:Page){await page.locator('.auth-account-shortcut').click();await expect(page.getByRole('heading',{name:'Устройства и сеансы',exact:true})).toBeVisible()}
+async function account(page:Page){await page.locator('.nav-profile').click();await page.getByRole('button',{name:'Аккаунт и устройства',exact:true}).click();await expect(page.getByRole('heading',{name:'Устройства и сеансы',exact:true})).toBeVisible()}
 async function logout(page:Page){await account(page);await page.getByRole('button',{name:'Выйти',exact:true}).click();await page.getByRole('button',{name:'Подтвердить выход',exact:true}).click();await expect(page.getByRole('heading',{name:'Вход в Presidium'})).toBeVisible({timeout:30000})}
 async function library(page:Page){await page.getByRole('button',{name:'Капсула',exact:true}).click();await page.locator('.cu-section-nav').getByRole('button',{name:'Библиотека',exact:true}).click()}
-async function chat(page:Page,login:string){await page.getByTitle('Новый разговор',{exact:true}).click();await page.getByLabel('Логин собеседника',{exact:true}).fill(login);await page.locator('.space-creation').getByRole('button',{name:'Создать',exact:true}).click();await expect(page.locator('.space-creation')).toHaveCount(0,{timeout:30000});await expect(page.locator('.conversation-header h1')).toContainText(login)}
+async function chat(page:Page,login:string){await page.getByRole('button',{name:'Сообщения',exact:true}).click();await expect(page.getByTitle('Новый разговор',{exact:true})).toBeVisible();await page.getByTitle('Новый разговор',{exact:true}).click();await page.getByLabel('Логин собеседника',{exact:true}).fill(login);await page.locator('.space-creation').getByRole('button',{name:'Создать',exact:true}).click();await expect(page.locator('.space-creation')).toHaveCount(0,{timeout:30000});await expect(page.locator('.conversation-header h1')).toContainText(login)}
 async function send(page:Page,text:string){await page.getByLabel('Сообщение',{exact:true}).fill(text);await page.getByTitle('Отправить сообщение',{exact:true}).click()}
 const bubble=(p:Page,t:string)=>p.locator('.message-line').filter({has:p.locator('.bubble > p',{hasText:t})});
 
