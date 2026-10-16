@@ -4,19 +4,20 @@ import {test,expect,type Page} from '@playwright/test';
 
 const hs='http://localhost:8008';
 const screenshots='../.cache/frontend-correction-browser';
-async function chats(page:Page){await page.getByRole('button',{name:'Сообщения',exact:true}).click()}
+async function chats(page:Page){await page.getByRole('button',{name:'Сообщения',exact:true}).click();await expect(page.getByTitle('Новый разговор',{exact:true})).toBeVisible()}
+async function account(page:Page){await page.getByRole('button',{name:'Профиль',exact:true}).click();await page.getByRole('button',{name:'Аккаунт и устройства',exact:true}).click();await expect(page.getByRole('heading',{name:'Устройства и сеансы',exact:true})).toBeVisible()}
 async function send(page:Page,text:string){await page.getByLabel('Сообщение',{exact:true}).fill(text);await page.getByTitle('Отправить сообщение',{exact:true}).click()}
 const bubble=(page:Page,text:string)=>page.locator('.message-line').filter({has:page.locator('.bubble > p',{hasText:text})});
 
 async function login(page:Page,username:string,password:string){
  await page.goto('/');await page.getByRole('button',{name:'Войти',exact:true}).click();
  await page.getByLabel('Логин',{exact:true}).fill(username);await page.getByLabel('Пароль',{exact:true}).fill(password);await page.getByRole('button',{name:'Войти',exact:true}).click();
- await expect(page.locator('.auth-account-shortcut')).toBeVisible({timeout:45000});await chats(page);await expect(page.locator('.matrix-inbox-entry')).toContainText('подключено');
+ await expect(page.getByRole('button',{name:'Профиль',exact:true})).toBeVisible({timeout:45000});await chats(page);await expect(page.locator('.matrix-inbox-entry')).toContainText('подключено');
 }
-async function signOut(page:Page){await page.locator('.auth-account-shortcut').click();await page.getByRole('button',{name:'Выйти',exact:true}).click();await page.getByRole('button',{name:'Подтвердить выход',exact:true}).click();await expect(page.getByRole('heading',{name:'Вход в Presidium'})).toBeVisible()}
+async function signOut(page:Page){await account(page);await page.getByRole('button',{name:'Выйти',exact:true}).click();await page.getByRole('button',{name:'Подтвердить выход',exact:true}).click();await expect(page.getByRole('heading',{name:'Вход в Presidium'})).toBeVisible()}
 async function currentSession(page:Page){const s=await page.evaluate(()=>fetch('/api/auth/session').then(r=>r.json()));return {userId:s.user_id,deviceId:s.device_id,accessToken:s.access_token}}
 async function registerUI(page:Page,username:string,password:string){
- await page.goto('/');await page.getByRole('button',{name:'Создать аккаунт',exact:true}).click();await page.getByLabel('Логин',{exact:true}).fill(username);await page.getByLabel('Отображаемое имя').fill(username);await page.getByLabel('Пароль',{exact:true}).fill(password);await page.getByRole('button',{name:'Зарегистрироваться',exact:true}).click();await expect(page.locator('.auth-account-shortcut')).toBeVisible({timeout:45000});await chats(page);
+ await page.goto('/');await page.getByRole('button',{name:'Создать аккаунт',exact:true}).click();await page.getByLabel('Логин',{exact:true}).fill(username);await page.getByLabel('Отображаемое имя').fill(username);await page.getByLabel('Пароль',{exact:true}).fill(password);await page.getByRole('button',{name:'Зарегистрироваться',exact:true}).click();await expect(page.getByRole('button',{name:'Профиль',exact:true})).toBeVisible({timeout:45000});await chats(page);
 }
 
 test('original conversation: real E2EE delivery, isolation, reconnect and preserved device/history',async({browser,request})=>{
@@ -35,6 +36,7 @@ test('original conversation: real E2EE delivery, isolation, reconnect and preser
   }
   const {alice,bob,carol}=pages;
   async function openChat(page:Page,target:string){
+   await chats(page);
    await page.getByTitle('Новый разговор',{exact:true}).click();
    await page.getByLabel('Логин собеседника',{exact:true}).fill(users[target].user_id);
    await page.locator('.space-creation').getByRole('button',{name:'Создать',exact:true}).click();
@@ -70,7 +72,7 @@ test('original conversation: real E2EE delivery, isolation, reconnect and preser
   // The local content database must not contain a parallel copy of Matrix history.
   const copies=await alice.evaluate(()=>new Promise<any[]>((resolve,reject)=>{const r=indexedDB.open('presidium-local-v1');r.onsuccess=()=>{const q=r.result.transaction('state').objectStore('state').getAll();q.onsuccess=()=>resolve(q.result);q.onerror=reject};r.onerror=reject}));
   expect(JSON.stringify(copies)).not.toContain(ab);expect(JSON.stringify(copies)).not.toContain(ac);
-  await alice.getByTitle('Новый разговор',{exact:true}).click();
+  await chats(alice);await alice.getByTitle('Новый разговор',{exact:true}).click();
   await alice.locator('.sc-types').getByRole('button',{name:'Комната',exact:true}).click();
   await alice.getByLabel('Название',{exact:true}).fill(`Group ${suffix}`);await alice.getByLabel('Matrix ID участников',{exact:true}).fill(users.bob.user_id);
   await alice.locator('.space-creation').getByRole('button',{name:'Создать',exact:true}).click();
